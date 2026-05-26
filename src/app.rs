@@ -16,6 +16,7 @@ use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::ActiveEventLoop,
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowId},
 };
 
@@ -46,6 +47,8 @@ pub struct App {
     mouse_pos: (f32, f32),
     last_pos: (f32, f32),
     drag: Drag,
+    /// Latest keyboard modifier state, tracked for the undo/redo shortcuts.
+    modifiers: ModifiersState,
 }
 
 impl App {
@@ -60,6 +63,7 @@ impl App {
             mouse_pos: (0.0, 0.0),
             last_pos: (0.0, 0.0),
             drag: Drag::None,
+            modifiers: ModifiersState::empty(),
         }
     }
 
@@ -161,6 +165,19 @@ impl App {
             }
         }
 
+        // Undo / redo. The checkpoint here runs before set_layer_opacity below so
+        // it captures the pre-drag opacity (an opacity-slider drag emits checkpoint
+        // on its first frame).
+        if actions.undo {
+            renderer.undo();
+        }
+        if actions.redo {
+            renderer.redo();
+        }
+        if actions.checkpoint {
+            renderer.checkpoint();
+        }
+
         // Layer ops (G10).
         if actions.add_layer {
             renderer.add_layer();
@@ -197,6 +214,8 @@ impl App {
 
         // Keep the UI mirrors in sync with the renderer.
         self.ui.resolution = renderer.texture_resolution();
+        self.ui.can_undo = renderer.can_undo();
+        self.ui.can_redo = renderer.can_redo();
         self.ui.palette_swatches = renderer.palette().colors.clone();
         self.ui.active_layer = renderer.layers().active;
         self.ui.layers = renderer
@@ -332,6 +351,39 @@ impl ApplicationHandler for App {
                             renderer.end_stroke();
                         }
                         self.drag = Drag::None;
+                    }
+                    _ => {}
+                }
+            }
+
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
+
+            WindowEvent::KeyboardInput { event: key, .. } => {
+                // Let egui claim keys first (e.g. a focused widget); only then do
+                // viewport shortcuts fire. Ctrl/⌘+Z undo, Ctrl/⌘+Shift+Z or
+                // Ctrl/⌘+Y redo. Super covers macOS's Cmd.
+                if egui_consumed || key.state != ElementState::Pressed {
+                    return;
+                }
+                let cmd = self.modifiers.control_key() || self.modifiers.super_key();
+                if !cmd {
+                    return;
+                }
+                let shift = self.modifiers.shift_key();
+                match key.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyZ) => {
+                        if shift {
+                            renderer.redo();
+                        } else {
+                            renderer.undo();
+                        }
+                        window.request_redraw();
+                    }
+                    PhysicalKey::Code(KeyCode::KeyY) => {
+                        renderer.redo();
+                        window.request_redraw();
                     }
                     _ => {}
                 }

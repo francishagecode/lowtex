@@ -26,6 +26,12 @@ pub struct UiActions {
     pub save_png: bool,
     pub open_texture: bool,
     pub open_model: bool,
+    // Undo/redo (history over the layer stack).
+    pub undo: bool,
+    pub redo: bool,
+    /// Snapshot the layer stack before a continuous edit (an opacity-slider drag),
+    /// so the whole drag collapses to one undo step.
+    pub checkpoint: bool,
     pub set_resolution: Option<u32>,
     /// Index into `Palette::builtins()` to make active.
     pub select_builtin_palette: Option<usize>,
@@ -60,6 +66,9 @@ pub struct UiState {
     pub ao_strength: f32,
     /// Mirror of the renderer's current texture resolution, shown in the picker.
     pub resolution: u32,
+    /// Mirrors of the history state, to enable/disable the Undo/Redo buttons.
+    pub can_undo: bool,
+    pub can_redo: bool,
     pub actions: UiActions,
 }
 
@@ -74,6 +83,8 @@ impl Default for UiState {
             active_layer: 0,
             ao_strength: 0.75,
             resolution: 128,
+            can_undo: false,
+            can_redo: false,
             actions: UiActions::default(),
         }
     }
@@ -105,6 +116,23 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             if ui.button("Open model…").clicked() {
                 state.actions.open_model = true;
             }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(state.can_undo, egui::Button::new("↶ Undo"))
+                    .on_hover_text("Ctrl/⌘+Z")
+                    .clicked()
+                {
+                    state.actions.undo = true;
+                }
+                if ui
+                    .add_enabled(state.can_redo, egui::Button::new("↷ Redo"))
+                    .on_hover_text("Ctrl/⌘+Shift+Z")
+                    .clicked()
+                {
+                    state.actions.redo = true;
+                }
+            });
             ui.separator();
 
             ui.label("Brush");
@@ -208,6 +236,11 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                     .weak()
                     .small(),
             );
+            ui.label(
+                egui::RichText::new("Undo Ctrl/⌘+Z · Redo Ctrl/⌘+Shift+Z")
+                    .weak()
+                    .small(),
+            );
         });
 }
 
@@ -260,10 +293,13 @@ fn layers_section(ui: &mut egui::Ui, state: &mut UiState) {
                 }
             });
         let mut op = active.opacity;
-        if ui
-            .add(egui::Slider::new(&mut op, 0.0..=1.0).text("Layer opacity"))
-            .changed()
-        {
+        let resp = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).text("Layer opacity"));
+        // Snapshot once when the drag begins so the whole adjustment is one undo
+        // step, not one per frame.
+        if resp.drag_started() {
+            state.actions.checkpoint = true;
+        }
+        if resp.changed() {
             state.actions.set_layer_opacity = Some((i, op));
         }
     }

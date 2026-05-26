@@ -47,6 +47,7 @@ impl BlendMode {
     }
 }
 
+#[derive(Clone)]
 pub struct Layer {
     pub name: String,
     pub tex: Texture,
@@ -55,6 +56,7 @@ pub struct Layer {
     pub blend: BlendMode,
 }
 
+#[derive(Clone)]
 pub struct Layers {
     pub layers: Vec<Layer>, // index 0 = bottom
     pub active: usize,

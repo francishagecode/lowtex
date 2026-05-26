@@ -15,6 +15,7 @@ mod app;
 mod bake;
 mod bvh;
 mod camera;
+mod history;
 mod layers;
 mod mesh;
 mod model;

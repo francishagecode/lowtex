@@ -33,12 +33,17 @@ use winit::window::Window;
 
 use crate::bvh::Bvh;
 use crate::camera::Camera;
+use crate::history::History;
 use crate::layers::Layers;
 use crate::mesh::{Mesh, Vertex};
 use crate::paint::{Brush, Ray, Texture as PaintTexture};
 use crate::palette::Palette;
 
 const TEX_SIZE: u32 = 128; // PSX-scale. Bump to 256 if you want.
+
+/// How many undo steps to keep. Each step is a full layer-stack snapshot (a few
+/// hundred KB at PSX sizes), so this bounds history memory to a handful of MB.
+const HISTORY_CAP: usize = 64;
 
 /// The color format used for offscreen capture. sRGB to match the surface.
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -54,7 +59,7 @@ pub struct UiPaint<'a> {
 /// Quantize is applied to the *texture* on the CPU (non-destructive: the
 /// full-color paint buffer is preserved), so the model and the exported PNG show
 /// the quantized result.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct PaletteSettings {
     pub enabled: bool,
     pub dither: bool,
@@ -98,6 +103,14 @@ pub struct Renderer {
     // per-texel coverage, so overlapping stamps within one stroke don't double-darken.
     stroke_base: Vec<u8>,
     stroke_coverage: Vec<f32>,
+
+    // Undo/redo over the layer stack. A stroke records one entry on release (via
+    // `pending` + `stroke_dirty`); discrete layer ops record one each.
+    history: History,
+    // The layer stack as it was when the in-progress stroke began; committed to
+    // history on `end_stroke` only if the stroke actually painted anything.
+    pending: Option<Layers>,
+    stroke_dirty: bool,
 
     depth_view: wgpu::TextureView,
 
@@ -387,6 +400,9 @@ impl Renderer {
             tex_size,
             stroke_base,
             stroke_coverage,
+            history: History::new(HISTORY_CAP),
+            pending: None,
+            stroke_dirty: false,
             depth_view,
             palette,
             palette_settings,
@@ -455,8 +471,14 @@ impl Renderer {
         self.refresh_display_texture();
     }
 
-    /// Update quantize/dither settings and refresh the display.
+    /// Update quantize/dither settings and refresh the display. The App pushes
+    /// these every frame, so skip the (potentially multi-millisecond) recomposite
+    /// when nothing actually changed — otherwise idle frames pay a full composite +
+    /// GPU upload for no reason.
     pub fn set_palette_settings(&mut self, settings: PaletteSettings) {
+        if settings == self.palette_settings {
+            return;
+        }
         self.palette_settings = settings;
         self.refresh_display_texture();
     }
@@ -497,6 +519,59 @@ impl Renderer {
         &self.layers
     }
 
+    // --- Undo / redo (history over the layer stack) ---
+
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    /// Snapshot the current layer stack as an undo point (and drop the redo
+    /// future). Discrete edits call this before mutating; continuous edits (an
+    /// opacity-slider drag) checkpoint once at drag start via the UI, and strokes
+    /// use the `begin_stroke`/`end_stroke` pair instead.
+    pub fn checkpoint(&mut self) {
+        let before = self.layers.clone();
+        self.history.record(before);
+    }
+
+    /// Step back to the previous layer state, if any.
+    pub fn undo(&mut self) {
+        let current = self.layers.clone();
+        if let Some(prev) = self.history.undo(current) {
+            self.layers = prev;
+            self.restore_after_history();
+        }
+    }
+
+    /// Step forward to the next layer state, if any.
+    pub fn redo(&mut self) {
+        let current = self.layers.clone();
+        if let Some(next) = self.history.redo(current) {
+            self.layers = next;
+            self.restore_after_history();
+        }
+    }
+
+    /// Re-sync GPU + stroke buffers after the stack is replaced wholesale by
+    /// undo/redo. A restored state may be at a different resolution (undoing a
+    /// resize) or have a different active index, so handle both.
+    fn restore_after_history(&mut self) {
+        self.layers.active = self.layers.active.min(self.layers.layers.len() - 1);
+        if self.tex_size != self.layers.size() {
+            // rebuild_paint_gpu re-snapshots stroke buffers and refreshes for us.
+            self.mesh_maps = None; // baked at the previous resolution
+            self.rebuild_paint_gpu();
+        } else {
+            self.stroke_base = self.layers.active_tex().pixels.clone();
+            self.stroke_coverage = vec![0.0; (self.tex_size * self.tex_size) as usize];
+            self.refresh_display_texture();
+        }
+    }
+
     /// Re-snapshot the active-layer stroke base (after the active layer changes).
     fn resync_stroke_base(&mut self) {
         self.stroke_base.clear();
@@ -505,18 +580,24 @@ impl Renderer {
     }
 
     pub fn add_layer(&mut self) {
+        self.checkpoint();
         self.layers.add_layer();
         self.resync_stroke_base();
         self.refresh_display_texture();
     }
 
     pub fn remove_active_layer(&mut self) {
+        if self.layers.layers.len() <= 1 {
+            return; // remove_active is a no-op on the last layer — don't record it
+        }
+        self.checkpoint();
         self.layers.remove_active();
         self.resync_stroke_base();
         self.refresh_display_texture();
     }
 
     pub fn move_active_layer(&mut self, up: bool) {
+        self.checkpoint();
         self.layers.move_active(up);
         self.refresh_display_texture();
     }
@@ -529,10 +610,12 @@ impl Renderer {
     }
 
     pub fn set_layer_visible(&mut self, index: usize, visible: bool) {
-        if let Some(l) = self.layers.layers.get_mut(index) {
-            l.visible = visible;
-            self.refresh_display_texture();
+        if index >= self.layers.layers.len() {
+            return;
         }
+        self.checkpoint();
+        self.layers.layers[index].visible = visible;
+        self.refresh_display_texture();
     }
 
     pub fn set_layer_opacity(&mut self, index: usize, opacity: f32) {
@@ -543,10 +626,12 @@ impl Renderer {
     }
 
     pub fn set_layer_blend(&mut self, index: usize, blend: crate::layers::BlendMode) {
-        if let Some(l) = self.layers.layers.get_mut(index) {
-            l.blend = blend;
-            self.refresh_display_texture();
+        if index >= self.layers.layers.len() {
+            return;
         }
+        self.checkpoint();
+        self.layers.layers[index].blend = blend;
+        self.refresh_display_texture();
     }
 
     /// Orbit the camera by drag deltas and refresh the uniform.
@@ -623,6 +708,7 @@ impl Renderer {
             height: h,
             pixels: rgba.into_raw(),
         };
+        self.checkpoint(); // decode succeeded; the load is about to be applied
         *self.layers.active_tex_mut() = loaded.resampled(self.tex_size, self.tex_size);
         self.refresh_display_texture();
         // Re-snapshot the stroke base since the active layer changed wholesale.
@@ -636,6 +722,7 @@ impl Renderer {
         if size == self.tex_size {
             return;
         }
+        self.checkpoint();
         self.layers.resize(size);
         self.mesh_maps = None; // baked at the old resolution
         self.rebuild_paint_gpu();
@@ -658,6 +745,7 @@ impl Renderer {
     /// Add a black Multiply layer weighted by ambient occlusion — shadow sinks
     /// into crevices. `strength` 0..1 scales the darkening.
     pub fn apply_ao_layer(&mut self, strength: f32) {
+        self.checkpoint();
         self.ensure_mesh_maps();
         let maps = self.mesh_maps.as_ref().unwrap();
         let mut tex = PaintTexture::new(self.tex_size, self.tex_size, [0, 0, 0, 0]);
@@ -677,20 +765,22 @@ impl Renderer {
         self.refresh_display_texture();
     }
 
-    /// Add a white layer weighted by convex-edge strength — bright rims on edges
-    /// and corners. `strength` 0..1 scales the lightening.
+    /// Add a white layer that is the inverse of AO — bright where the surface is
+    /// exposed (low occlusion), nothing in the crevices AO darkens. `strength`
+    /// 0..1 scales the lightening.
     pub fn apply_highlight_layer(&mut self, strength: f32) {
+        self.checkpoint();
         self.ensure_mesh_maps();
         let maps = self.mesh_maps.as_ref().unwrap();
         let mut tex = PaintTexture::new(self.tex_size, self.tex_size, [255, 255, 255, 0]);
-        for i in 0..maps.edge.len() {
+        for i in 0..maps.ao.len() {
             if maps.mask[i] {
-                let a = (maps.edge[i] * strength).clamp(0.0, 1.0);
+                let a = ((1.0 - maps.ao[i]) * strength).clamp(0.0, 1.0);
                 tex.pixels[i * 4 + 3] = (a * 255.0).round() as u8;
             }
         }
         self.layers.push_generated(
-            "Edge highlights".to_string(),
+            "Highlights".to_string(),
             tex,
             crate::layers::BlendMode::Normal,
             1.0,
@@ -731,11 +821,23 @@ impl Renderer {
         self.stroke_base
             .extend_from_slice(&self.layers.active_tex().pixels);
         self.stroke_coverage.fill(0.0);
+        // Snapshot the pre-stroke stack so the whole stroke is one undo step. Held
+        // until release, then committed only if the stroke actually painted.
+        self.pending = Some(self.layers.clone());
+        self.stroke_dirty = false;
     }
 
-    /// End the current stroke. (The painted pixels are already committed; the
-    /// next `begin_stroke` re-snapshots from them.)
-    pub fn end_stroke(&mut self) {}
+    /// End the current stroke, committing it to history as a single undo step.
+    /// A stroke that never hit the mesh (`stroke_dirty` false) records nothing,
+    /// so an errant click off the model doesn't leave an empty undo entry.
+    pub fn end_stroke(&mut self) {
+        if let Some(before) = self.pending.take() {
+            if self.stroke_dirty {
+                self.history.record(before);
+            }
+        }
+        self.stroke_dirty = false;
+    }
 
     /// The current screen size (window physical size, or the headless config).
     fn screen_size(&self) -> Vec2 {
@@ -771,6 +873,7 @@ impl Renderer {
             self.layers
                 .active_tex_mut()
                 .stamp_stroke(uv, brush, base, coverage);
+            self.stroke_dirty = true;
             true
         } else {
             false

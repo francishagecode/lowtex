@@ -318,13 +318,24 @@ source of truth for paint.
 - **Done when:** painting on a 1024² texture with a large brush stays smooth.
 - **Depends on:** G10
 
-### [ ] G13 — Undo/redo
+### [x] G13 — Undo/redo
 **Outcome:** Ctrl-Z/Ctrl-Y across strokes and layer ops.
 - **Build:** command/history stack; for strokes, store affected-region deltas
   (tiles), not whole-texture snapshots, to bound memory.
 - **Touches:** new `src/history.rs`, `app.rs`, `layers.rs`, `paint.rs`.
 - **Done when:** a stroke, a layer add, and a fill can each be undone and redone.
 - **Depends on:** G10
+- _2026-05-26: `src/history.rs` — snapshot-based undo/redo over the layer stack
+  (the document). Each entry is a full `Layers` clone, capped at 64 (a few MB at
+  PSX sizes); chosen over tile deltas for correctness across *any* edit (stroke,
+  layer add/remove/reorder, AO bake, PNG load, resolution change). Strokes record
+  one entry on release (`pending`+`stroke_dirty`, nothing if the stroke missed);
+  discrete edits `checkpoint()` before mutating; an opacity-drag checkpoints once
+  on drag-start. Camera/palette are view state, outside undo. Renderer
+  undo/redo/restore_after_history (handles a restored resolution); app wires
+  Ctrl/⌘+Z and ⌘+Shift+Z. Tests: round-trip, redo-cleared-by-edit, empty no-ops,
+  capacity eviction. (Note: tile-delta memory optimization deferred to if/when
+  textures exceed PSX sizes — see history.rs.)_
 
 ---
 
