@@ -47,6 +47,12 @@ struct Args {
     load_texture: Option<String>,
     save_texture: Option<String>,
     res: Option<u32>,
+    /// Headless verification: disable PSX mode (clean view) / enable fog / flat
+    /// shading / override the wobble grid.
+    psx_off: bool,
+    fog: bool,
+    flat: bool,
+    psx_grid: Option<f32>,
 }
 
 fn parse_args() -> Args {
@@ -65,6 +71,10 @@ fn parse_args() -> Args {
         load_texture: None,
         save_texture: None,
         res: None,
+        psx_off: false,
+        fog: false,
+        flat: false,
+        psx_grid: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -91,6 +101,10 @@ fn parse_args() -> Args {
             "--load-texture" => args.load_texture = it.next(),
             "--save-texture" => args.save_texture = it.next(),
             "--res" => args.res = it.next().and_then(|s| s.parse().ok()),
+            "--psx-off" => args.psx_off = true,
+            "--fog" => args.fog = true,
+            "--flat" => args.flat = true,
+            "--psx-grid" => args.psx_grid = it.next().and_then(|s| s.parse().ok()),
             "--width" => {
                 if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
                     args.width = v;
@@ -143,6 +157,16 @@ fn main() {
 fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     let (width, height) = (args.width, args.height);
     let mut renderer = pollster::block_on(Renderer::new_headless(width, height, mesh));
+
+    let defaults = renderer::PsxSettings::default();
+    let psx = renderer::PsxSettings {
+        enabled: !args.psx_off,
+        fog: args.fog,
+        flat: args.flat,
+        grid: args.psx_grid.unwrap_or(defaults.grid),
+        ..defaults
+    };
+    renderer.set_psx_settings(psx);
 
     let mut brush = Brush::default();
     if let Some(c) = args.brush_color {

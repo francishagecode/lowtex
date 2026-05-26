@@ -216,7 +216,7 @@ paint → export a PNG.** That single loop is the line between tech demo and too
 Target: the viewport *is* the vibe. This is the hook that makes someone choose
 lowtex over a 2D editor.
 
-### [ ] G7 — PSX render shader
+### [x] G7 — PSX render shader
 **Outcome:** Toggleable affine-UV warp, vertex snap/jitter, optional fog.
 - **Build:** affine (perspective-incorrect) UV interpolation — emit UVs without
   perspective divide to get the warp; vertex position snapping to a low-res grid
@@ -226,6 +226,16 @@ lowtex over a 2D editor.
 - **Done when:** toggling "PSX mode" visibly warps textures and wobbles vertices
   in real time.
 - **Depends on:** G2
+- _2026-05-26: All effects runtime-toggleable via uniform flags (no pipeline
+  switching). main.wgsl carries a `@interpolate(linear)` UV copy (affine warp)
+  and selects it per-fragment; vertex snap quantizes projected NDC.xy to a grid
+  (`PsxSettings::grid`); flat shading derives the face normal from
+  `dpdx/dpdy(world_pos)`; linear depth fog over `[start,end]`. New `Uniforms`
+  block (binding 0, VERTEX_FRAGMENT). `PsxSettings` (master `enabled` + per-effect
+  flags) lives in renderer, edited in the UI's "PSX mode" section, pushed via
+  `set_psx_settings`. Verified headless: affine checker warp (on vs `--psx-off`),
+  dramatic wobble (`--psx-grid 14`), faceted flat shading on the octahedron, and
+  distance fog._
 
 ### [ ] G8 — Palette system
 **Outcome:** Constrained palettes with quantize + dithering, generatable from images.

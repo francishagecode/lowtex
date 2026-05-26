@@ -46,6 +46,60 @@ pub struct UiPaint<'a> {
     pub pixels_per_point: f32,
 }
 
+/// PSX-look render settings (G7). `enabled` is the master toggle; the individual
+/// flags dial each effect. `effective_*` resolves `enabled && flag`.
+#[derive(Clone, Copy)]
+pub struct PsxSettings {
+    pub enabled: bool,
+    pub affine: bool,
+    pub snap: bool,
+    pub grid: f32,
+    pub fog: bool,
+    pub fog_color: [f32; 3],
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub flat: bool,
+}
+
+impl Default for PsxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            affine: true,
+            snap: true,
+            grid: 64.0,
+            fog: false,
+            fog_color: [0.04, 0.06, 0.08], // matches the viewport clear
+            fog_start: 3.0,
+            fog_end: 7.0,
+            flat: false,
+        }
+    }
+}
+
+/// GPU uniform block. Layout matches `Uniforms` in main.wgsl (std140-friendly:
+/// mat4 then 16-byte-aligned vec4s).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    view_proj: [[f32; 4]; 4],
+    fog_color: [f32; 4],
+    params: [f32; 4],  // affine, snap, grid, fog
+    params2: [f32; 4], // flat, fog_start, fog_end, unused
+}
+
+impl Uniforms {
+    fn new(view_proj: glam::Mat4, psx: &PsxSettings) -> Self {
+        let on = |b: bool| if psx.enabled && b { 1.0 } else { 0.0 };
+        Self {
+            view_proj: view_proj.to_cols_array_2d(),
+            fog_color: [psx.fog_color[0], psx.fog_color[1], psx.fog_color[2], 1.0],
+            params: [on(psx.affine), on(psx.snap), psx.grid.max(1.0), on(psx.fog)],
+            params2: [on(psx.flat), psx.fog_start, psx.fog_end, 0.0],
+        }
+    }
+}
+
 pub struct Renderer {
     window: Option<Arc<Window>>,
     surface: Option<wgpu::Surface<'static>>,
@@ -81,6 +135,7 @@ pub struct Renderer {
     max_texture_dim: u32,
 
     camera: Camera,
+    psx: PsxSettings,
     // Kept for goals that re-read geometry (unwrap G14, bake G19); the BVH owns
     // its own triangle copy for picking.
     #[allow(dead_code)]
@@ -223,12 +278,13 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Uniform buffer for the view-projection matrix.
+        // Uniform buffer: view-projection + PSX params.
         let camera = Camera::new(width as f32 / height as f32);
-        let view_proj = camera.view_proj();
+        let psx = PsxSettings::default();
+        let uniforms = Uniforms::new(camera.view_proj(), &psx);
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniform buffer"),
-            contents: bytemuck::cast_slice(&[view_proj.to_cols_array_2d()]),
+            contents: bytemuck::bytes_of(&uniforms),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -237,7 +293,8 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    // Vertex reads view_proj + snap; fragment reads affine/flat/fog flags.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -354,6 +411,7 @@ impl Renderer {
             egui_renderer: None,
             max_texture_dim,
             camera,
+            psx,
             mesh,
             bvh,
         }
@@ -375,40 +433,44 @@ impl Renderer {
         self.depth_view = make_depth_view(&self.device, width, height);
 
         self.camera.aspect = width as f32 / height as f32;
-        self.update_camera_uniform();
+        self.update_uniforms();
     }
 
-    fn update_camera_uniform(&self) {
-        let view_proj = self.camera.view_proj();
-        self.queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[view_proj.to_cols_array_2d()]),
-        );
+    /// Write the view-proj + PSX uniform block to the GPU.
+    fn update_uniforms(&self) {
+        let uniforms = Uniforms::new(self.camera.view_proj(), &self.psx);
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    /// Orbit the camera by drag deltas and refresh the view-proj uniform.
+    /// Replace the PSX render settings and refresh the uniform.
+    pub fn set_psx_settings(&mut self, psx: PsxSettings) {
+        self.psx = psx;
+        self.update_uniforms();
+    }
+
+    /// Orbit the camera by drag deltas and refresh the uniform.
     pub fn orbit_camera(&mut self, dx: f32, dy: f32) {
         self.camera.orbit(dx, dy);
-        self.update_camera_uniform();
+        self.update_uniforms();
     }
 
-    /// Pan the camera target by drag deltas and refresh the view-proj uniform.
+    /// Pan the camera target by drag deltas and refresh the uniform.
     pub fn pan_camera(&mut self, dx: f32, dy: f32) {
         self.camera.pan(dx, dy);
-        self.update_camera_uniform();
+        self.update_uniforms();
     }
 
-    /// Zoom (dolly) the camera and refresh the view-proj uniform.
+    /// Zoom (dolly) the camera and refresh the uniform.
     pub fn zoom_camera(&mut self, delta: f32) {
         self.camera.zoom(delta);
-        self.update_camera_uniform();
+        self.update_uniforms();
     }
 
     /// Orbit by explicit angles (radians); for programmatic/headless control.
     pub fn orbit_view_radians(&mut self, d_azimuth: f32, d_elevation: f32) {
         self.camera.orbit_radians(d_azimuth, d_elevation);
-        self.update_camera_uniform();
+        self.update_uniforms();
     }
 
     /// The current paint texture resolution (square).

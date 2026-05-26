@@ -100,6 +100,10 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+
+        // Push the latest PSX render settings (cheap; resolves to a uniform write).
+        renderer.set_psx_settings(self.ui.psx);
+
         let actions = std::mem::take(&mut self.ui.actions);
 
         if let Some(size) = actions.set_resolution {

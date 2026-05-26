@@ -7,6 +7,7 @@
 use egui::Context;
 
 use crate::paint::Brush;
+use crate::renderer::PsxSettings;
 
 /// One-shot requests the UI raises this frame, drained by the App after the egui
 /// run (file dialogs and texture ops happen outside the egui closure).
@@ -20,6 +21,7 @@ pub struct UiActions {
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
 pub struct UiState {
     pub brush: Brush,
+    pub psx: PsxSettings,
     /// Mirror of the renderer's current texture resolution, shown in the picker.
     pub resolution: u32,
     pub actions: UiActions,
@@ -29,6 +31,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             brush: Brush::default(),
+            psx: PsxSettings::default(),
             resolution: 128,
             actions: UiActions::default(),
         }
@@ -91,6 +94,24 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 if ui.button("Save PNG…").clicked() {
                     state.actions.save_png = true;
                 }
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.checkbox(&mut state.psx.enabled, "PSX mode");
+            ui.add_enabled_ui(state.psx.enabled, |ui| {
+                ui.checkbox(&mut state.psx.affine, "Texture warp");
+                ui.checkbox(&mut state.psx.snap, "Vertex wobble");
+                ui.add(egui::Slider::new(&mut state.psx.grid, 8.0..=256.0).text("Wobble grid"));
+                ui.checkbox(&mut state.psx.flat, "Flat shading");
+                ui.checkbox(&mut state.psx.fog, "Fog");
+                ui.add_enabled_ui(state.psx.fog, |ui| {
+                    ui.color_edit_button_rgb(&mut state.psx.fog_color);
+                    ui.add(
+                        egui::Slider::new(&mut state.psx.fog_start, 0.0..=10.0).text("Fog near"),
+                    );
+                    ui.add(egui::Slider::new(&mut state.psx.fog_end, 0.0..=20.0).text("Fog far"));
+                });
             });
 
             ui.add_space(10.0);
