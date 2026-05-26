@@ -313,7 +313,7 @@ visibility, reorder; composited on the GPU.
   machinery (white reveals, black hides). Tests: black mask hides a layer / white
   reveals. Verified headless (`--mask-demo`)._
 
-### [ ] G12 — Move painting & compositing to the GPU
+### [~] G12 — Move painting & compositing to the GPU *(deferred — out of scope)*
 **Outcome:** Brush stamps and compositing run on the GPU; CPU is no longer the
 source of truth for paint.
 - **Build:** brush stamp as a compute (or render-to-texture) pass writing
@@ -322,6 +322,17 @@ source of truth for paint.
 - **Touches:** `paint.rs`, `renderer.rs`, new compute shader.
 - **Done when:** painting on a 1024² texture with a large brush stays smooth.
 - **Depends on:** G10
+- _2026-05-26: **deferred by decision.** The done-when (smooth 1024² painting) is
+  outside lowtex's PSX scope — the tool targets 64–256px textures (default 128²),
+  where the CPU composite + bleed + quantize path is sub-millisecond and the
+  per-stamp re-upload is negligible (measured: a full headless GPU-init + render +
+  AO/highlight bake + indexed export is 30–70 ms total). A GPU-compute rewrite
+  would rework the working, correct CPU pipeline (which everything else — layers,
+  masks, undo snapshots, export, presets — currently reads as the source of truth)
+  for headroom the product doesn't need. Revisit only if large-canvas painting
+  becomes a goal; the lighter win if so is dirty-rect partial uploads rather than a
+  full compute rewrite. Like G7 (screen-space PSX shader), descoped to keep the
+  architecture honest about what a PSX texture painter actually needs._
 
 ### [x] G13 — Undo/redo
 **Outcome:** Ctrl-Z/Ctrl-Y across strokes and layer ops.
