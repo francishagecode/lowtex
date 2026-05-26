@@ -191,7 +191,7 @@ paint → export a PNG.** That single loop is the line between tech demo and too
   `bvh_faster_than_brute_force` (5000 tris, 2000 picks: ~190× faster, 63ms→0.3ms,
   identical hit set)._
 
-### [ ] G6 — Stroke engine
+### [x] G6 — Stroke engine
 **Outcome:** Drags paint continuous strokes, not gappy dots.
 - **Build:** interpolate brush stamps between consecutive mouse samples by
   spacing (% of brush size); soft falloff by hardness; opacity accumulation per
@@ -200,6 +200,14 @@ paint → export a PNG.** That single loop is the line between tech demo and too
 - **Touches:** `paint.rs`, `app.rs`.
 - **Done when:** a fast drag across the model leaves a solid, even line.
 - **Depends on:** G3
+- _2026-05-26: `Renderer::begin_stroke`/`paint_segment`/`end_stroke`.
+  `paint_segment` interpolates ~2px screen steps between mouse samples (capped at
+  1024), re-picking at each so strokes follow the surface across faces.
+  `Texture::stamp_stroke` accumulates per-texel coverage as a *max* against a
+  stroke-start snapshot, so overlap tops out at the brush opacity (no
+  double-darkening). app.rs drives begin/segment/end on LMB. Verified headless
+  (`--stroke`): a single big diagonal jump renders a solid even line; at
+  `--brush-opacity 0.4` the heavily-overlapping band stays uniform 40%._
 
 ---
 

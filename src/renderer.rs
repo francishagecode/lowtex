@@ -67,6 +67,11 @@ pub struct Renderer {
     paint_texture_cpu: PaintTexture,
     tex_size: u32,
 
+    // Stroke accumulation (G6): the texture snapshot at stroke start + per-texel
+    // coverage, so overlapping stamps within one stroke don't double-darken.
+    stroke_base: Vec<u8>,
+    stroke_coverage: Vec<f32>,
+
     depth_view: wgpu::TextureView,
 
     // egui overlay renderer; None in headless mode.
@@ -323,6 +328,9 @@ impl Renderer {
         // BVH over the mesh triangles for fast ray picking (G5).
         let bvh = Bvh::build(&mesh);
 
+        let stroke_base = paint_texture_cpu.pixels.clone();
+        let stroke_coverage = vec![0.0; (tex_size * tex_size) as usize];
+
         Self {
             window: None,
             surface: None,
@@ -340,6 +348,8 @@ impl Renderer {
             paint_texture_gpu,
             paint_texture_cpu,
             tex_size,
+            stroke_base,
+            stroke_coverage,
             depth_view,
             egui_renderer: None,
             max_texture_dim,
@@ -423,6 +433,9 @@ impl Renderer {
             &self.paint_texture_gpu,
             &self.sampler,
         );
+        // The stroke buffers must track the (possibly resized) texture.
+        self.stroke_base = self.paint_texture_cpu.pixels.clone();
+        self.stroke_coverage = vec![0.0; (self.tex_size * self.tex_size) as usize];
     }
 
     /// Save the painted texture to a PNG. The CPU texture holds sRGB-encoded
@@ -465,32 +478,89 @@ impl Renderer {
         self.rebuild_paint_gpu();
     }
 
-    /// Called when the mouse moves while held, or on click.
-    /// Casts a ray, finds the UV, stamps the brush, re-uploads the texture.
-    pub fn paint_at(&mut self, mouse_px: (f32, f32), brush: &Brush) {
-        let (w, h) = match &self.window {
+    /// Begin a new stroke: snapshot the texture and clear stroke coverage, so
+    /// overlap within the stroke accumulates by max-coverage (no double-darken).
+    pub fn begin_stroke(&mut self) {
+        self.stroke_base.clear();
+        self.stroke_base
+            .extend_from_slice(&self.paint_texture_cpu.pixels);
+        self.stroke_coverage.fill(0.0);
+    }
+
+    /// End the current stroke. (The painted pixels are already committed; the
+    /// next `begin_stroke` re-snapshots from them.)
+    pub fn end_stroke(&mut self) {}
+
+    /// The current screen size (window physical size, or the headless config).
+    fn screen_size(&self) -> Vec2 {
+        match &self.window {
             Some(window) => {
                 let s = window.inner_size();
-                (s.width as f32, s.height as f32)
+                Vec2::new(s.width as f32, s.height as f32)
             }
-            None => (self.config.width as f32, self.config.height as f32),
-        };
-        let screen_size = Vec2::new(w, h);
-        let mouse = Vec2::new(mouse_px.0, mouse_px.1);
+            None => Vec2::new(self.config.width as f32, self.config.height as f32),
+        }
+    }
 
+    /// Build a stable world-space pick ray for a screen pixel.
+    fn pick_ray(&self, mouse_px: Vec2) -> Ray {
         let inv_view_proj = self.camera.view_proj().inverse();
         let ray_origin = self.camera.eye();
-        let ray = Ray::from_screen(mouse, screen_size, inv_view_proj);
-
+        let ray = Ray::from_screen(mouse_px, self.screen_size(), inv_view_proj);
         // Pin the origin to the camera eye for stability — unproject can wobble
         // for near==0 depending on driver.
-        let ray = Ray {
+        Ray {
             origin: ray_origin,
             direction: (ray.origin + ray.direction - ray_origin).normalize(),
-        };
+        }
+    }
 
+    /// Pick + stamp a single dab at a screen pixel (no GPU upload). Returns
+    /// whether it hit the mesh.
+    fn stamp_screen(&mut self, mouse_px: Vec2, brush: &Brush) -> bool {
+        let ray = self.pick_ray(mouse_px);
         if let Some(uv) = self.bvh.pick_uv(&ray) {
-            self.paint_texture_cpu.stamp(uv, brush);
+            self.paint_texture_cpu.stamp_stroke(
+                uv,
+                brush,
+                &self.stroke_base,
+                &mut self.stroke_coverage,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stamp a single dab at a screen pixel and upload. Used for the initial
+    /// click of a stroke and for headless verification.
+    pub fn paint_at(&mut self, mouse_px: (f32, f32), brush: &Brush) {
+        if self.stamp_screen(Vec2::new(mouse_px.0, mouse_px.1), brush) {
+            upload_texture(
+                &self.queue,
+                &self.paint_texture_gpu,
+                &self.paint_texture_cpu,
+            );
+        }
+    }
+
+    /// Paint a continuous stroke segment from `from` to `to` (screen pixels),
+    /// interpolating stamps so a fast drag leaves a solid line, not gappy dots.
+    /// Re-picks at each sub-sample so the stroke follows the surface across faces.
+    pub fn paint_segment(&mut self, from: (f32, f32), to: (f32, f32), brush: &Brush) {
+        let from = Vec2::new(from.0, from.1);
+        let to = Vec2::new(to.0, to.1);
+        // ~2px steps guarantee overlap regardless of brush size. Cap the count so
+        // a giant drag can't stall; coverage accumulation prevents double-darken.
+        const STEP_PX: f32 = 2.0;
+        let dist = (to - from).length();
+        let steps = ((dist / STEP_PX).ceil() as u32).clamp(1, 1024);
+        let mut hit_any = false;
+        for k in 1..=steps {
+            let t = k as f32 / steps as f32;
+            hit_any |= self.stamp_screen(from.lerp(to, t), brush);
+        }
+        if hit_any {
             upload_texture(
                 &self.queue,
                 &self.paint_texture_gpu,

@@ -208,14 +208,16 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                let prev = self.last_pos;
                 let pos = (position.x as f32, position.y as f32);
-                let dx = pos.0 - self.last_pos.0;
-                let dy = pos.1 - self.last_pos.1;
+                let dx = pos.0 - prev.0;
+                let dy = pos.1 - prev.1;
                 self.mouse_pos = pos;
                 self.last_pos = pos;
                 match self.drag {
                     Drag::Paint => {
-                        renderer.paint_at(self.mouse_pos, &self.ui.brush);
+                        // Interpolate from the previous sample so fast drags stay solid.
+                        renderer.paint_segment(prev, pos, &self.ui.brush);
                         window.request_redraw();
                     }
                     Drag::Orbit => {
@@ -240,12 +242,18 @@ impl ApplicationHandler for App {
                 match (button, pressed) {
                     (MouseButton::Left, true) => {
                         self.drag = Drag::Paint;
+                        renderer.begin_stroke();
                         renderer.paint_at(self.mouse_pos, &self.ui.brush);
                         window.request_redraw();
                     }
                     (MouseButton::Right, true) => self.drag = Drag::Orbit,
                     (MouseButton::Middle, true) => self.drag = Drag::Pan,
-                    (_, false) => self.drag = Drag::None,
+                    (_, false) => {
+                        if self.drag == Drag::Paint {
+                            renderer.end_stroke();
+                        }
+                        self.drag = Drag::None;
+                    }
                     _ => {}
                 }
             }

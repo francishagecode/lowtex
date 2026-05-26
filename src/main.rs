@@ -33,6 +33,8 @@ struct Args {
     height: u32,
     /// Headless verification: stamp a brush at screen center before capture.
     paint: bool,
+    /// Headless verification: paint one fast drag (a single stroke) before capture.
+    stroke: bool,
     /// Headless verification: orbit horizontally by this many degrees before capture.
     orbit_deg: f32,
     /// Headless verification: draw the egui panel into the screenshot.
@@ -40,6 +42,7 @@ struct Args {
     /// Headless verification: override the brush (color r,g,b in 0..1 and size).
     brush_color: Option<[f32; 3]>,
     brush_size: Option<f32>,
+    brush_opacity: Option<f32>,
     /// Headless verification: load a starting texture / save the result / set res.
     load_texture: Option<String>,
     save_texture: Option<String>,
@@ -53,10 +56,12 @@ fn parse_args() -> Args {
         width: 1024,
         height: 768,
         paint: false,
+        stroke: false,
         orbit_deg: 0.0,
         ui: false,
         brush_color: None,
         brush_size: None,
+        brush_opacity: None,
         load_texture: None,
         save_texture: None,
         res: None,
@@ -66,6 +71,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--screenshot" => args.screenshot = it.next(),
             "--paint" => args.paint = true,
+            "--stroke" => args.stroke = true,
             "--ui" => args.ui = true,
             "--orbit" => {
                 if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
@@ -81,6 +87,7 @@ fn parse_args() -> Args {
                 }
             }
             "--brush-size" => args.brush_size = it.next().and_then(|s| s.parse().ok()),
+            "--brush-opacity" => args.brush_opacity = it.next().and_then(|s| s.parse().ok()),
             "--load-texture" => args.load_texture = it.next(),
             "--save-texture" => args.save_texture = it.next(),
             "--res" => args.res = it.next().and_then(|s| s.parse().ok()),
@@ -144,6 +151,9 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     if let Some(s) = args.brush_size {
         brush.radius = s;
     }
+    if let Some(o) = args.brush_opacity {
+        brush.opacity = o;
+    }
 
     if let Some(size) = args.res {
         renderer.set_texture_resolution(size);
@@ -169,6 +179,13 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     };
     if args.paint {
         dab(&mut renderer);
+    }
+    if args.stroke {
+        // One fast diagonal drag across the front face — interpolation should
+        // fill it solid despite the large jump between the two endpoints.
+        renderer.begin_stroke();
+        renderer.paint_segment((cx - 80.0, cy - 50.0), (cx + 80.0, cy + 50.0), &brush);
+        renderer.end_stroke();
     }
     if args.orbit_deg != 0.0 {
         renderer.orbit_view_radians(args.orbit_deg.to_radians(), 0.0);

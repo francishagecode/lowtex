@@ -87,13 +87,14 @@ impl Texture {
         out
     }
 
-    /// Stamp a brush at a UV coordinate, blending by the brush's opacity and a
-    /// hardness-controlled radial falloff. UV is in [0,1] with V=0 at the top
-    /// (matches wgpu texture orientation).
+    /// Stamp a brush at a UV coordinate with per-stroke coverage accumulation.
     ///
-    /// Blending is per-stamp, so heavy overlap within one drag double-darkens;
-    /// per-stroke accumulation is G6's job.
-    pub fn stamp(&mut self, uv: Vec2, brush: &Brush) {
+    /// `base` is the texture as it was when the stroke began; `coverage` is the
+    /// stroke's accumulated per-texel coverage (0..1). Overlapping stamps within
+    /// one stroke take the *max* coverage rather than adding, so a slow drag or a
+    /// dense interpolation doesn't double-darken — the stroke tops out at the
+    /// brush's opacity. UV is in [0,1] with V=0 at the top.
+    pub fn stamp_stroke(&mut self, uv: Vec2, brush: &Brush, base: &[u8], coverage: &mut [f32]) {
         let cx = uv.x * self.width as f32;
         let cy = uv.y * self.height as f32;
         let radius = brush.radius.max(0.5);
@@ -112,11 +113,18 @@ impl Texture {
                 if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
                     continue;
                 }
-                let i = ((y as u32 * self.width + x as u32) * 4) as usize;
+                let texel = (y as u32 * self.width + x as u32) as usize;
+                if a <= coverage[texel] {
+                    continue; // already covered at least this much this stroke
+                }
+                coverage[texel] = a;
+                let cov = a;
+                let i = texel * 4;
                 for (c, &src) in color.iter().enumerate() {
-                    let dst = self.pixels[i + c] as f32;
-                    self.pixels[i + c] =
-                        (dst * (1.0 - a) + src as f32 * a).round().clamp(0.0, 255.0) as u8;
+                    let dst = base[i + c] as f32;
+                    self.pixels[i + c] = (dst * (1.0 - cov) + src as f32 * cov)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                 }
                 self.pixels[i + 3] = 255;
             }
