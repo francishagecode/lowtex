@@ -49,6 +49,10 @@ const HISTORY_CAP: usize = 64;
 /// The color format used for offscreen capture. sRGB to match the surface.
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// How many texels to bleed island colors into the UV gutter (G18). A few px is
+/// enough to cover nearest-neighbour sampling slop at seams without smearing.
+const BLEED_PAD: u32 = 4;
+
 /// egui paint data for one frame, produced by the App and consumed by `render`.
 pub struct UiPaint<'a> {
     pub jobs: &'a [egui::ClippedPrimitive],
@@ -150,6 +154,11 @@ pub struct Renderer {
     // Cached UV-island map at the current resolution, driving the fill tools.
     // Invalidated alongside mesh_maps (geometry or resolution change).
     fill_map: Option<crate::fill::FillMap>,
+    // Cached UV-coverage mask for island bleed (G18): which texels a triangle
+    // covers, so we can dilate paint into the gutter. Lazily built in the display
+    // path; invalidated on geometry change. RefCell so the &self display helper can
+    // populate it.
+    coverage: std::cell::RefCell<Option<Vec<bool>>>,
 }
 
 impl Renderer {
@@ -433,6 +442,7 @@ impl Renderer {
             bvh,
             mesh_maps: None,
             fill_map: None,
+            coverage: std::cell::RefCell::new(None),
         }
     }
 
@@ -465,9 +475,11 @@ impl Renderer {
         );
     }
 
-    /// Composite the layers, palette-quantize the result (if enabled), and upload
-    /// it. Non-destructive — the layers keep full color.
-    fn refresh_display_texture(&self) {
+    /// Composite the layers, palette-quantize (if enabled), then bleed island
+    /// colors into the UV gutter (G18) so nearest sampling at a seam can't reveal
+    /// background. Shared by the upload and export paths so the PNG matches the
+    /// model. Non-destructive — the layers keep full color.
+    fn composite_display(&self) -> Vec<u8> {
         let mut display = self.layers.composite();
         if self.palette_settings.enabled && !self.palette.colors.is_empty() {
             self.palette.quantize_rgba(
@@ -477,6 +489,30 @@ impl Renderer {
                 self.palette_settings.dither_strength,
             );
         }
+        // Lazily build (and cache) the UV-coverage mask, then dilate into the gutter.
+        {
+            let mut slot = self.coverage.borrow_mut();
+            let need = slot
+                .as_ref()
+                .is_none_or(|c| c.len() != (self.tex_size * self.tex_size) as usize);
+            if need {
+                *slot = Some(crate::bleed::coverage(&self.mesh, self.tex_size));
+            }
+            if let Some(cov) = slot.as_ref() {
+                // `LOWTEX_BLEED_PAD` overrides the default for tuning/debugging.
+                let pad = std::env::var("LOWTEX_BLEED_PAD")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(BLEED_PAD);
+                crate::bleed::dilate(&mut display, cov, self.tex_size, pad);
+            }
+        }
+        display
+    }
+
+    /// Composite and upload the display texture.
+    fn refresh_display_texture(&self) {
+        let display = self.composite_display();
         upload_pixels(
             &self.queue,
             &self.paint_texture_gpu,
@@ -504,19 +540,10 @@ impl Renderer {
         self.refresh_display_texture();
     }
 
-    /// The composited (and quantized, if enabled) texture as currently shown —
-    /// used for export so the PNG matches the model.
+    /// The composited (quantized + gutter-bled, if enabled) texture as currently
+    /// shown — used for export so the PNG matches the model.
     pub fn display_pixels(&self) -> Vec<u8> {
-        let mut px = self.layers.composite();
-        if self.palette_settings.enabled && !self.palette.colors.is_empty() {
-            self.palette.quantize_rgba(
-                &mut px,
-                self.tex_size,
-                self.palette_settings.dither,
-                self.palette_settings.dither_strength,
-            );
-        }
-        px
+        self.composite_display()
     }
 
     /// The active palette (for the UI swatch row).
@@ -1062,6 +1089,7 @@ impl Renderer {
         self.mesh = mesh;
         self.mesh_maps = None; // geometry changed; baked maps are stale
         self.fill_map = None; // geometry changed; island map is stale
+        *self.coverage.get_mut() = None; // UV coverage is stale
         Ok(())
     }
 
@@ -1090,6 +1118,7 @@ impl Renderer {
         self.mesh = mesh;
         self.mesh_maps = None;
         self.fill_map = None;
+        *self.coverage.get_mut() = None;
     }
 
     /// Save the entire editing state to a `.lowtex` file (G24).
@@ -1167,6 +1196,7 @@ impl Renderer {
         self.mesh = mesh;
         self.mesh_maps = None;
         self.fill_map = None;
+        *self.coverage.get_mut() = None;
 
         // Rebuild the layer stack.
         let n = (doc.tex_size * doc.tex_size * 4) as usize;

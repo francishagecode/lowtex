@@ -13,6 +13,7 @@
 
 mod app;
 mod bake;
+mod bleed;
 mod bvh;
 mod camera;
 mod export;

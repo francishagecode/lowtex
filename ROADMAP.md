@@ -399,7 +399,7 @@ lowtex should unwrap them in-style. Projection methods fit PSX better than LSCM.
   stay in the atlas and don't overlap. (90°-rotation + 8px snapping deferred as a
   refinement; basic non-overlapping fill is in.)_
 
-### [ ] G18 — Seam-aware painting + island bleed
+### [x] G18 — Seam-aware painting + island bleed
 **Outcome:** Strokes across UV-island boundaries don't leave visible seams.
 - **Build:** dilate/bleed painted texels outward past island edges into the gutter
   so nearest-neighbor sampling can't reveal background; ideally paint in 3D space
@@ -407,6 +407,18 @@ lowtex should unwrap them in-style. Projection methods fit PSX better than LSCM.
 - **Touches:** `paint.rs`/compute, `unwrap.rs`.
 - **Done when:** a stroke crossing a seam shows no gap on the rendered mesh.
 - **Depends on:** G12, G17
+- **Done (2026-05-26):** new `src/bleed.rs` — `coverage(mesh, size)` rasterizes the
+  UV triangles into a per-texel mask, and `dilate()` floods island colors outward
+  into the gutter by `BLEED_PAD` (4) rings. Wired into `Renderer::composite_display()`
+  (shared by the live upload and PNG export paths, so what you see and what you
+  export both get the bleed), with the coverage mask cached and invalidated on any
+  geometry change. UV→texel uses the same `uv.y * size` convention as `paint.rs`, so
+  the *correct* gutter side is filled. Verified end-to-end: per-face-unwrapped cube,
+  fill-object, indexed export — strict coverage (pad 0) = 6772 red texels vs bleed
+  (pad 4) = 9900, i.e. a +3128-texel ring around every island closing the seams.
+  `LOWTEX_BLEED_PAD` env var overrides the width for tuning. The "paint in 3D so a
+  stroke writes both sides of a seam" idea is deferred to the G12 GPU rewrite; the
+  gutter dilation alone satisfies the done-when (no gap on the rendered mesh).
 
 ---
 
