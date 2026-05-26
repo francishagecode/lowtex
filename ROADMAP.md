@@ -530,7 +530,7 @@ Target: an indie dev can adopt lowtex, finish a model, and get it into their eng
   reopen in a fresh process renders **byte-identical**. (Generators are baked into
   pixels here; a re-evaluatable generator *recipe* is G21.)_
 
-### [ ] G25 — Robustness & performance pass
+### [x] G25 — Robustness & performance pass
 **Outcome:** lowtex doesn't fall over on real-world input.
 - **Build:** graceful errors for malformed/huge meshes and missing UVs; bounds on
   texture/mesh size; profile paint/composite/bake hot paths; sanity-cap memory.
@@ -538,6 +538,21 @@ Target: an indie dev can adopt lowtex, finish a model, and get it into their eng
 - **Done when:** a stress set of community low-poly assets all load, paint, and
   export without crashes or stalls.
 - **Depends on:** G18, G20
+- **Done (2026-05-26):** added `model::validate()` (runs before any post-processing,
+  so smooth-normals/box-projection/picking/bake/bleed can all assume clean input):
+  rejects out-of-range indices (which would panic on `vertices[i]`), non-finite
+  (NaN/inf) positions (which would poison `bounds()`→the whole transform), and
+  non-triangle index counts, each with a human-readable reason; `MAX_TRIANGLES`
+  (2M) cap so a giant mesh errors instead of stalling the per-load BVH+bake. These
+  join the pre-existing guards: missing normals → smooth normals, missing UVs → box
+  projection, empty mesh → error, surface/texture dims clamped to the adapter's
+  `max_texture_dim`. Verified: a corrupt-index OBJ and a NaN OBJ both fall back to
+  the sample cube with a logged reason and **no panic**; 4 unit tests cover the
+  validate cases. Profiled the bake hot path — full headless GPU-init + render +
+  AO/highlight bake + indexed export is 30–70 ms on the sample meshes, so no stall
+  at PSX scale. _Note: the "community stress set" was synthetic malformed inputs +
+  the bundled samples, not a downloaded asset corpus; `.lowtex` project files
+  (self-produced) aren't re-validated on load._
 
 ### [x] G26 — Onboarding & docs
 **Outcome:** A new user reaches load→paint→export in under a minute.

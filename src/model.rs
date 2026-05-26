@@ -19,6 +19,12 @@ use crate::mesh::{Mesh, Vertex};
 /// ~3.5 units out, so ~1.6 units frames the model without clipping.
 const FRAME_SIZE: f32 = 1.6;
 
+/// Upper bound on triangle count (G25). lowtex targets low-poly/PSX assets
+/// (hundreds–thousands of tris); past this the per-load BVH build and AO bake
+/// stall the UI for seconds, so we reject with a clear message rather than hang.
+/// Generous enough that no legitimate retro asset hits it.
+const MAX_TRIANGLES: usize = 2_000_000;
+
 /// Load a mesh from `path`, dispatching on file extension. On failure returns a
 /// human-readable error; the caller can fall back to the sample cube.
 pub fn load(path: &str) -> Result<Mesh, String> {
@@ -38,6 +44,7 @@ pub fn load(path: &str) -> Result<Mesh, String> {
         return Err(format!("'{path}' contained no triangles"));
     }
 
+    validate(&mesh).map_err(|e| format!("'{path}': {e}"))?;
     finalize(&mut mesh);
     log::info!(
         "loaded '{}' — {} verts, {} tris",
@@ -46,6 +53,40 @@ pub fn load(path: &str) -> Result<Mesh, String> {
         mesh.indices.len() / 3
     );
     Ok(mesh)
+}
+
+/// Reject input that would later panic or stall (G25), with a human-readable
+/// reason. Runs before `finalize`, so smooth-normals / box-projection / picking /
+/// bake / bleed can all assume in-range indices and finite positions.
+fn validate(mesh: &Mesh) -> Result<(), String> {
+    let tris = mesh.indices.len() / 3;
+    if tris > MAX_TRIANGLES {
+        return Err(format!(
+            "{tris} triangles exceeds the {MAX_TRIANGLES}-triangle limit — \
+             decimate the mesh first (lowtex targets low-poly assets)"
+        ));
+    }
+    if !mesh.indices.len().is_multiple_of(3) {
+        return Err(format!(
+            "index count {} is not a multiple of 3 (not triangles)",
+            mesh.indices.len()
+        ));
+    }
+    let n = mesh.vertices.len() as u32;
+    if let Some(&bad) = mesh.indices.iter().find(|&&i| i >= n) {
+        return Err(format!(
+            "index {bad} references a vertex outside the {n}-vertex buffer (corrupt mesh)"
+        ));
+    }
+    if let Some((i, _)) = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .find(|(_, v)| v.position.iter().any(|c| !c.is_finite()))
+    {
+        return Err(format!("vertex {i} has a non-finite (NaN/inf) position"));
+    }
+    Ok(())
 }
 
 /// Shared post-processing: fill in missing attributes and frame the model.
@@ -164,4 +205,36 @@ fn load_obj(path: &str) -> Result<Mesh, String> {
         needs_normals: !had_normals,
         needs_uvs: !had_uvs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_mesh_passes() {
+        assert!(validate(&Mesh::cube()).is_ok());
+    }
+
+    #[test]
+    fn out_of_range_index_is_rejected() {
+        let mut m = Mesh::cube();
+        let n = m.vertices.len() as u32;
+        m.indices[0] = n; // one past the end
+        assert!(validate(&m).unwrap_err().contains("outside"));
+    }
+
+    #[test]
+    fn non_finite_position_is_rejected() {
+        let mut m = Mesh::cube();
+        m.vertices[0].position[1] = f32::NAN;
+        assert!(validate(&m).unwrap_err().contains("non-finite"));
+    }
+
+    #[test]
+    fn non_triangle_index_count_is_rejected() {
+        let mut m = Mesh::cube();
+        m.indices.pop(); // count no longer divisible by 3
+        assert!(validate(&m).unwrap_err().contains("multiple of 3"));
+    }
 }
