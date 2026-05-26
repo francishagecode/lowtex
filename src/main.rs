@@ -12,6 +12,7 @@
 // scene the window would, to an offscreen texture, and writes it to disk.
 
 mod app;
+mod bvh;
 mod camera;
 mod mesh;
 mod model;

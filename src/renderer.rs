@@ -29,9 +29,10 @@ use glam::Vec2;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::bvh::Bvh;
 use crate::camera::Camera;
 use crate::mesh::{Mesh, Vertex};
-use crate::paint::{pick_uv, Brush, Ray, Texture as PaintTexture};
+use crate::paint::{Brush, Ray, Texture as PaintTexture};
 
 const TEX_SIZE: u32 = 128; // PSX-scale. Bump to 256 if you want.
 
@@ -75,7 +76,11 @@ pub struct Renderer {
     max_texture_dim: u32,
 
     camera: Camera,
+    // Kept for goals that re-read geometry (unwrap G14, bake G19); the BVH owns
+    // its own triangle copy for picking.
+    #[allow(dead_code)]
     mesh: Mesh,
+    bvh: Bvh,
 }
 
 impl Renderer {
@@ -315,6 +320,9 @@ impl Renderer {
 
         let depth_view = make_depth_view(&device, width, height);
 
+        // BVH over the mesh triangles for fast ray picking (G5).
+        let bvh = Bvh::build(&mesh);
+
         Self {
             window: None,
             surface: None,
@@ -337,6 +345,7 @@ impl Renderer {
             max_texture_dim,
             camera,
             mesh,
+            bvh,
         }
     }
 
@@ -480,7 +489,7 @@ impl Renderer {
             direction: (ray.origin + ray.direction - ray_origin).normalize(),
         };
 
-        if let Some(uv) = pick_uv(&ray, &self.mesh) {
+        if let Some(uv) = self.bvh.pick_uv(&ray) {
             self.paint_texture_cpu.stamp(uv, brush);
             upload_texture(
                 &self.queue,

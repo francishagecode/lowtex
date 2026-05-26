@@ -177,13 +177,19 @@ paint → export a PNG.** That single loop is the line between tech demo and too
   Verified headless: paint→save→load reproduces the paint on a fresh cube; 64²
   renders chunkier._
 
-### [ ] G5 — BVH-accelerated picking
+### [x] G5 — BVH-accelerated picking
 **Outcome:** Picking is fast on real (thousands-of-tris) meshes.
 - **Build:** build a BVH over triangles once at load; replace the O(all-tris)
   loop in `pick_uv`. Rebuild on mesh change only.
 - **Touches:** `paint.rs`; **crates:** `bvh` (or hand-rolled).
 - **Done when:** picking a 5k-tri mesh has no perceptible lag on click-drag.
 - **Depends on:** G1 (value appears once meshes are non-trivial)
+- _2026-05-26: `src/bvh.rs` — hand-rolled midpoint-split BVH (LEAF_MAX=4), built
+  once in `Renderer::build`, used by `paint_at`. Padded-slab traversal (epsilon
+  pad handles flat meshes / boundary-aligned rays; zero-dir components nudged).
+  Tests: `bvh_matches_brute_force` (UVs match the brute-force oracle) and
+  `bvh_faster_than_brute_force` (5000 tris, 2000 picks: ~190× faster, 63ms→0.3ms,
+  identical hit set)._
 
 ### [ ] G6 — Stroke engine
 **Outcome:** Drags paint continuous strokes, not gappy dots.

@@ -169,7 +169,12 @@ impl Ray {
 /// Returns (t, u, v) where t is distance along ray, (u, v) are barycentric
 /// coordinates suitable for interpolating vertex attributes:
 ///   point = (1 - u - v) * v0 + u * v1 + v * v2
-fn intersect_triangle(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<(f32, f32, f32)> {
+pub(crate) fn intersect_triangle(
+    ray: &Ray,
+    v0: Vec3,
+    v1: Vec3,
+    v2: Vec3,
+) -> Option<(f32, f32, f32)> {
     const EPS: f32 = 1e-7;
     let edge1 = v1 - v0;
     let edge2 = v2 - v0;
@@ -200,7 +205,9 @@ fn intersect_triangle(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<(f32, f
 /// Cast a ray against every triangle in the mesh. Returns the UV at the closest
 /// hit, or None if the ray misses everything.
 ///
-/// O(n) per click. Fine for a cube. v0.2 builds a BVH for arbitrary meshes.
+/// O(n) per click. Superseded for real picking by the BVH (G5); kept as the
+/// brute-force oracle the BVH is tested against.
+#[allow(dead_code)]
 pub fn pick_uv(ray: &Ray, mesh: &Mesh) -> Option<Vec2> {
     let mut best: Option<(f32, Vec2)> = None;
 
