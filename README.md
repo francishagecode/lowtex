@@ -1,75 +1,101 @@
-# Lowtex — v0.1 (proof of paint)
+# lowtex
 
-The smallest possible version of the PSX-style 3D texture painter: opens a window, renders a cube, lets you click and drag to paint directly on it. That's it.
+A focused **3D texture painter for the PS1 / low-poly aesthetic** — written in
+Rust (winit + wgpu + egui). Load a low-poly model, paint straight onto it, and
+constrain the result to a limited palette with dithering, the way PS1-era artists
+worked. The differentiator: **the mesh tells you where to paint** — bake ambient
+occlusion and curvature once, and "grime in the crevices" or "wear on the edges"
+happens automatically, at 64×64 with 16 colors.
 
-## What this proves
-
-- Mouse pixel → world-space ray (unproject through inverse view-projection)
-- Ray → mesh intersection (Möller–Trumbore against every triangle)
-- Hit → UV (barycentric interpolation of vertex UVs)
-- UV → texel write (CPU-side brush stamp into an RGBA buffer)
-- Texel → screen (re-upload texture to GPU, re-render with nearest-neighbor sampling)
-
-If this loop feels good, the rest of the tool is built on this foundation. If it doesn't, better to find out now.
+It deliberately does *not* chase Substance Painter's PBR surface area. It leans
+into the constraints of the style and turns them into features. See
+[DESIGN.md](DESIGN.md) for the rationale and [ROADMAP.md](ROADMAP.md) for status.
 
 ## Run it
 
-You need [Rust](https://rustup.rs/) installed (any recent stable, 1.75+).
+You need [Rust](https://rustup.rs/) (recent stable).
 
 ```bash
-cargo run --release
+cargo run --release                       # opens the sample cube
+cargo run --release -- assets/samples/octahedron.obj   # or your own .gltf/.glb/.obj
 ```
 
-First build will take a couple of minutes (wgpu has a lot of transitive deps). After that it's seconds.
+First build pulls a lot of wgpu deps (a couple of minutes); after that it's
+seconds.
+
+## 60-second first texture
+
+1. **Open** a model (top of the panel) or use the cube that's already there.
+2. **Unwrap → Box** if the model's UVs are bad or missing (most downloaded
+   low-poly assets).
+3. Pick a **Color** and a **Size**, then **left-drag** on the model to paint.
+4. **Ambient occlusion → Darken (AO)** drops shadow into the crevices;
+   **Highlights** brightens the edges — both as their own layers you can dial back.
+5. Turn on **Palette → Quantize** and pick **PICO-8** to snap everything to 16
+   colors with dithering — the PS1 look.
+6. **Export indexed…** writes a true paletted PNG ready for your engine.
 
 ## Controls
 
-- **Left-click + drag** — paint
-- **Close window** — exit
+| Input | Action |
+|-------|--------|
+| **Left-drag** | Paint (brush) / bucket-fill (with a fill tool selected) |
+| **Right-drag** | Orbit the camera |
+| **Middle-drag** | Pan |
+| **Scroll** | Zoom |
+| **Ctrl/⌘ + Z** | Undo |
+| **Ctrl/⌘ + Shift + Z** | Redo |
 
-That's all there is in v0.1.
+## What's in it
 
-## What you should see
+- **Load** glTF / glb / OBJ; missing normals/UVs are synthesized so any mesh is
+  paintable. **Unwrap** Box / Smart / Per-face when UVs are bad.
+- **Brush** with size / opacity / hardness; gap-free interpolated strokes; bucket
+  **fill** (island / object / face).
+- **Layers** with blend modes (Normal/Multiply/Add/Screen), opacity, visibility,
+  reorder, and a paintable **reveal mask** per layer.
+- **Palette** quantize + ordered dithering (PICO-8 / Game Boy / Grayscale, or
+  generate one from any image). Applied to the texture, so it's WYSIWYG.
+- **Mesh-aware effects**: baked AO + curvature drive **Darken (AO)**,
+  **Highlights**, **Dirt**, **Edge-wear**, and "mask from map" — paint that
+  follows the geometry with zero hand-work.
+- **Materials**: fill a layer with an image (brick, moss, …); mask it by AO for
+  material-in-the-crevices.
+- **Undo/redo**, **save/load** projects (`.lowtex`), and **export** (true indexed
+  PNG, engine-named files).
 
-A dark teal background with a white-and-grey checkerboard cube. The checkerboard reveals the box-projection UV layout (each face is one cell of a 2×3 grid). Click on the cube and a red dot appears. Drag and you get a stroke. Each face paints independently — the UV unwrap is per-face, no seam-blending yet.
+## Project files & export
 
-## File layout
+- **`.lowtex`** — your whole project (mesh, layers, masks, palette, settings),
+  a versioned RON file. Save/Open from the top of the panel.
+- **Export** — choose your engine (Unity/Unreal/Godot/glTF) for the right
+  filename, then *Export indexed…* for a true paletted PNG (retro pipelines) or
+  *Export RGBA…*. Set the texture to **Point/Nearest filtering, no mipmaps** on
+  import — the panel reminds you of the exact flag per engine.
+
+## Source layout
 
 ```
 src/
-  main.rs       — entry point, event loop kickoff
-  app.rs        — winit ApplicationHandler, owns window + input state
-  camera.rs     — static orbiting camera
-  mesh.rs       — Vertex layout + hand-built cube
-  paint.rs      — ray/triangle intersection + brush stamping
-  renderer.rs   — wgpu setup, GPU resources, draw + paint plumbing
-  shaders/
-    main.wgsl   — vertex + fragment shaders
+  main.rs     entry point, CLI, headless --screenshot
+  app.rs      winit handler: window, input routing, egui
+  camera.rs   orbit camera
+  mesh.rs / model.rs   Vertex + cube; glTF/OBJ loaders
+  bvh.rs      BVH for fast ray picking
+  paint.rs    ray/UV picking + CPU brush stamping
+  layers.rs   layer stack + blend + masks + compositor
+  palette.rs  palettes + median-cut + CPU quantize/dither
+  bake.rs     AO + curvature mesh maps (the "moat")
+  fill.rs     UV-island flood fill
+  noise.rs    value/Perlin/Worley noise
+  unwrap.rs   box / smart / per-face unwrap + chart packing
+  material.rs material-texture fill
+  export.rs   indexed-PNG + engine export presets
+  project.rs  .lowtex save/load
+  renderer.rs wgpu setup + GPU resources + plumbing
+  ui.rs       egui side panel
+  shaders/main.wgsl   scene shader (nearest-sampled)
 ```
 
-Read in that order. `main.rs` is 10 lines; `renderer.rs` is the biggest piece because wgpu has a lot of boilerplate for resource setup.
-
-## What's next (v0.2 — minimum viable painter)
-
-In rough priority order:
-
-1. **glTF mesh loading** — replace the hardcoded cube with the `gltf` crate
-2. **Orbit camera** — middle-mouse to orbit, scroll to zoom
-3. **BVH for ray picking** — O(n) per-triangle test won't scale past a few thousand tris; build a BVH with the `bvh` crate
-4. **Smart projection unwrap** — angle-clustered planar projection (the PSX-friendly default from the design doc)
-5. **PSX shader effects** — affine UVs, vertex snap, palette quantize as a post-process
-6. **GPU brush compute shader** — move the brush stamp to a compute pass so it scales to 1024² textures
-7. **egui UI** — brush size slider, color picker, palette picker
-8. **PNG export** — save the painted texture to disk
-
-Each of those is a sensible 1–3 day chunk for the next iterations.
-
-## Known limitations in v0.1
-
-- Cube only (no mesh import yet)
-- One color, one brush size (constants in `renderer.rs`)
-- No undo
-- No save/load
-- Painting near UV seams writes to one side only (seam dilation is a v0.3 feature)
-- Camera is static (no orbit)
-- CPU-side texture is re-uploaded in full on every paint stroke — fine at 128² but would thrash at higher resolutions. The compute shader rewrite in v0.2 fixes this.
+Build/test: `cargo build --release`, `cargo test`. Headless render for checks:
+`cargo run --release -- --screenshot out.png [MESH]`.

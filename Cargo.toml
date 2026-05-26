@@ -47,3 +47,10 @@ png = "0.17"
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
 base64 = "0.22"
+
+# Lean, fast shipping builds (G27): LTO + one codegen unit + stripped symbols.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

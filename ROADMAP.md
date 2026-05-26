@@ -527,7 +527,7 @@ Target: an indie dev can adopt lowtex, finish a model, and get it into their eng
   export without crashes or stalls.
 - **Depends on:** G18, G20
 
-### [ ] G26 — Onboarding & docs
+### [x] G26 — Onboarding & docs
 **Outcome:** A new user reaches load→paint→export in under a minute.
 - **Build:** sample meshes + starter palettes bundled; README/quickstart; a short
   "60-second first texture" walkthrough; tooltips in plain language (principle 1).
@@ -535,14 +535,25 @@ Target: an indie dev can adopt lowtex, finish a model, and get it into their eng
 - **Done when:** someone unfamiliar follows the quickstart and exports a texture
   without help.
 - **Depends on:** G23
+- _2026-05-26: README rewritten for the real tool — install/run, a "60-second
+  first texture" walkthrough, a controls table, feature + source overview, and the
+  `.lowtex`/export sections. Starter palettes ship built-in (PICO-8/Game Boy/
+  Grayscale); `assets/samples/octahedron.obj` bundled + referenced. UI buttons use
+  plain words + hover hints throughout (principle #1)._
 
-### [ ] G27 — Distribution
+### [~] G27 — Distribution *(CI/release scaffolding done; signed builds pending)*
 **Outcome:** Downloadable builds for macOS/Windows/Linux.
 - **Build:** release builds + bundling per platform; tagged releases; consider an
   itch.io page aimed at the Haunted PS1 / low-poly communities.
 - **Touches:** CI config, packaging.
 - **Done when:** a non-developer can download and run lowtex on their OS.
 - **Depends on:** G25, G26
+- _2026-05-26: lean release profile (LTO/strip). `.github/workflows/ci.yml`
+  (fmt/clippy/test/build on Linux/macOS/Windows, with the Linux X11/Wayland deps)
+  and `release.yml` (tag `v*` → per-target archives attached to a GitHub Release).
+  `docs/DISTRIBUTION.md` covers tagging + itch.io (butler) upload. Remaining:
+  actually cut a tagged release, and code-signing/notarization (unsigned builds
+  warn on first launch) — both need a real release run, not doable headless here._
 
 ---
 
