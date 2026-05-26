@@ -132,6 +132,17 @@ impl App {
         if let Some(mode) = actions.unwrap {
             renderer.apply_unwrap(mode);
         }
+        if let Some(tile) = actions.fill_material {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Image", &["png", "jpg", "jpeg"])
+                .pick_file()
+            {
+                match renderer.fill_active_with_material(&path.to_string_lossy(), tile) {
+                    Ok(()) => log::info!("filled layer with material {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
         if let Some(indexed) = actions.export_png {
             let preset = self.ui.export_preset;
             if let Some(path) = rfd::FileDialog::new()

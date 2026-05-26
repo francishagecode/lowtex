@@ -46,3 +46,4 @@ png = "0.17"
 # Project (.lowtex) serialization.
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
+base64 = "0.22"

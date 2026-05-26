@@ -19,6 +19,7 @@ mod export;
 mod fill;
 mod history;
 mod layers;
+mod material;
 mod mesh;
 mod model;
 mod noise;
@@ -75,6 +76,12 @@ struct Args {
     unwrap: Option<String>,
     /// Headless verification: export an indexed PNG to this path (needs --quantize).
     export_indexed: Option<String>,
+    /// Headless verification: fill the base layer with a material image (tiled).
+    material: Option<String>,
+    material_tile: f32,
+    /// Headless verification: material on a NEW layer, masked by AO (Cavities) —
+    /// the "moss in the crevices" workflow.
+    material_crevice: bool,
 }
 
 fn parse_args() -> Args {
@@ -105,6 +112,9 @@ fn parse_args() -> Args {
         fill_face: false,
         unwrap: None,
         export_indexed: None,
+        material: None,
+        material_tile: 4.0,
+        material_crevice: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -140,6 +150,13 @@ fn parse_args() -> Args {
             "--fill-face" => args.fill_face = true,
             "--unwrap" => args.unwrap = it.next(),
             "--export-indexed" => args.export_indexed = it.next(),
+            "--material" => args.material = it.next(),
+            "--material-tile" => {
+                if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
+                    args.material_tile = v;
+                }
+            }
+            "--material-crevice" => args.material_crevice = true,
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
             "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
@@ -203,6 +220,23 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
             _ => unwrap::UnwrapMode::Box,
         };
         renderer.apply_unwrap(mode);
+    }
+
+    if let Some(path) = &args.material {
+        if args.material_crevice {
+            // "Moss in the crevices": material on a new layer, masked by AO.
+            renderer.add_layer();
+            if let Err(e) = renderer.fill_active_with_material(path, args.material_tile) {
+                log::error!("{e}");
+            }
+            renderer
+                .fill_active_mask_from_map(bake::MapSource::Cavities, bake::Levels::amount(1.0));
+        } else {
+            match renderer.fill_active_with_material(path, args.material_tile) {
+                Ok(()) => log::info!("filled with material {path}"),
+                Err(e) => log::error!("{e}"),
+            }
+        }
     }
 
     if args.quantize {

@@ -75,6 +75,8 @@ pub struct UiActions {
     pub mask_from_map: Option<(MapSource, Levels)>,
     /// Export the texture (G23): `true` = true indexed PNG, `false` = RGBA8.
     pub export_png: Option<bool>,
+    /// Fill the active layer with a chosen material image, tiled this many times.
+    pub fill_material: Option<f32>,
     /// Re-unwrap the mesh's UVs (G14–G17).
     pub unwrap: Option<crate::unwrap::UnwrapMode>,
 }
@@ -98,6 +100,8 @@ pub struct UiState {
     pub mask_reveal: bool,
     /// Target engine for export naming/hints (G23).
     pub export_preset: ExportPreset,
+    /// How many times a material image tiles across UV when filling a layer.
+    pub material_tile: f32,
     /// Levels controls shared by every mesh effect: overall strength, mid-tone
     /// contrast, and invert. `effect_source` is which baked channel the generic
     /// "Tint layer" / "Mask layer" actions read from.
@@ -126,6 +130,7 @@ impl Default for UiState {
             paint_mask: false,
             mask_reveal: false,
             export_preset: ExportPreset::Plain,
+            material_tile: 4.0,
             ao_strength: 0.75,
             effect_contrast: 0.0,
             effect_invert: false,
@@ -223,6 +228,19 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             ui.add_space(10.0);
             ui.separator();
             mesh_effects_section(ui, state);
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label("Material");
+            ui.label(
+                egui::RichText::new("Fill the active layer with an image (brick, moss…). Mask it for crevice/edge detail.")
+                    .weak()
+                    .small(),
+            );
+            ui.add(egui::Slider::new(&mut state.material_tile, 1.0..=16.0).text("Tile"));
+            if ui.button("Fill with image…").clicked() {
+                state.actions.fill_material = Some(state.material_tile);
+            }
 
             ui.add_space(10.0);
             ui.separator();

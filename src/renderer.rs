@@ -1092,6 +1092,18 @@ impl Renderer {
         self.fill_map = None;
     }
 
+    /// Fill the active layer's color with a loaded material image (brick, moss, …),
+    /// UV-tiled `tile` times. Combine with a reveal mask (e.g. mask-from-Cavities)
+    /// for "moss in the crevices". Undoable.
+    pub fn fill_active_with_material(&mut self, path: &str, tile: f32) -> Result<(), String> {
+        let material = crate::material::Material::load(path)?;
+        self.checkpoint();
+        material.fill(self.layers.active_tex_mut(), tile);
+        self.resync_stroke_base();
+        self.refresh_display_texture();
+        Ok(())
+    }
+
     /// Begin a new stroke: snapshot the texture and clear stroke coverage, so
     /// overlap within the stroke accumulates by max-coverage (no double-darken).
     pub fn begin_stroke(&mut self) {
