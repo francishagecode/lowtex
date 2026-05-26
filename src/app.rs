@@ -12,21 +12,35 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use crate::mesh::Mesh;
 use crate::renderer::Renderer;
 
-#[derive(Default)]
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    // The mesh to paint, taken when the renderer is built on resume.
+    mesh: Option<Mesh>,
     mouse_pos: (f32, f32),
     mouse_down: bool,
+}
+
+impl App {
+    pub fn new(mesh: Mesh) -> Self {
+        Self {
+            window: None,
+            renderer: None,
+            mesh: Some(mesh),
+            mouse_pos: (0.0, 0.0),
+            mouse_down: false,
+        }
+    }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Create the window on resume (correct lifecycle for winit 0.30).
         let window_attrs = Window::default_attributes()
-            .with_title("Lowtex — proof of paint")
+            .with_title("lowtex")
             .with_inner_size(winit::dpi::LogicalSize::new(1024, 768));
 
         let window = Arc::new(
@@ -37,7 +51,8 @@ impl ApplicationHandler for App {
 
         // Renderer setup is async (wgpu::Instance::request_adapter etc).
         // pollster::block_on runs it synchronously here.
-        let renderer = pollster::block_on(Renderer::new(window.clone()));
+        let mesh = self.mesh.take().unwrap_or_else(Mesh::cube);
+        let renderer = pollster::block_on(Renderer::new(window.clone(), mesh));
 
         self.window = Some(window);
         self.renderer = Some(renderer);

@@ -53,6 +53,10 @@ impl Vertex {
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    /// True if the source had no normals and they were (or must be) synthesized.
+    pub needs_normals: bool,
+    /// True if the source had no UVs and a projection fallback is (or must be) used.
+    pub needs_uvs: bool,
 }
 
 impl Mesh {
@@ -166,6 +170,87 @@ impl Mesh {
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
 
-        Self { vertices, indices }
+        Self {
+            vertices,
+            indices,
+            needs_normals: false,
+            needs_uvs: false,
+        }
+    }
+
+    /// Axis-aligned bounding box (min, max) over all vertex positions.
+    /// Returns a unit box centered at the origin for an empty mesh.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        if self.vertices.is_empty() {
+            return (Vec3::splat(-0.5), Vec3::splat(0.5));
+        }
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for v in &self.vertices {
+            let p = Vec3::from(v.position);
+            min = min.min(p);
+            max = max.max(p);
+        }
+        (min, max)
+    }
+
+    /// Recenter the mesh on the origin and scale it so its largest dimension is
+    /// `target` units. This keeps any imported model framed by the static camera
+    /// (which sits ~3.5 units out and expects a roughly unit-sized subject).
+    pub fn recenter_and_normalize(&mut self, target: f32) {
+        let (min, max) = self.bounds();
+        let center = (min + max) * 0.5;
+        let extent = (max - min).max_element().max(1e-6);
+        let scale = target / extent;
+        for v in &mut self.vertices {
+            let p = (Vec3::from(v.position) - center) * scale;
+            v.position = p.to_array();
+        }
+    }
+
+    /// Recompute smooth (area-weighted) vertex normals from the triangle faces.
+    /// Used when an imported mesh ships without normals.
+    pub fn compute_smooth_normals(&mut self) {
+        let mut accum = vec![Vec3::ZERO; self.vertices.len()];
+        for tri in self.indices.chunks_exact(3) {
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            let p0 = Vec3::from(self.vertices[i0].position);
+            let p1 = Vec3::from(self.vertices[i1].position);
+            let p2 = Vec3::from(self.vertices[i2].position);
+            // Cross product magnitude is proportional to triangle area, so summing
+            // un-normalized face normals area-weights the result naturally.
+            let face = (p1 - p0).cross(p2 - p0);
+            accum[i0] += face;
+            accum[i1] += face;
+            accum[i2] += face;
+        }
+        for (v, n) in self.vertices.iter_mut().zip(accum) {
+            let n = n.normalize_or_zero();
+            let n = if n == Vec3::ZERO { Vec3::Y } else { n };
+            v.normal = n.to_array();
+        }
+    }
+
+    /// Assign box-projected UVs to every vertex, based on the dominant axis of
+    /// its normal. This is the fallback that makes a UV-less mesh paintable; it
+    /// matches the cube's scheme and is generalized properly in G14.
+    pub fn box_project_uvs(&mut self) {
+        let (min, max) = self.bounds();
+        let size = (max - min).max(Vec3::splat(1e-6));
+        for v in &mut self.vertices {
+            let p = Vec3::from(v.position);
+            let n = Vec3::from(v.normal).abs();
+            // Normalize position into [0,1] per axis, then pick the two axes
+            // perpendicular to the dominant normal axis as (u, v).
+            let t = (p - min) / size;
+            let uv = if n.x >= n.y && n.x >= n.z {
+                Vec2::new(t.z, t.y)
+            } else if n.y >= n.x && n.y >= n.z {
+                Vec2::new(t.x, t.z)
+            } else {
+                Vec2::new(t.x, t.y)
+            };
+            v.uv = uv.to_array();
+        }
     }
 }

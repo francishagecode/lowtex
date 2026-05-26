@@ -66,7 +66,7 @@ pub struct Renderer {
 
 impl Renderer {
     /// Window-backed renderer: presents to the window's surface.
-    pub async fn new(window: Arc<Window>) -> Self {
+    pub async fn new(window: Arc<Window>, mesh: Mesh) -> Self {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -103,7 +103,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let mut r = Self::build(device, queue, config, Mesh::cube());
+        let mut r = Self::build(device, queue, config, mesh);
         r.window = Some(window);
         r.surface = Some(surface);
         r

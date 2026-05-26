@@ -79,7 +79,7 @@ unwraps match the aesthetic better (see G14–G16).
 - _2026-05-26: compiles & runs on Rust 1.95 / wgpu 22.1. Fixed the two
   `entry_point: Some(..)` → `entry_point: ".."` errors (wgpu 22 takes `&str`)._
 
-### [ ] G0.1 — Project hygiene
+### [x] G0.1 — Project hygiene
 **Outcome:** The repo is version-controlled and consistently formatted.
 - **Build:** `git init` + `.gitignore` (`/target`, `*.lowtex` scratch, OS junk);
   add `rustfmt.toml` (defaults are fine); run `cargo clippy` and clear warnings;
@@ -88,6 +88,11 @@ unwraps match the aesthetic better (see G14–G16).
 - **Done when:** `git status` is clean after an initial commit; `cargo clippy`
   is warning-free.
 - **Depends on:** —
+- _2026-05-26: `git init`, `.gitignore`, `rustfmt.toml`, `DESIGN.md` added;
+  cleared 2 clippy warnings (clean now). Bonus: added a headless `--screenshot`
+  offscreen render mode (`renderer.rs::capture`, `main.rs::run_screenshot`) so
+  rendering goals can be verified without a window — the offscreen path shares
+  `draw_into` with the window renderer._
 
 ---
 
@@ -96,7 +101,7 @@ unwraps match the aesthetic better (see G14–G16).
 Target: **load your own model → orbit to every face → pick color + brush size →
 paint → export a PNG.** That single loop is the line between tech demo and tool.
 
-### [ ] G1 — Load real meshes (glTF + OBJ)
+### [x] G1 — Load real meshes (glTF + OBJ)
 **Outcome:** lowtex opens a `.gltf`/`.glb`/`.obj` instead of the hardcoded cube.
 - **Build:** add a `model` loader that produces our `Vertex`/`index` buffers;
   handle missing normals (compute face/smooth normals); handle missing UVs by
@@ -108,6 +113,13 @@ paint → export a PNG.** That single loop is the line between tech demo and too
 - **Done when:** running with a path arg loads and renders an external low-poly
   model, and clicking paints on its surface.
 - **Depends on:** G0
+- _2026-05-26: `src/model.rs` loads glTF (`gltf`) + OBJ (`tobj`); missing normals
+  → area-weighted smooth normals, missing UVs → box-projection fallback,
+  recenter/normalize to ~1.6u. `Mesh` gained `needs_normals`/`needs_uvs`. Wired
+  through `main.rs` (path arg) → `App::new(mesh)` → `Renderer::new(window, mesh)`.
+  Verified headless: cube/octahedron.obj/tetra.gltf all load, render, and paint
+  (added `--paint` to the screenshot tool). Known limit: shared-vertex meshes get
+  degenerate fallback UVs until proper per-tri unwrap (G14)._
 
 ### [ ] G2 — Orbit camera
 **Outcome:** Drag rotates the model, scroll zooms, optional middle-drag pans.

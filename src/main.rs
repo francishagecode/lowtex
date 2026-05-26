@@ -14,6 +14,7 @@
 mod app;
 mod camera;
 mod mesh;
+mod model;
 mod paint;
 mod renderer;
 
@@ -27,6 +28,8 @@ struct Args {
     mesh: Option<String>,
     width: u32,
     height: u32,
+    /// Headless verification: stamp a brush at screen center before capture.
+    paint: bool,
 }
 
 fn parse_args() -> Args {
@@ -35,11 +38,13 @@ fn parse_args() -> Args {
         mesh: None,
         width: 1024,
         height: 768,
+        paint: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--screenshot" => args.screenshot = it.next(),
+            "--paint" => args.paint = true,
             "--width" => {
                 if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
                     args.width = v;
@@ -62,24 +67,47 @@ fn main() {
 
     let args = parse_args();
 
-    // TODO(G1): load `args.mesh` once the model loader exists. For now the cube.
-    let mesh = Mesh::cube();
+    // Load the requested mesh, or fall back to the sample cube.
+    let mesh = match &args.mesh {
+        Some(path) => match model::load(path) {
+            Ok(m) => m,
+            Err(e) => {
+                log::error!("{e} — falling back to the sample cube");
+                Mesh::cube()
+            }
+        },
+        None => Mesh::cube(),
+    };
 
     if let Some(out) = args.screenshot {
-        run_screenshot(&out, args.width, args.height, mesh);
+        run_screenshot(&out, args.width, args.height, mesh, args.paint);
         return;
     }
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = app::App::default();
+    let mut app = app::App::new(mesh);
     event_loop.run_app(&mut app).expect("event loop error");
 }
 
-/// Headless: render one frame to `out` as a PNG and exit.
-fn run_screenshot(out: &str, width: u32, height: u32, mesh: Mesh) {
+/// Headless: render one frame to `out` as a PNG and exit. With `paint`, stamp a
+/// few brush dabs around screen center first, to verify the pick→paint→render
+/// loop without a window.
+fn run_screenshot(out: &str, width: u32, height: u32, mesh: Mesh, paint: bool) {
     let mut renderer = pollster::block_on(Renderer::new_headless(width, height, mesh));
+    if paint {
+        let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+        for (dx, dy) in [
+            (0.0, 0.0),
+            (-30.0, 0.0),
+            (30.0, 0.0),
+            (0.0, -30.0),
+            (0.0, 30.0),
+        ] {
+            renderer.paint_at((cx + dx, cy + dy));
+        }
+    }
     let (pixels, w, h) = renderer.capture();
     image::save_buffer(out, &pixels, w, h, image::ColorType::Rgba8)
         .expect("failed to write screenshot PNG");
