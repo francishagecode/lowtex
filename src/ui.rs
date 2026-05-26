@@ -40,6 +40,9 @@ pub struct UiActions {
     pub set_layer_visible: Option<(usize, bool)>,
     pub set_layer_opacity: Option<(usize, f32)>,
     pub set_layer_blend: Option<(usize, BlendMode)>,
+    // AO suite: add a baked AO / edge-highlight layer at the given strength.
+    pub apply_ao: Option<f32>,
+    pub apply_highlight: Option<f32>,
 }
 
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
@@ -53,6 +56,8 @@ pub struct UiState {
     /// Layer stack snapshot (bottom-first), synced from the renderer.
     pub layers: Vec<LayerInfo>,
     pub active_layer: usize,
+    /// Strength for the AO-suite bakes.
+    pub ao_strength: f32,
     /// Mirror of the renderer's current texture resolution, shown in the picker.
     pub resolution: u32,
     pub actions: UiActions,
@@ -67,6 +72,7 @@ impl Default for UiState {
             palette_size: 16,
             layers: Vec::new(),
             active_layer: 0,
+            ao_strength: 0.75,
             resolution: 128,
             actions: UiActions::default(),
         }
@@ -111,6 +117,32 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             ui.add_space(10.0);
             ui.separator();
             layers_section(ui, state);
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label("Ambient occlusion");
+            ui.label(
+                egui::RichText::new("Bake shadow/highlights from the mesh into a layer")
+                    .weak()
+                    .small(),
+            );
+            ui.add(egui::Slider::new(&mut state.ao_strength, 0.0..=1.0).text("Strength"));
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Darken (AO)")
+                    .on_hover_text("Shadow in crevices")
+                    .clicked()
+                {
+                    state.actions.apply_ao = Some(state.ao_strength);
+                }
+                if ui
+                    .button("Highlights")
+                    .on_hover_text("Brighten exposed edges")
+                    .clicked()
+                {
+                    state.actions.apply_highlight = Some(state.ao_strength);
+                }
+            });
 
             ui.add_space(10.0);
             ui.separator();

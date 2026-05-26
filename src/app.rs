@@ -187,6 +187,14 @@ impl App {
             renderer.set_layer_blend(i, b);
         }
 
+        // AO suite — bakes mesh maps (cached) then adds a generated layer.
+        if let Some(s) = actions.apply_ao {
+            renderer.apply_ao_layer(s);
+        }
+        if let Some(s) = actions.apply_highlight {
+            renderer.apply_highlight_layer(s);
+        }
+
         // Keep the UI mirrors in sync with the renderer.
         self.ui.resolution = renderer.texture_resolution();
         self.ui.palette_swatches = renderer.palette().colors.clone();

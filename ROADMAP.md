@@ -391,6 +391,13 @@ Target: the unique value. "Rust on the edges," automatically, at 64×64.
 - **Done when:** baked AO/curvature maps visibly match the geometry (crevices
   dark, edges high-curvature).
 - **Depends on:** G5, G17 (needs UVs to bake into)
+- _2026-05-26: **Partially landed early** as the "AO suite" (user request, after
+  G10). `src/bake.rs` rasterizes triangles into UV space (per-texel world pos +
+  smooth/face normal) and bakes: AO via cosine-weighted hemisphere ray casts
+  against the BVH (`Bvh::occludes`), and an `edge` map (1 − dot(smooth, face))
+  that peaks on convex edges. Driven by the AO-suite UI (Darken/Highlights) which
+  add non-destructive layers. Still TODO for full G19: curvature/world-pos/
+  thickness maps, caching to disk, vertex-AO fallback._
 
 ### [ ] G20 — Generator / mask system
 **Outcome:** Procedural masks driven by mesh maps (curvature, AO, world-Y) ×

@@ -233,6 +233,50 @@ impl Bvh {
         }
         best.map(|(_, uv)| uv)
     }
+
+    /// Does anything block the ray within `max_dist`? Early-exits on the first
+    /// hit — used for ambient-occlusion baking (G19/AO suite).
+    pub fn occludes(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> bool {
+        if self.tris.is_empty() {
+            return false;
+        }
+        let safe = |x: f32| if x.abs() < 1e-8 { 1e-8 } else { x };
+        let inv_dir = Vec3::new(1.0 / safe(dir.x), 1.0 / safe(dir.y), 1.0 / safe(dir.z));
+        let ray = Ray {
+            origin,
+            direction: dir,
+        };
+
+        let mut stack = [0u32; 64];
+        let mut sp = 0usize;
+        stack[sp] = 0;
+        sp += 1;
+        while sp > 0 {
+            sp -= 1;
+            let node = self.nodes[stack[sp] as usize];
+            if !ray_hits_aabb(ray.origin, inv_dir, node.min, node.max, max_dist) {
+                continue;
+            }
+            if node.count > 0 {
+                let first = node.left_or_first as usize;
+                for &ti in &self.tri_idx[first..first + node.count as usize] {
+                    let tri = &self.tris[ti as usize];
+                    if let Some((t, _, _)) = intersect_triangle(&ray, tri.p[0], tri.p[1], tri.p[2])
+                    {
+                        if t < max_dist {
+                            return true;
+                        }
+                    }
+                }
+            } else {
+                stack[sp] = node.left_or_first;
+                sp += 1;
+                stack[sp] = node.left_or_first + 1;
+                sp += 1;
+            }
+        }
+        false
+    }
 }
 
 /// Slab test: does the ray reach the box within `max_t`? The box is padded by a

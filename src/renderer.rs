@@ -114,11 +114,11 @@ pub struct Renderer {
     max_texture_dim: u32,
 
     camera: Camera,
-    // Kept for goals that re-read geometry (unwrap G14, bake G19); the BVH owns
-    // its own triangle copy for picking.
-    #[allow(dead_code)]
     mesh: Mesh,
     bvh: Bvh,
+    // Cached baked mesh maps (AO/edge) at the current resolution; invalidated on
+    // model load or resolution change.
+    mesh_maps: Option<crate::bake::MeshMaps>,
 }
 
 impl Renderer {
@@ -395,6 +395,7 @@ impl Renderer {
             camera,
             mesh,
             bvh,
+            mesh_maps: None,
         }
     }
 
@@ -636,7 +637,66 @@ impl Renderer {
             return;
         }
         self.layers.resize(size);
+        self.mesh_maps = None; // baked at the old resolution
         self.rebuild_paint_gpu();
+    }
+
+    // --- Ambient-occlusion suite (mesh-aware, drives layers) ---
+
+    /// Bake the mesh maps for the current resolution if not already cached.
+    fn ensure_mesh_maps(&mut self) {
+        let stale = self
+            .mesh_maps
+            .as_ref()
+            .is_none_or(|m| m.size != self.tex_size);
+        if stale {
+            log::info!("baking mesh maps at {}²…", self.tex_size);
+            self.mesh_maps = Some(crate::bake::bake(&self.mesh, &self.bvh, self.tex_size));
+        }
+    }
+
+    /// Add a black Multiply layer weighted by ambient occlusion — shadow sinks
+    /// into crevices. `strength` 0..1 scales the darkening.
+    pub fn apply_ao_layer(&mut self, strength: f32) {
+        self.ensure_mesh_maps();
+        let maps = self.mesh_maps.as_ref().unwrap();
+        let mut tex = PaintTexture::new(self.tex_size, self.tex_size, [0, 0, 0, 0]);
+        for i in 0..maps.ao.len() {
+            if maps.mask[i] {
+                let a = (maps.ao[i] * strength).clamp(0.0, 1.0);
+                tex.pixels[i * 4 + 3] = (a * 255.0).round() as u8;
+            }
+        }
+        self.layers.push_generated(
+            "AO".to_string(),
+            tex,
+            crate::layers::BlendMode::Multiply,
+            1.0,
+        );
+        self.resync_stroke_base();
+        self.refresh_display_texture();
+    }
+
+    /// Add a white layer weighted by convex-edge strength — bright rims on edges
+    /// and corners. `strength` 0..1 scales the lightening.
+    pub fn apply_highlight_layer(&mut self, strength: f32) {
+        self.ensure_mesh_maps();
+        let maps = self.mesh_maps.as_ref().unwrap();
+        let mut tex = PaintTexture::new(self.tex_size, self.tex_size, [255, 255, 255, 0]);
+        for i in 0..maps.edge.len() {
+            if maps.mask[i] {
+                let a = (maps.edge[i] * strength).clamp(0.0, 1.0);
+                tex.pixels[i * 4 + 3] = (a * 255.0).round() as u8;
+            }
+        }
+        self.layers.push_generated(
+            "Edge highlights".to_string(),
+            tex,
+            crate::layers::BlendMode::Normal,
+            1.0,
+        );
+        self.resync_stroke_base();
+        self.refresh_display_texture();
     }
 
     /// Load a new mesh from a file, rebuilding the GPU buffers and the pick BVH.
@@ -660,6 +720,7 @@ impl Renderer {
         self.index_count = mesh.indices.len() as u32;
         self.bvh = Bvh::build(&mesh);
         self.mesh = mesh;
+        self.mesh_maps = None; // geometry changed; baked maps are stale
         Ok(())
     }
 

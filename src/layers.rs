@@ -101,6 +101,19 @@ impl Layers {
         self.active = self.layers.len() - 1;
     }
 
+    /// Push a pre-built layer (e.g. a baked AO/highlight layer) on top and make
+    /// it active.
+    pub fn push_generated(&mut self, name: String, tex: Texture, blend: BlendMode, opacity: f32) {
+        self.layers.push(Layer {
+            name,
+            tex,
+            visible: true,
+            opacity,
+            blend,
+        });
+        self.active = self.layers.len() - 1;
+    }
+
     /// Remove the active layer (never the last remaining one).
     pub fn remove_active(&mut self) {
         if self.layers.len() <= 1 {

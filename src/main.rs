@@ -12,6 +12,7 @@
 // scene the window would, to an offscreen texture, and writes it to disk.
 
 mod app;
+mod bake;
 mod bvh;
 mod camera;
 mod layers;
@@ -55,6 +56,9 @@ struct Args {
     no_dither: bool,
     /// Headless verification: paint base, add a layer, paint it a 2nd color.
     layer_demo: bool,
+    /// Headless verification: bake an AO / edge-highlight layer at this strength.
+    ao: Option<f32>,
+    highlight: Option<f32>,
 }
 
 fn parse_args() -> Args {
@@ -77,6 +81,8 @@ fn parse_args() -> Args {
         palette_builtin: None,
         no_dither: false,
         layer_demo: false,
+        ao: None,
+        highlight: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -104,6 +110,8 @@ fn parse_args() -> Args {
             "--save-texture" => args.save_texture = it.next(),
             "--res" => args.res = it.next().and_then(|s| s.parse().ok()),
             "--layer-demo" => args.layer_demo = true,
+            "--ao" => args.ao = it.next().and_then(|s| s.parse().ok()),
+            "--highlight" => args.highlight = it.next().and_then(|s| s.parse().ok()),
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
             "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
@@ -237,6 +245,13 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         if args.paint {
             dab(&mut renderer);
         }
+    }
+
+    if let Some(s) = args.ao {
+        renderer.apply_ao_layer(s);
+    }
+    if let Some(s) = args.highlight {
+        renderer.apply_highlight_layer(s);
     }
 
     if let Some(path) = &args.save_texture {
