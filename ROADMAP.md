@@ -414,7 +414,7 @@ lowtex should unwrap them in-style. Projection methods fit PSX better than LSCM.
 
 Target: the unique value. "Rust on the edges," automatically, at 64×64.
 
-### [ ] G19 — Bake mesh maps
+### [~] G19 — Bake mesh maps *(AO + curvature done; more maps pending)*
 **Outcome:** Per-mesh AO, curvature, world-space normal, position, thickness maps.
 - **Build:** rasterize each map into UV space; AO via hemisphere sampling against
   the BVH (G5); curvature from dihedral angles / normal divergence. Bake once,
@@ -423,15 +423,16 @@ Target: the unique value. "Rust on the edges," automatically, at 64×64.
 - **Done when:** baked AO/curvature maps visibly match the geometry (crevices
   dark, edges high-curvature).
 - **Depends on:** G5, G17 (needs UVs to bake into)
-- _2026-05-26: **Partially landed early** as the "AO suite" (user request, after
-  G10). `src/bake.rs` rasterizes triangles into UV space (per-texel world pos +
-  smooth/face normal) and bakes: AO via cosine-weighted hemisphere ray casts
-  against the BVH (`Bvh::occludes`), and an `edge` map (1 − dot(smooth, face))
-  that peaks on convex edges. Driven by the AO-suite UI (Darken/Highlights) which
-  add non-destructive layers. Still TODO for full G19: curvature/world-pos/
-  thickness maps, caching to disk, vertex-AO fallback._
+- _2026-05-26: `src/bake.rs` rasterizes triangles into UV space (per-texel world
+  pos + smooth/face normal) and bakes **AO** (cosine-weighted hemisphere ray casts
+  vs the BVH, `Bvh::occludes`) and **signed curvature** (smooth-vs-face divergence,
+  + convex / − concave). `MapSource` exposes them as Cavities / Exposed / Edges /
+  Creases through a `Levels` remap — the inputs the generator system reads. Done
+  & verified (AO darkens torus crevices; curvature peaks on cube/octa edges).
+  Remaining for full G19: world-normal/position/thickness maps, on-disk cache,
+  vertex-AO fallback._
 
-### [ ] G20 — Generator / mask system
+### [x] G20 — Generator / mask system
 **Outcome:** Procedural masks driven by mesh maps (curvature, AO, world-Y) ×
 noise, used as layer masks.
 - **Build:** generators output a mask from mesh-map inputs with thresholds/curves;
@@ -441,6 +442,13 @@ noise, used as layer masks.
 - **Done when:** adding an "edge wear" generator to a layer puts paint on the
   mesh's actual edges with zero hand-painting.
 - **Depends on:** G11, G19, G22
+- _2026-05-26 (parallel session): mesh maps (`bake::MapSource` × `Levels`
+  invert/contrast/strength) drive generated layers and masks. Renderer:
+  `apply_dirt_layer` (Cavities), `apply_edge_wear_layer` (Edges), `apply_ao_layer`,
+  `apply_highlight_layer`, `apply_tint`, and `fill_active_mask_from_map` (any
+  source → the active layer's reveal mask, G11). UI exposes the Levels controls +
+  preset buttons. Edge-wear puts paint on edges with zero hand-painting. (Noise
+  modulation from G22 not yet wired — generators are mesh-map driven for now.)_
 
 ### [ ] G21 — Smart palettes / preset looks
 **Outcome:** A draggable preset (layer stack + generators + palette) that adapts
@@ -452,6 +460,10 @@ to any mesh via its baked maps.
 - **Done when:** applying a saved preset to a *different* mesh produces a coherent
   result that follows the new geometry.
 - **Depends on:** G20
+- _2026-05-26: not done. The preset *operations* (Dirt, Edge-wear, …) exist under
+  G20 and already re-evaluate against whatever mesh is loaded, but the core of G21
+  — serializing a layer-stack + generators + palette as a reusable, shareable
+  asset — depends on the `.lowtex` format (G24), which is still pending._
 
 ### [~] G22 — Procedural noise library *(library done; generator wiring pending)*
 **Outcome:** Value/Perlin/Worley noise available to generators and as brushes.
