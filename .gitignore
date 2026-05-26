@@ -1,0 +1,22 @@
+# Rust build output
+/target
+
+# lowtex scratch / project files used during dev
+*.lowtex
+/scratch
+*.lowtex.bak
+
+# Screenshots produced by --screenshot during dev
+/shots
+*.shot.png
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor junk
+*.swp
+*~
+.idea/
+.vscode/

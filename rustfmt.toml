@@ -1,0 +1,3 @@
+# Defaults are fine for lowtex. This file pins them explicitly so formatting is
+# stable across rustfmt versions and contributors.
+edition = "2021"

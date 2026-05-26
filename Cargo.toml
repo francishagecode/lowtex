@@ -1,0 +1,28 @@
+[package]
+name = "lowtex"
+version = "0.1.0"
+edition = "2021"
+description = "PSX-style 3D texture painter — v0.1 proof of paint"
+
+[dependencies]
+# Windowing + event loop
+winit = "0.30"
+
+# GPU abstraction
+wgpu = "22.1"
+
+# Async runtime for wgpu setup
+pollster = "0.4"
+
+# Math (vectors, matrices)
+glam = { version = "0.29", features = ["bytemuck"] }
+
+# Bytemuck for casting Rust structs to GPU buffers
+bytemuck = { version = "1.18", features = ["derive"] }
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# Image encode/decode (PNG export/import, headless screenshots)
+image = { version = "0.25", default-features = false, features = ["png"] }
