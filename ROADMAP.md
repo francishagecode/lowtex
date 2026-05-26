@@ -136,7 +136,7 @@ paint → export a PNG.** That single loop is the line between tech demo and too
   orbit/pan/zoom that refresh the view-proj uniform. Verified headless with
   `--orbit 130 --paint`: view changes and pre-orbit paint persists on the surface._
 
-### [ ] G3 — egui UI shell + brush controls
+### [x] G3 — egui UI shell + brush controls
 **Outcome:** A side panel with a color picker, brush size, hardness/opacity.
 - **Build:** integrate `egui` with the wgpu/winit setup; route events so UI
   clicks don't paint through to the mesh; replace the hardcoded `BRUSH_COLOR`/
@@ -147,6 +147,15 @@ paint → export a PNG.** That single loop is the line between tech demo and too
 - **Done when:** changing color/size in the panel changes the next stroke; UI
   hover doesn't paint.
 - **Depends on:** G1
+- _2026-05-26: egui 0.29 (matched to wgpu 22) integrated. `src/ui.rs` has a right
+  side panel — Color picker + Size/Opacity/Hardness sliders (plain-language per
+  principle #1) — driving a `paint::Brush`. `app.rs` feeds events to egui first
+  and gates drag-start on `consumed` so panel clicks don't paint through.
+  `renderer::render` takes `UiPaint` and draws egui in a second (load) pass via
+  `forget_lifetime`. `paint::Texture::stamp` now blends by opacity + hardness
+  falloff (per-stamp; per-stroke accumulation is G6). Verified headless
+  (`--ui --paint --brush-color --brush-size`): panel renders, color/size change
+  the stroke. Verified live in the window too._
 
 ### [ ] G4 — Texture import/export (PNG)
 **Outcome:** Save the painted texture to PNG; optionally load a starting texture.

@@ -31,14 +31,19 @@ use winit::window::Window;
 
 use crate::camera::Camera;
 use crate::mesh::{Mesh, Vertex};
-use crate::paint::{pick_uv, Ray, Texture as PaintTexture};
+use crate::paint::{pick_uv, Brush, Ray, Texture as PaintTexture};
 
 const TEX_SIZE: u32 = 128; // PSX-scale. Bump to 256 if you want.
-const BRUSH_RADIUS: i32 = 3;
-const BRUSH_COLOR: [u8; 4] = [220, 60, 80, 255]; // a nice retro red
 
 /// The color format used for offscreen capture. sRGB to match the surface.
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// egui paint data for one frame, produced by the App and consumed by `render`.
+pub struct UiPaint<'a> {
+    pub jobs: &'a [egui::ClippedPrimitive],
+    pub textures_delta: &'a egui::TexturesDelta,
+    pub pixels_per_point: f32,
+}
 
 pub struct Renderer {
     window: Option<Arc<Window>>,
@@ -59,6 +64,9 @@ pub struct Renderer {
     paint_texture_cpu: PaintTexture,
 
     depth_view: wgpu::TextureView,
+
+    // egui overlay renderer; None in headless mode.
+    egui_renderer: Option<egui_wgpu::Renderer>,
 
     camera: Camera,
     mesh: Mesh,
@@ -104,6 +112,14 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let mut r = Self::build(device, queue, config, mesh);
+        // egui overlay renders to the surface format, no depth, single-sampled.
+        r.egui_renderer = Some(egui_wgpu::Renderer::new(
+            &r.device,
+            surface_format,
+            None,
+            1,
+            false,
+        ));
         r.window = Some(window);
         r.surface = Some(surface);
         r
@@ -129,7 +145,16 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
 
-        Self::build(device, queue, config, mesh)
+        let mut r = Self::build(device, queue, config, mesh);
+        // Headless can also draw the egui overlay (for screenshot verification).
+        r.egui_renderer = Some(egui_wgpu::Renderer::new(
+            &r.device,
+            OFFSCREEN_FORMAT,
+            None,
+            1,
+            false,
+        ));
+        r
     }
 
     /// Shared construction of all scene resources. The target color format is
@@ -318,6 +343,7 @@ impl Renderer {
             paint_texture_gpu,
             paint_texture_cpu,
             depth_view,
+            egui_renderer: None,
             camera,
             mesh,
         }
@@ -372,8 +398,8 @@ impl Renderer {
     }
 
     /// Called when the mouse moves while held, or on click.
-    /// Casts a ray, finds the UV, stamps a brush, re-uploads the texture.
-    pub fn paint_at(&mut self, mouse_px: (f32, f32)) {
+    /// Casts a ray, finds the UV, stamps the brush, re-uploads the texture.
+    pub fn paint_at(&mut self, mouse_px: (f32, f32), brush: &Brush) {
         let (w, h) = match &self.window {
             Some(window) => {
                 let s = window.inner_size();
@@ -396,8 +422,7 @@ impl Renderer {
         };
 
         if let Some(uv) = pick_uv(&ray, &self.mesh) {
-            self.paint_texture_cpu
-                .paint_brush(uv, BRUSH_RADIUS, BRUSH_COLOR);
+            self.paint_texture_cpu.stamp(uv, brush);
             upload_texture(
                 &self.queue,
                 &self.paint_texture_gpu,
@@ -443,7 +468,7 @@ impl Renderer {
         rpass.draw_indexed(0..self.index_count, 0, 0..1);
     }
 
-    pub fn render(&mut self) {
+    pub fn render(&mut self, ui: Option<UiPaint>) {
         let Some(surface) = &self.surface else {
             return; // headless renderer has nothing to present
         };
@@ -467,14 +492,65 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
+
+        // Scene first (clears + depth), then the egui overlay on top.
         self.draw_into(&mut encoder, &view);
+        if let Some(ui) = ui.as_ref() {
+            self.encode_egui(&mut encoder, &view, ui);
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
     }
 
+    /// Record the egui overlay into `view`, loading (not clearing) the scene
+    /// underneath. Shared by the window and offscreen paths.
+    fn encode_egui(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        ui: &UiPaint,
+    ) {
+        let Some(er) = self.egui_renderer.as_mut() else {
+            return;
+        };
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: ui.pixels_per_point,
+        };
+        for (id, delta) in &ui.textures_delta.set {
+            er.update_texture(&self.device, &self.queue, *id, delta);
+        }
+        er.update_buffers(&self.device, &self.queue, encoder, ui.jobs, &screen);
+
+        let mut rpass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // keep the scene underneath
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            })
+            .forget_lifetime();
+        er.render(&mut rpass, ui.jobs, &screen);
+        drop(rpass);
+
+        for id in &ui.textures_delta.free {
+            er.free_texture(id);
+        }
+    }
+
     /// Render one frame to an offscreen texture and read it back as RGBA8.
-    /// Returns (pixels, width, height). Used by the `--screenshot` path.
-    pub fn capture(&mut self) -> (Vec<u8>, u32, u32) {
+    /// Returns (pixels, width, height). Used by the `--screenshot` path. With
+    /// `ui`, the egui overlay is drawn too, so the panel can be verified headless.
+    pub fn capture(&mut self, ui: Option<UiPaint>) -> (Vec<u8>, u32, u32) {
         let width = self.config.width;
         let height = self.config.height;
 
@@ -511,6 +587,9 @@ impl Renderer {
                 label: Some("capture encoder"),
             });
         self.draw_into(&mut encoder, &color_view);
+        if let Some(ui) = ui.as_ref() {
+            self.encode_egui(&mut encoder, &color_view, ui);
+        }
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
                 texture: &color,

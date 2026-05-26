@@ -18,6 +18,38 @@ use glam::{Mat4, Vec2, Vec3};
 
 use crate::mesh::Mesh;
 
+/// Live brush settings, driven by the UI panel (G3). Color is sRGB in 0..1 to
+/// match egui's color picker; radius is in texels.
+#[derive(Clone, Copy)]
+pub struct Brush {
+    pub color: [f32; 3],
+    pub radius: f32,
+    pub opacity: f32,  // 0..1, per-stamp coverage
+    pub hardness: f32, // 0..1, fraction of the radius that is fully opaque
+}
+
+impl Default for Brush {
+    fn default() -> Self {
+        Self {
+            color: [0.86, 0.24, 0.31], // the retro red from v0.1
+            radius: 4.0,
+            opacity: 1.0,
+            hardness: 0.8,
+        }
+    }
+}
+
+impl Brush {
+    /// Brush color as sRGB u8, for writing into the RGBA8 texture.
+    pub fn color_u8(&self) -> [u8; 3] {
+        [
+            (self.color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (self.color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (self.color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]
+    }
+}
+
 pub struct Texture {
     pub width: u32,
     pub height: u32,
@@ -39,27 +71,55 @@ impl Texture {
         }
     }
 
-    /// Draw a filled circular brush at a UV coordinate.
-    /// UV is in [0,1] with V=0 at the top (matches wgpu texture orientation).
-    pub fn paint_brush(&mut self, uv: Vec2, radius_pixels: i32, color: [u8; 4]) {
-        let cx = (uv.x * self.width as f32) as i32;
-        let cy = (uv.y * self.height as f32) as i32;
-        let r2 = radius_pixels * radius_pixels;
+    /// Stamp a brush at a UV coordinate, blending by the brush's opacity and a
+    /// hardness-controlled radial falloff. UV is in [0,1] with V=0 at the top
+    /// (matches wgpu texture orientation).
+    ///
+    /// Blending is per-stamp, so heavy overlap within one drag double-darkens;
+    /// per-stroke accumulation is G6's job.
+    pub fn stamp(&mut self, uv: Vec2, brush: &Brush) {
+        let cx = uv.x * self.width as f32;
+        let cy = uv.y * self.height as f32;
+        let radius = brush.radius.max(0.5);
+        let r = radius.ceil() as i32;
+        let color = brush.color_u8();
 
-        for dy in -radius_pixels..=radius_pixels {
-            for dx in -radius_pixels..=radius_pixels {
-                if dx * dx + dy * dy > r2 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let dist = ((dx * dx + dy * dy) as f32).sqrt();
+                let a = brush.opacity * falloff(dist / radius, brush.hardness);
+                if a <= 0.0 {
                     continue;
                 }
-                let x = cx + dx;
-                let y = cy + dy;
+                let x = cx as i32 + dx;
+                let y = cy as i32 + dy;
                 if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
                     continue;
                 }
                 let i = ((y as u32 * self.width + x as u32) * 4) as usize;
-                self.pixels[i..i + 4].copy_from_slice(&color);
+                for (c, &src) in color.iter().enumerate() {
+                    let dst = self.pixels[i + c] as f32;
+                    self.pixels[i + c] =
+                        (dst * (1.0 - a) + src as f32 * a).round().clamp(0.0, 255.0) as u8;
+                }
+                self.pixels[i + 3] = 255;
             }
         }
+    }
+}
+
+/// Radial brush coverage at normalized distance `d` (0 at center, 1 at the rim)
+/// for a given `hardness` (1 = hard edge, 0 = fully soft). Returns 0..1.
+fn falloff(d: f32, hardness: f32) -> f32 {
+    if d >= 1.0 {
+        return 0.0;
+    }
+    let h = hardness.clamp(0.0, 1.0);
+    if d <= h {
+        1.0
+    } else {
+        // Linear ramp from the hard core out to the rim.
+        1.0 - (d - h) / (1.0 - h).max(1e-4)
     }
 }
 

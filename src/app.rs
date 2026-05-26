@@ -1,10 +1,17 @@
 // src/app.rs
 //
-// The application shell: owns the window, the renderer, and the input state.
-// Implements winit's ApplicationHandler trait (the modern 0.30+ event API).
+// The application shell: owns the window, the renderer, egui state, and input
+// state. Implements winit's ApplicationHandler trait (the modern 0.30+ event
+// API).
+//
+// Event routing: every window event is first fed to egui. Pointer presses that
+// egui consumes (clicks on the panel) never start a paint/camera drag, so UI
+// hover and widgets don't paint through to the mesh. Once a drag has begun on
+// the viewport, it continues until release regardless of where the cursor goes.
 
 use std::sync::Arc;
 
+use egui::ViewportId;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
@@ -13,7 +20,8 @@ use winit::{
 };
 
 use crate::mesh::Mesh;
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, UiPaint};
+use crate::ui::{self, UiState};
 
 /// What the current mouse drag is doing. LMB paints; RMB orbits; MMB pans — so
 /// camera control and painting never fight over the same button.
@@ -30,6 +38,11 @@ pub struct App {
     renderer: Option<Renderer>,
     // The mesh to paint, taken when the renderer is built on resume.
     mesh: Option<Mesh>,
+
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
+    ui: UiState,
+
     mouse_pos: (f32, f32),
     last_pos: (f32, f32),
     drag: Drag,
@@ -41,9 +54,41 @@ impl App {
             window: None,
             renderer: None,
             mesh: Some(mesh),
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+            ui: UiState::default(),
             mouse_pos: (0.0, 0.0),
             last_pos: (0.0, 0.0),
             drag: Drag::None,
+        }
+    }
+
+    /// Run egui for this frame and render the scene + overlay.
+    fn redraw(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(state) = self.egui_state.as_mut() else {
+            return;
+        };
+        let raw_input = state.take_egui_input(&window);
+        let full_output = self
+            .egui_ctx
+            .run(raw_input, |ctx| ui::build(ctx, &mut self.ui));
+        self.egui_state
+            .as_mut()
+            .unwrap()
+            .handle_platform_output(&window, full_output.platform_output);
+        let jobs = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.render(Some(UiPaint {
+                jobs: &jobs,
+                textures_delta: &full_output.textures_delta,
+                pixels_per_point: full_output.pixels_per_point,
+            }));
         }
     }
 }
@@ -66,8 +111,20 @@ impl ApplicationHandler for App {
         let mesh = self.mesh.take().unwrap_or_else(Mesh::cube);
         let renderer = pollster::block_on(Renderer::new(window.clone(), mesh));
 
+        // egui platform integration.
+        ui::install_style(&self.egui_ctx);
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+
         self.window = Some(window);
         self.renderer = Some(renderer);
+        self.egui_state = Some(egui_state);
     }
 
     fn window_event(
@@ -76,18 +133,35 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(renderer) = self.renderer.as_mut() else {
+        let Some(window) = self.window.clone() else {
             return;
         };
-        let Some(window) = self.window.as_ref() else {
+
+        // Feed every event to egui first; remember whether it claimed the event.
+        let egui_consumed = self
+            .egui_state
+            .as_mut()
+            .map(|s| s.on_window_event(&window, &event).consumed)
+            .unwrap_or(false);
+
+        // These need &mut self wholly, so handle them before borrowing renderer.
+        match &event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+                return;
+            }
+            WindowEvent::RedrawRequested => {
+                self.redraw();
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
 
         match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-
             WindowEvent::Resized(new_size) => {
                 renderer.resize(new_size.width, new_size.height);
             }
@@ -100,7 +174,7 @@ impl ApplicationHandler for App {
                 self.last_pos = pos;
                 match self.drag {
                     Drag::Paint => {
-                        renderer.paint_at(self.mouse_pos);
+                        renderer.paint_at(self.mouse_pos, &self.ui.brush);
                         window.request_redraw();
                     }
                     Drag::Orbit => {
@@ -118,10 +192,14 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 self.last_pos = self.mouse_pos;
+                // A click egui claimed must not start a viewport drag.
+                if pressed && egui_consumed {
+                    return;
+                }
                 match (button, pressed) {
                     (MouseButton::Left, true) => {
                         self.drag = Drag::Paint;
-                        renderer.paint_at(self.mouse_pos);
+                        renderer.paint_at(self.mouse_pos, &self.ui.brush);
                         window.request_redraw();
                     }
                     (MouseButton::Right, true) => self.drag = Drag::Orbit,
@@ -132,6 +210,9 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if egui_consumed {
+                    return;
+                }
                 let amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05,
@@ -140,9 +221,7 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
 
-            WindowEvent::RedrawRequested => {
-                renderer.render();
-            }
+            WindowEvent::RedrawRequested => self.redraw(),
 
             _ => {}
         }
