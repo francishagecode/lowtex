@@ -33,6 +33,7 @@ use winit::window::Window;
 
 use crate::bvh::Bvh;
 use crate::camera::Camera;
+use crate::layers::Layers;
 use crate::mesh::{Mesh, Vertex};
 use crate::paint::{Brush, Ray, Texture as PaintTexture};
 use crate::palette::Palette;
@@ -88,11 +89,13 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
 
     paint_texture_gpu: wgpu::Texture,
-    paint_texture_cpu: PaintTexture,
+    // Layer stack (G10); painting targets the active layer, composited bottom-up
+    // into the GPU texture (then palette-quantized).
+    layers: Layers,
     tex_size: u32,
 
-    // Stroke accumulation (G6): the texture snapshot at stroke start + per-texel
-    // coverage, so overlapping stamps within one stroke don't double-darken.
+    // Stroke accumulation (G6): the active-layer snapshot at stroke start +
+    // per-texel coverage, so overlapping stamps within one stroke don't double-darken.
     stroke_base: Vec<u8>,
     stroke_coverage: Vec<f32>,
 
@@ -235,11 +238,12 @@ impl Renderer {
         });
         let index_count = mesh.indices.len() as u32;
 
-        // Paint texture: faint checkerboard so the UV layout is visible pre-paint.
+        // Base layer: faint checkerboard so the UV layout is visible pre-paint.
         let tex_size = TEX_SIZE;
-        let paint_texture_cpu = make_checkerboard(tex_size, tex_size);
-        let paint_texture_gpu = make_paint_texture(&device, &paint_texture_cpu);
-        upload_texture(&queue, &paint_texture_gpu, &paint_texture_cpu);
+        let base = make_checkerboard(tex_size, tex_size);
+        let paint_texture_gpu = make_paint_texture(&device, &base);
+        upload_texture(&queue, &paint_texture_gpu, &base);
+        let layers = Layers::new(base);
 
         // Nearest-neighbor sampler — pure PSX, no filtering.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -361,7 +365,7 @@ impl Renderer {
         // BVH over the mesh triangles for fast ray picking (G5).
         let bvh = Bvh::build(&mesh);
 
-        let stroke_base = paint_texture_cpu.pixels.clone();
+        let stroke_base = layers.active_tex().pixels.clone();
         let stroke_coverage = vec![0.0; (tex_size * tex_size) as usize];
 
         Self {
@@ -379,7 +383,7 @@ impl Renderer {
             bind_group_layout,
             sampler,
             paint_texture_gpu,
-            paint_texture_cpu,
+            layers,
             tex_size,
             stroke_base,
             stroke_coverage,
@@ -423,32 +427,25 @@ impl Renderer {
         );
     }
 
-    /// Re-derive the GPU texture from the full-color paint buffer: quantized to
-    /// the palette (with optional dither) when enabled, otherwise the raw paint.
-    /// Non-destructive — `paint_texture_cpu` always keeps full color.
+    /// Composite the layers, palette-quantize the result (if enabled), and upload
+    /// it. Non-destructive — the layers keep full color.
     fn refresh_display_texture(&self) {
+        let mut display = self.layers.composite();
         if self.palette_settings.enabled && !self.palette.colors.is_empty() {
-            let mut display = self.paint_texture_cpu.pixels.clone();
             self.palette.quantize_rgba(
                 &mut display,
                 self.tex_size,
                 self.palette_settings.dither,
                 self.palette_settings.dither_strength,
             );
-            upload_pixels(
-                &self.queue,
-                &self.paint_texture_gpu,
-                &display,
-                self.tex_size,
-                self.tex_size,
-            );
-        } else {
-            upload_texture(
-                &self.queue,
-                &self.paint_texture_gpu,
-                &self.paint_texture_cpu,
-            );
         }
+        upload_pixels(
+            &self.queue,
+            &self.paint_texture_gpu,
+            &display,
+            self.tex_size,
+            self.tex_size,
+        );
     }
 
     /// Replace the active palette (live swap) and refresh the display.
@@ -463,10 +460,10 @@ impl Renderer {
         self.refresh_display_texture();
     }
 
-    /// The quantized texture pixels as currently shown (for export). Full color
-    /// when quantize is off.
+    /// The composited (and quantized, if enabled) texture as currently shown —
+    /// used for export so the PNG matches the model.
     pub fn display_pixels(&self) -> Vec<u8> {
-        let mut px = self.paint_texture_cpu.pixels.clone();
+        let mut px = self.layers.composite();
         if self.palette_settings.enabled && !self.palette.colors.is_empty() {
             self.palette.quantize_rgba(
                 &mut px,
@@ -489,6 +486,66 @@ impl Renderer {
         let rgba = img.to_rgba8();
         self.set_palette(Palette::from_image_median_cut(&rgba, n));
         Ok(())
+    }
+
+    // --- Layer stack (G10) ---
+
+    /// Read-only view of the layer stack for the UI (top-first not assumed; index
+    /// 0 is the bottom). Returns the active index too.
+    pub fn layers(&self) -> &Layers {
+        &self.layers
+    }
+
+    /// Re-snapshot the active-layer stroke base (after the active layer changes).
+    fn resync_stroke_base(&mut self) {
+        self.stroke_base.clear();
+        self.stroke_base
+            .extend_from_slice(&self.layers.active_tex().pixels);
+    }
+
+    pub fn add_layer(&mut self) {
+        self.layers.add_layer();
+        self.resync_stroke_base();
+        self.refresh_display_texture();
+    }
+
+    pub fn remove_active_layer(&mut self) {
+        self.layers.remove_active();
+        self.resync_stroke_base();
+        self.refresh_display_texture();
+    }
+
+    pub fn move_active_layer(&mut self, up: bool) {
+        self.layers.move_active(up);
+        self.refresh_display_texture();
+    }
+
+    pub fn set_active_layer(&mut self, index: usize) {
+        if index < self.layers.layers.len() {
+            self.layers.active = index;
+            self.resync_stroke_base();
+        }
+    }
+
+    pub fn set_layer_visible(&mut self, index: usize, visible: bool) {
+        if let Some(l) = self.layers.layers.get_mut(index) {
+            l.visible = visible;
+            self.refresh_display_texture();
+        }
+    }
+
+    pub fn set_layer_opacity(&mut self, index: usize, opacity: f32) {
+        if let Some(l) = self.layers.layers.get_mut(index) {
+            l.opacity = opacity;
+            self.refresh_display_texture();
+        }
+    }
+
+    pub fn set_layer_blend(&mut self, index: usize, blend: crate::layers::BlendMode) {
+        if let Some(l) = self.layers.layers.get_mut(index) {
+            l.blend = blend;
+            self.refresh_display_texture();
+        }
     }
 
     /// Orbit the camera by drag deltas and refresh the uniform.
@@ -520,11 +577,14 @@ impl Renderer {
         self.tex_size
     }
 
-    /// Recreate the GPU paint texture + bind group from the current CPU texture.
-    /// Call after the CPU texture is replaced or resized.
+    /// Recreate the GPU paint texture + bind group sized to the current layers.
+    /// Call after the layers are replaced or resized.
     fn rebuild_paint_gpu(&mut self) {
-        self.tex_size = self.paint_texture_cpu.width;
-        self.paint_texture_gpu = make_paint_texture(&self.device, &self.paint_texture_cpu);
+        self.tex_size = self.layers.size();
+        // The GPU texture only needs the right dimensions; a 1×1 stand-in carries
+        // the size, then refresh_display_texture uploads the composited pixels.
+        let placeholder = PaintTexture::new(self.tex_size, self.tex_size, [0, 0, 0, 255]);
+        self.paint_texture_gpu = make_paint_texture(&self.device, &placeholder);
         self.bind_group = make_paint_bind_group(
             &self.device,
             &self.bind_group_layout,
@@ -532,8 +592,8 @@ impl Renderer {
             &self.paint_texture_gpu,
             &self.sampler,
         );
-        // The stroke buffers must track the (possibly resized) texture.
-        self.stroke_base = self.paint_texture_cpu.pixels.clone();
+        // The stroke buffers must track the (possibly resized) active layer.
+        self.stroke_base = self.layers.active_tex().pixels.clone();
         self.stroke_coverage = vec![0.0; (self.tex_size * self.tex_size) as usize];
         self.refresh_display_texture();
     }
@@ -562,18 +622,20 @@ impl Renderer {
             height: h,
             pixels: rgba.into_raw(),
         };
-        self.paint_texture_cpu = loaded.resampled(self.tex_size, self.tex_size);
-        self.rebuild_paint_gpu();
+        *self.layers.active_tex_mut() = loaded.resampled(self.tex_size, self.tex_size);
+        self.refresh_display_texture();
+        // Re-snapshot the stroke base since the active layer changed wholesale.
+        self.stroke_base = self.layers.active_tex().pixels.clone();
         Ok(())
     }
 
-    /// Change the paint texture resolution, resampling existing paint into it.
+    /// Change the paint texture resolution, resampling every layer into it.
     pub fn set_texture_resolution(&mut self, size: u32) {
         let size = size.clamp(8, self.max_texture_dim);
         if size == self.tex_size {
             return;
         }
-        self.paint_texture_cpu = self.paint_texture_cpu.resampled(size, size);
+        self.layers.resize(size);
         self.rebuild_paint_gpu();
     }
 
@@ -606,7 +668,7 @@ impl Renderer {
     pub fn begin_stroke(&mut self) {
         self.stroke_base.clear();
         self.stroke_base
-            .extend_from_slice(&self.paint_texture_cpu.pixels);
+            .extend_from_slice(&self.layers.active_tex().pixels);
         self.stroke_coverage.fill(0.0);
     }
 
@@ -643,12 +705,11 @@ impl Renderer {
     fn stamp_screen(&mut self, mouse_px: Vec2, brush: &Brush) -> bool {
         let ray = self.pick_ray(mouse_px);
         if let Some(uv) = self.bvh.pick_uv(&ray) {
-            self.paint_texture_cpu.stamp_stroke(
-                uv,
-                brush,
-                &self.stroke_base,
-                &mut self.stroke_coverage,
-            );
+            let base = &self.stroke_base;
+            let coverage = &mut self.stroke_coverage;
+            self.layers
+                .active_tex_mut()
+                .stamp_stroke(uv, brush, base, coverage);
             true
         } else {
             false

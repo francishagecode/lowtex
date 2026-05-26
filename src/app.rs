@@ -161,9 +161,47 @@ impl App {
             }
         }
 
-        // Keep the resolution picker and palette swatches in sync with the renderer.
+        // Layer ops (G10).
+        if actions.add_layer {
+            renderer.add_layer();
+        }
+        if actions.remove_layer {
+            renderer.remove_active_layer();
+        }
+        if actions.move_layer_up {
+            renderer.move_active_layer(true);
+        }
+        if actions.move_layer_down {
+            renderer.move_active_layer(false);
+        }
+        if let Some(i) = actions.select_layer {
+            renderer.set_active_layer(i);
+        }
+        if let Some((i, v)) = actions.set_layer_visible {
+            renderer.set_layer_visible(i, v);
+        }
+        if let Some((i, o)) = actions.set_layer_opacity {
+            renderer.set_layer_opacity(i, o);
+        }
+        if let Some((i, b)) = actions.set_layer_blend {
+            renderer.set_layer_blend(i, b);
+        }
+
+        // Keep the UI mirrors in sync with the renderer.
         self.ui.resolution = renderer.texture_resolution();
         self.ui.palette_swatches = renderer.palette().colors.clone();
+        self.ui.active_layer = renderer.layers().active;
+        self.ui.layers = renderer
+            .layers()
+            .layers
+            .iter()
+            .map(|l| crate::ui::LayerInfo {
+                name: l.name.clone(),
+                visible: l.visible,
+                opacity: l.opacity,
+                blend: l.blend,
+            })
+            .collect();
     }
 }
 

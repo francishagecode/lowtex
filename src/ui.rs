@@ -6,8 +6,18 @@
 
 use egui::Context;
 
+use crate::layers::BlendMode;
 use crate::paint::Brush;
 use crate::renderer::PaletteSettings;
+
+/// A read-only snapshot of one layer, synced from the renderer for the UI list.
+#[derive(Clone)]
+pub struct LayerInfo {
+    pub name: String,
+    pub visible: bool,
+    pub opacity: f32,
+    pub blend: BlendMode,
+}
 
 /// One-shot requests the UI raises this frame, drained by the App after the egui
 /// run (file dialogs and texture ops happen outside the egui closure).
@@ -21,6 +31,15 @@ pub struct UiActions {
     pub select_builtin_palette: Option<usize>,
     /// Generate a palette from a chosen image with this many colors.
     pub generate_palette: Option<usize>,
+    // Layer ops (G10).
+    pub add_layer: bool,
+    pub remove_layer: bool,
+    pub move_layer_up: bool,
+    pub move_layer_down: bool,
+    pub select_layer: Option<usize>,
+    pub set_layer_visible: Option<(usize, bool)>,
+    pub set_layer_opacity: Option<(usize, f32)>,
+    pub set_layer_blend: Option<(usize, BlendMode)>,
 }
 
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
@@ -31,6 +50,9 @@ pub struct UiState {
     pub palette_swatches: Vec<[f32; 3]>,
     /// Color count requested when generating a palette from an image.
     pub palette_size: u32,
+    /// Layer stack snapshot (bottom-first), synced from the renderer.
+    pub layers: Vec<LayerInfo>,
+    pub active_layer: usize,
     /// Mirror of the renderer's current texture resolution, shown in the picker.
     pub resolution: u32,
     pub actions: UiActions,
@@ -43,6 +65,8 @@ impl Default for UiState {
             palette: PaletteSettings::default(),
             palette_swatches: Vec::new(),
             palette_size: 16,
+            layers: Vec::new(),
+            active_layer: 0,
             resolution: 128,
             actions: UiActions::default(),
         }
@@ -83,6 +107,10 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
             ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
             ui.add(egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"));
+
+            ui.add_space(10.0);
+            ui.separator();
+            layers_section(ui, state);
 
             ui.add_space(10.0);
             ui.separator();
@@ -149,6 +177,64 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                     .small(),
             );
         });
+}
+
+/// The layer stack panel: add/remove/reorder, per-layer visibility, the active
+/// layer's blend mode + opacity. Emits actions on interaction (no per-frame push).
+fn layers_section(ui: &mut egui::Ui, state: &mut UiState) {
+    ui.horizontal(|ui| {
+        ui.label("Layers");
+        if ui.small_button("+").on_hover_text("Add layer").clicked() {
+            state.actions.add_layer = true;
+        }
+        if ui.small_button("−").on_hover_text("Delete layer").clicked() {
+            state.actions.remove_layer = true;
+        }
+        if ui.small_button("↑").on_hover_text("Move up").clicked() {
+            state.actions.move_layer_up = true;
+        }
+        if ui.small_button("↓").on_hover_text("Move down").clicked() {
+            state.actions.move_layer_down = true;
+        }
+    });
+
+    // Top layer first in the list (reverse of the bottom-up storage order).
+    let count = state.layers.len();
+    for ui_idx in (0..count).rev() {
+        let layer = state.layers[ui_idx].clone();
+        ui.horizontal(|ui| {
+            let mut vis = layer.visible;
+            if ui.checkbox(&mut vis, "").changed() {
+                state.actions.set_layer_visible = Some((ui_idx, vis));
+            }
+            let selected = ui_idx == state.active_layer;
+            if ui.selectable_label(selected, &layer.name).clicked() {
+                state.actions.select_layer = Some(ui_idx);
+            }
+        });
+    }
+
+    // Active layer's blend + opacity.
+    if let Some(active) = state.layers.get(state.active_layer).cloned() {
+        let i = state.active_layer;
+        egui::ComboBox::from_label("Blend")
+            .selected_text(active.blend.name())
+            .show_ui(ui, |ui| {
+                for mode in BlendMode::ALL {
+                    let mut sel = active.blend;
+                    if ui.selectable_value(&mut sel, mode, mode.name()).clicked() {
+                        state.actions.set_layer_blend = Some((i, mode));
+                    }
+                }
+            });
+        let mut op = active.opacity;
+        if ui
+            .add(egui::Slider::new(&mut op, 0.0..=1.0).text("Layer opacity"))
+            .changed()
+        {
+            state.actions.set_layer_opacity = Some((i, op));
+        }
+    }
 }
 
 /// Draw a wrapping row of small color swatches.

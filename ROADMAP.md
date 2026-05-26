@@ -278,7 +278,7 @@ Descoped 2026-05-26: the look comes from the texture, not screen-space effects.
 
 Target: a Photoshop-style stack — the principle that makes iteration fearless.
 
-### [ ] G10 — Layer stack + blend modes
+### [x] G10 — Layer stack + blend modes
 **Outcome:** Multiple layers (albedo + emissive channels), opacity, blend modes,
 visibility, reorder; composited on the GPU.
 - **Build:** layer = set of GPU textures; compositor pass blends bottom-up
@@ -289,6 +289,15 @@ visibility, reorder; composited on the GPU.
 - **Done when:** painting on layer 2 above a layer-1 fill composites correctly;
   hiding a layer removes it from the view.
 - **Depends on:** G6, G8
+- _2026-05-26: `src/layers.rs` — `Layers` stack of RGBA8 `Texture`s (bottom-up),
+  blend modes Normal/Multiply/Add/Screen, per-layer visibility + opacity, reorder.
+  Painting targets the active layer (alpha now encodes paint presence; base layer
+  opaque, added layers transparent). `Renderer` composites bottom-up on the CPU
+  then palette-quantizes (the quantize-at-bottom principle) and uploads — CPU
+  composite for now, GPU at G12. UI Layers panel: +/−/↑/↓, visibility checkboxes,
+  active selection, blend combo + opacity. Tests: normal-over, multiply, hidden.
+  Verified headless (`--layer-demo`): base red + layer green both composite.
+  (Emissive channel deferred — albedo layers only for now.)_
 
 ### [ ] G11 — Layer masks
 **Outcome:** Each layer has a paintable mask that reveals/hides it.

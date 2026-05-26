@@ -126,7 +126,10 @@ impl Texture {
                         .round()
                         .clamp(0.0, 255.0) as u8;
                 }
-                self.pixels[i + 3] = 255;
+                // Raise alpha toward opaque by coverage. An opaque base (255)
+                // stays opaque; a transparent layer (0) gains paint where stamped.
+                let base_a = base[i + 3] as f32;
+                self.pixels[i + 3] = (base_a * (1.0 - cov) + 255.0 * cov).round() as u8;
             }
         }
     }

@@ -14,6 +14,7 @@
 mod app;
 mod bvh;
 mod camera;
+mod layers;
 mod mesh;
 mod model;
 mod paint;
@@ -52,6 +53,8 @@ struct Args {
     quantize: bool,
     palette_builtin: Option<usize>,
     no_dither: bool,
+    /// Headless verification: paint base, add a layer, paint it a 2nd color.
+    layer_demo: bool,
 }
 
 fn parse_args() -> Args {
@@ -73,6 +76,7 @@ fn parse_args() -> Args {
         quantize: false,
         palette_builtin: None,
         no_dither: false,
+        layer_demo: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -99,6 +103,7 @@ fn parse_args() -> Args {
             "--load-texture" => args.load_texture = it.next(),
             "--save-texture" => args.save_texture = it.next(),
             "--res" => args.res = it.next().and_then(|s| s.parse().ok()),
+            "--layer-demo" => args.layer_demo = true,
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
             "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
@@ -201,6 +206,22 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
             r.paint_at((cx + dx, cy + dy), &brush);
         }
     };
+    if args.layer_demo {
+        // Paint a red stroke on the base, then a green stroke on a layer above it.
+        let mut b = Brush {
+            color: [0.85, 0.2, 0.2],
+            radius: 7.0,
+            ..Brush::default()
+        };
+        renderer.begin_stroke();
+        renderer.paint_segment((cx - 70.0, cy - 40.0), (cx + 70.0, cy - 40.0), &b);
+        renderer.end_stroke();
+        renderer.add_layer();
+        b.color = [0.2, 0.8, 0.3];
+        renderer.begin_stroke();
+        renderer.paint_segment((cx - 70.0, cy + 40.0), (cx + 70.0, cy + 40.0), &b);
+        renderer.end_stroke();
+    }
     if args.paint {
         dab(&mut renderer);
     }
