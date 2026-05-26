@@ -31,6 +31,7 @@ use glam::Vec2;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::bake::{Levels, MapSource};
 use crate::bvh::Bvh;
 use crate::camera::Camera;
 use crate::history::History;
@@ -76,6 +77,15 @@ impl Default for PaletteSettings {
     }
 }
 
+/// What the brush paints into (G11).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PaintTarget {
+    /// The active layer's color.
+    Color,
+    /// The active layer's reveal mask.
+    Mask,
+}
+
 pub struct Renderer {
     window: Option<Arc<Window>>,
     surface: Option<wgpu::Surface<'static>>,
@@ -103,6 +113,11 @@ pub struct Renderer {
     // per-texel coverage, so overlapping stamps within one stroke don't double-darken.
     stroke_base: Vec<u8>,
     stroke_coverage: Vec<f32>,
+
+    // Whether the brush paints the active layer's color or its reveal mask (G11),
+    // and (in mask mode) whether it reveals (white) or hides (black).
+    paint_target: PaintTarget,
+    mask_reveal: bool,
 
     // Undo/redo over the layer stack. A stroke records one entry on release (via
     // `pending` + `stroke_dirty`); discrete layer ops record one each.
@@ -132,6 +147,9 @@ pub struct Renderer {
     // Cached baked mesh maps (AO/edge) at the current resolution; invalidated on
     // model load or resolution change.
     mesh_maps: Option<crate::bake::MeshMaps>,
+    // Cached UV-island map at the current resolution, driving the fill tools.
+    // Invalidated alongside mesh_maps (geometry or resolution change).
+    island_map: Option<crate::fill::IslandMap>,
 }
 
 impl Renderer {
@@ -400,6 +418,8 @@ impl Renderer {
             tex_size,
             stroke_base,
             stroke_coverage,
+            paint_target: PaintTarget::Color,
+            mask_reveal: false,
             history: History::new(HISTORY_CAP),
             pending: None,
             stroke_dirty: false,
@@ -412,6 +432,7 @@ impl Renderer {
             mesh,
             bvh,
             mesh_maps: None,
+            island_map: None,
         }
     }
 
@@ -564,19 +585,40 @@ impl Renderer {
         if self.tex_size != self.layers.size() {
             // rebuild_paint_gpu re-snapshots stroke buffers and refreshes for us.
             self.mesh_maps = None; // baked at the previous resolution
+            self.island_map = None; // rasterized at the previous resolution
             self.rebuild_paint_gpu();
         } else {
-            self.stroke_base = self.layers.active_tex().pixels.clone();
+            self.stroke_base = self.target_pixels().to_vec();
             self.stroke_coverage = vec![0.0; (self.tex_size * self.tex_size) as usize];
             self.refresh_display_texture();
         }
     }
 
-    /// Re-snapshot the active-layer stroke base (after the active layer changes).
+    /// The pixels of the current paint target (active layer's color or mask).
+    fn target_pixels(&self) -> &[u8] {
+        match self.paint_target {
+            PaintTarget::Color => &self.layers.active_tex().pixels,
+            PaintTarget::Mask => &self.layers.active_mask().pixels,
+        }
+    }
+
+    /// Re-snapshot the stroke base from the current paint target (after the active
+    /// layer or paint target changes).
     fn resync_stroke_base(&mut self) {
-        self.stroke_base.clear();
-        self.stroke_base
-            .extend_from_slice(&self.layers.active_tex().pixels);
+        self.stroke_base = self.target_pixels().to_vec();
+    }
+
+    /// Switch between painting the layer's color and its reveal mask.
+    pub fn set_paint_target(&mut self, target: PaintTarget) {
+        if target != self.paint_target {
+            self.paint_target = target;
+            self.resync_stroke_base();
+        }
+    }
+
+    /// In mask mode, whether the brush reveals (white) or hides (black).
+    pub fn set_mask_reveal(&mut self, reveal: bool) {
+        self.mask_reveal = reveal;
     }
 
     pub fn add_layer(&mut self) {
@@ -679,7 +721,7 @@ impl Renderer {
             &self.sampler,
         );
         // The stroke buffers must track the (possibly resized) active layer.
-        self.stroke_base = self.layers.active_tex().pixels.clone();
+        self.stroke_base = self.target_pixels().to_vec();
         self.stroke_coverage = vec![0.0; (self.tex_size * self.tex_size) as usize];
         self.refresh_display_texture();
     }
@@ -712,7 +754,7 @@ impl Renderer {
         *self.layers.active_tex_mut() = loaded.resampled(self.tex_size, self.tex_size);
         self.refresh_display_texture();
         // Re-snapshot the stroke base since the active layer changed wholesale.
-        self.stroke_base = self.layers.active_tex().pixels.clone();
+        self.stroke_base = self.target_pixels().to_vec();
         Ok(())
     }
 
@@ -725,6 +767,7 @@ impl Renderer {
         self.checkpoint();
         self.layers.resize(size);
         self.mesh_maps = None; // baked at the old resolution
+        self.island_map = None; // rasterized at the old resolution
         self.rebuild_paint_gpu();
     }
 
@@ -742,51 +785,207 @@ impl Renderer {
         }
     }
 
-    /// Add a black Multiply layer weighted by ambient occlusion — shadow sinks
-    /// into crevices. `strength` 0..1 scales the darkening.
-    pub fn apply_ao_layer(&mut self, strength: f32) {
+    /// Add a generated tint layer: a flat `color` whose alpha is a baked map
+    /// (`src`) read through `levels`. This is the one path behind every AO/curvature
+    /// effect — the presets below are just fixed (source, color, blend) choices.
+    pub fn add_map_layer(
+        &mut self,
+        name: &str,
+        src: MapSource,
+        levels: Levels,
+        color: [u8; 3],
+        blend: crate::layers::BlendMode,
+    ) {
         self.checkpoint();
         self.ensure_mesh_maps();
-        let maps = self.mesh_maps.as_ref().unwrap();
-        let mut tex = PaintTexture::new(self.tex_size, self.tex_size, [0, 0, 0, 0]);
-        for i in 0..maps.ao.len() {
-            if maps.mask[i] {
-                let a = (maps.ao[i] * strength).clamp(0.0, 1.0);
-                tex.pixels[i * 4 + 3] = (a * 255.0).round() as u8;
-            }
-        }
-        self.layers.push_generated(
-            "AO".to_string(),
-            tex,
-            crate::layers::BlendMode::Multiply,
-            1.0,
+        let weights = self.mesh_maps.as_ref().unwrap().sample(src, &levels);
+        let mut tex = PaintTexture::new(
+            self.tex_size,
+            self.tex_size,
+            [color[0], color[1], color[2], 0],
         );
+        for (i, w) in weights.iter().enumerate() {
+            tex.pixels[i * 4 + 3] = (w * 255.0).round() as u8;
+        }
+        self.layers
+            .push_generated(name.to_string(), tex, blend, 1.0);
         self.resync_stroke_base();
         self.refresh_display_texture();
     }
 
-    /// Add a white layer that is the inverse of AO — bright where the surface is
-    /// exposed (low occlusion), nothing in the crevices AO darkens. `strength`
-    /// 0..1 scales the lightening.
-    pub fn apply_highlight_layer(&mut self, strength: f32) {
+    /// Fill the *active layer's* reveal mask from a baked map — the Substance-style
+    /// move: route AO/curvature into a mask so whatever that layer paints only shows
+    /// where the map is high (e.g. paint a flat color, then confine it to cavities).
+    pub fn fill_active_mask_from_map(&mut self, src: MapSource, levels: Levels) {
         self.checkpoint();
         self.ensure_mesh_maps();
-        let maps = self.mesh_maps.as_ref().unwrap();
-        let mut tex = PaintTexture::new(self.tex_size, self.tex_size, [255, 255, 255, 0]);
-        for i in 0..maps.ao.len() {
-            if maps.mask[i] {
-                let a = ((1.0 - maps.ao[i]) * strength).clamp(0.0, 1.0);
-                tex.pixels[i * 4 + 3] = (a * 255.0).round() as u8;
-            }
+        let weights = self.mesh_maps.as_ref().unwrap().sample(src, &levels);
+        let mask = self.layers.active_mask_mut();
+        for (i, w) in weights.iter().enumerate() {
+            let v = (w * 255.0).round() as u8;
+            mask.pixels[i * 4] = v; // compositor reads the red channel
+            mask.pixels[i * 4 + 1] = v;
+            mask.pixels[i * 4 + 2] = v;
+            mask.pixels[i * 4 + 3] = 255;
         }
-        self.layers.push_generated(
-            "Highlights".to_string(),
-            tex,
-            crate::layers::BlendMode::Normal,
-            1.0,
-        );
         self.resync_stroke_base();
         self.refresh_display_texture();
+    }
+
+    /// Preset: a black Multiply layer in the cavities — shadow sinks into crevices.
+    pub fn apply_ao_layer(&mut self, levels: Levels) {
+        self.add_map_layer(
+            "AO",
+            MapSource::Cavities,
+            levels,
+            [0, 0, 0],
+            crate::layers::BlendMode::Multiply,
+        );
+    }
+
+    /// Preset: a white layer on convex edges/corners — brightens exposed edges and,
+    /// being curvature-driven, never lands on flat lit faces or in concave creases.
+    pub fn apply_highlight_layer(&mut self, levels: Levels) {
+        self.add_map_layer(
+            "Highlights",
+            MapSource::Edges,
+            levels,
+            [255, 255, 255],
+            crate::layers::BlendMode::Normal,
+        );
+    }
+
+    /// Preset: a dark grime tint settling into the cavities (Substance "Dirt").
+    pub fn apply_dirt_layer(&mut self, levels: Levels) {
+        self.add_map_layer(
+            "Dirt",
+            MapSource::Cavities,
+            levels,
+            [54, 42, 30],
+            crate::layers::BlendMode::Normal,
+        );
+    }
+
+    /// Preset: a worn, lightened tint on convex edges (Substance "Edge wear").
+    pub fn apply_edge_wear_layer(&mut self, levels: Levels) {
+        self.add_map_layer(
+            "Edge wear",
+            MapSource::Edges,
+            levels,
+            [205, 200, 185],
+            crate::layers::BlendMode::Normal,
+        );
+    }
+
+    // --- Fill tools (paint bucket; UV-island map driven) ---
+
+    /// Build the UV-island map for the current resolution if not already cached.
+    /// Cheap (union-find + a UV-space scan-fill, no ray-casting), so unlike the AO
+    /// bake it's fine to do lazily on the first fill click.
+    fn ensure_island_map(&mut self) {
+        let stale = self
+            .island_map
+            .as_ref()
+            .is_none_or(|m| m.size != self.tex_size);
+        if stale {
+            self.island_map = Some(crate::fill::IslandMap::build(&self.mesh, self.tex_size));
+        }
+    }
+
+    /// Object fill: a click on the mesh floods the active paint target with the
+    /// brush color across every texel the mesh's UVs cover. Returns whether it
+    /// landed on the mesh (a click on the background fills nothing). One undo step.
+    pub fn fill_object_at(&mut self, mouse_px: (f32, f32), brush: &Brush) -> bool {
+        let ray = self.pick_ray(Vec2::new(mouse_px.0, mouse_px.1));
+        if self.bvh.pick(&ray).is_none() {
+            return false;
+        }
+        self.ensure_island_map();
+        let map = self.island_map.as_ref().unwrap();
+        let covered: Vec<bool> = map.texel_island.iter().map(|&i| i >= 0).collect();
+        self.checkpoint();
+        let keep = covered.clone();
+        self.fill_texels(brush, &keep, &covered);
+        self.resync_stroke_base();
+        self.refresh_display_texture();
+        true
+    }
+
+    /// UV-island fill: a click floods the one UV island under the cursor with the
+    /// brush color (the island the picked triangle belongs to), bounded by the
+    /// island edge regardless of existing color. Returns whether it hit the mesh.
+    /// One undo step.
+    pub fn fill_island_at(&mut self, mouse_px: (f32, f32), brush: &Brush) -> bool {
+        let ray = self.pick_ray(Vec2::new(mouse_px.0, mouse_px.1));
+        let Some(hit) = self.bvh.pick(&ray) else {
+            return false;
+        };
+        self.ensure_island_map();
+        let map = self.island_map.as_ref().unwrap();
+        let Some(island) = map.island_for_tri(hit.tri) else {
+            return false;
+        };
+        let island = island as i32;
+        let covered: Vec<bool> = map.texel_island.iter().map(|&i| i >= 0).collect();
+        let keep: Vec<bool> = map.texel_island.iter().map(|&i| i == island).collect();
+        self.checkpoint();
+        self.fill_texels(brush, &keep, &covered);
+        self.resync_stroke_base();
+        self.refresh_display_texture();
+        true
+    }
+
+    /// Write the fill color into every `keep` texel of the active paint target,
+    /// then dilate the filled region one texel into uncovered neighbours so an
+    /// island edge reads solid under nearest sampling (principle #5). Dilation
+    /// only expands into `!covered` texels, so it never bleeds across a seam into
+    /// a neighbouring island. `keep` and `covered` are `size`×`size`, row-major.
+    fn fill_texels(&mut self, brush: &Brush, keep: &[bool], covered: &[bool]) {
+        // Mask painting ignores the brush color (reveal=white, hide=black), to
+        // match `stamp_screen`; color painting writes opaque brush color.
+        let rgba = match self.paint_target {
+            PaintTarget::Color => {
+                let c = brush.color_u8();
+                [c[0], c[1], c[2], 255]
+            }
+            PaintTarget::Mask => {
+                let v = if self.mask_reveal { 255 } else { 0 };
+                [v, v, v, 255]
+            }
+        };
+
+        // Frontier texels: uncovered, but 4-adjacent to a filled texel. Computed
+        // from `keep`/`covered` (not the texture) so it doesn't fight the borrow.
+        let w = self.tex_size as i32;
+        let h = self.tex_size as i32;
+        let mut frontier: Vec<usize> = Vec::new();
+        for (t, &cov) in covered.iter().enumerate() {
+            if cov {
+                continue;
+            }
+            let (x, y) = (t as i32 % w, t as i32 / w);
+            let adjacent = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+                .into_iter()
+                .any(|(nx, ny)| {
+                    nx >= 0 && ny >= 0 && nx < w && ny < h && keep[(ny * w + nx) as usize]
+                });
+            if adjacent {
+                frontier.push(t);
+            }
+        }
+
+        let tex = match self.paint_target {
+            PaintTarget::Color => self.layers.active_tex_mut(),
+            PaintTarget::Mask => self.layers.active_mask_mut(),
+        };
+        for (t, &k) in keep.iter().enumerate() {
+            if k {
+                tex.pixels[t * 4..t * 4 + 4].copy_from_slice(&rgba);
+            }
+        }
+        for t in frontier {
+            tex.pixels[t * 4..t * 4 + 4].copy_from_slice(&rgba);
+        }
     }
 
     /// Load a new mesh from a file, rebuilding the GPU buffers and the pick BVH.
@@ -811,15 +1010,14 @@ impl Renderer {
         self.bvh = Bvh::build(&mesh);
         self.mesh = mesh;
         self.mesh_maps = None; // geometry changed; baked maps are stale
+        self.island_map = None; // geometry changed; island map is stale
         Ok(())
     }
 
     /// Begin a new stroke: snapshot the texture and clear stroke coverage, so
     /// overlap within the stroke accumulates by max-coverage (no double-darken).
     pub fn begin_stroke(&mut self) {
-        self.stroke_base.clear();
-        self.stroke_base
-            .extend_from_slice(&self.layers.active_tex().pixels);
+        self.stroke_base = self.target_pixels().to_vec();
         self.stroke_coverage.fill(0.0);
         // Snapshot the pre-stroke stack so the whole stroke is one undo step. Held
         // until release, then committed only if the stroke actually painted.
@@ -870,9 +1068,24 @@ impl Renderer {
         if let Some(uv) = self.bvh.pick_uv(&ray) {
             let base = &self.stroke_base;
             let coverage = &mut self.stroke_coverage;
-            self.layers
-                .active_tex_mut()
-                .stamp_stroke(uv, brush, base, coverage);
+            match self.paint_target {
+                PaintTarget::Color => {
+                    self.layers
+                        .active_tex_mut()
+                        .stamp_stroke(uv, brush, base, coverage);
+                }
+                PaintTarget::Mask => {
+                    // Mask painting ignores the brush color: reveal=white, hide=black.
+                    let v = if self.mask_reveal { 1.0 } else { 0.0 };
+                    let mask_brush = Brush {
+                        color: [v, v, v],
+                        ..*brush
+                    };
+                    self.layers
+                        .active_mask_mut()
+                        .stamp_stroke(uv, &mask_brush, base, coverage);
+                }
+            }
             self.stroke_dirty = true;
             true
         } else {

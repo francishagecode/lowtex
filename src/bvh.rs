@@ -39,6 +39,14 @@ pub struct Bvh {
     tris: Vec<Tri>,
 }
 
+/// The closest triangle a ray struck: the interpolated UV at the hit and the
+/// original mesh-triangle index (for keying per-triangle data like UV islands).
+#[derive(Clone, Copy)]
+pub struct Hit {
+    pub uv: Vec2,
+    pub tri: u32,
+}
+
 impl Bvh {
     /// Build a BVH over the mesh's triangles. Cheap for low-poly assets.
     pub fn build(mesh: &Mesh) -> Self {
@@ -183,6 +191,15 @@ impl Bvh {
 
     /// Cast a ray and return the interpolated UV at the closest triangle hit.
     pub fn pick_uv(&self, ray: &Ray) -> Option<Vec2> {
+        self.pick(ray).map(|h| h.uv)
+    }
+
+    /// Cast a ray and return the closest hit: its interpolated UV and the index
+    /// of the triangle it struck. The triangle index is the *original* mesh
+    /// triangle (the `tris` Vec is built in mesh order and never reordered — only
+    /// `tri_idx` is permuted during the build), so it maps straight into anything
+    /// keyed by triangle, e.g. `fill::IslandMap::island_of_tri`.
+    pub fn pick(&self, ray: &Ray) -> Option<Hit> {
         if self.tris.is_empty() {
             return None;
         }
@@ -196,7 +213,7 @@ impl Bvh {
             1.0 / safe(ray.direction.z),
         );
 
-        let mut best: Option<(f32, Vec2)> = None;
+        let mut best: Option<(f32, Vec2, u32)> = None;
         // Explicit stack traversal.
         let mut stack = [0u32; 64];
         let mut sp = 0usize;
@@ -206,7 +223,7 @@ impl Bvh {
         while sp > 0 {
             sp -= 1;
             let node = self.nodes[stack[sp] as usize];
-            let best_t = best.map_or(f32::INFINITY, |(t, _)| t);
+            let best_t = best.map_or(f32::INFINITY, |(t, _, _)| t);
             if !ray_hits_aabb(ray.origin, inv_dir, node.min, node.max, best_t) {
                 continue;
             }
@@ -216,10 +233,10 @@ impl Bvh {
                 for &ti in &self.tri_idx[first..first + node.count as usize] {
                     let tri = &self.tris[ti as usize];
                     if let Some((t, u, v)) = intersect_triangle(ray, tri.p[0], tri.p[1], tri.p[2]) {
-                        if best.is_none_or(|(bt, _)| t < bt) {
+                        if best.is_none_or(|(bt, _, _)| t < bt) {
                             let w = 1.0 - u - v;
                             let uv = tri.uv[0] * w + tri.uv[1] * u + tri.uv[2] * v;
-                            best = Some((t, uv));
+                            best = Some((t, uv, ti));
                         }
                     }
                 }
@@ -231,7 +248,7 @@ impl Bvh {
                 sp += 1;
             }
         }
-        best.map(|(_, uv)| uv)
+        best.map(|(_, uv, tri)| Hit { uv, tri })
     }
 
     /// Does anything block the ray within `max_dist`? Early-exits on the first

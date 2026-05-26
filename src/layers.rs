@@ -51,9 +51,28 @@ impl BlendMode {
 pub struct Layer {
     pub name: String,
     pub tex: Texture,
+    /// Single-channel reveal mask (stored as a `Texture`; the compositor reads the
+    /// red channel). White (255) fully reveals, black (0) hides — paint into it to
+    /// carve a layer away non-destructively (G11).
+    pub mask: Texture,
     pub visible: bool,
     pub opacity: f32,
     pub blend: BlendMode,
+}
+
+impl Layer {
+    /// A layer wrapping `tex`, with a fully-revealing (white) mask of matching size.
+    pub fn new(name: String, tex: Texture, blend: BlendMode, opacity: f32) -> Self {
+        let mask = Texture::new(tex.width, tex.height, [255, 255, 255, 255]);
+        Self {
+            name,
+            tex,
+            mask,
+            visible: true,
+            opacity,
+            blend,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -66,13 +85,7 @@ impl Layers {
     /// Start with a single opaque base layer holding `base`.
     pub fn new(base: Texture) -> Self {
         Self {
-            layers: vec![Layer {
-                name: "Base".to_string(),
-                tex: base,
-                visible: true,
-                opacity: 1.0,
-                blend: BlendMode::Normal,
-            }],
+            layers: vec![Layer::new("Base".to_string(), base, BlendMode::Normal, 1.0)],
             active: 0,
         }
     }
@@ -89,30 +102,31 @@ impl Layers {
         &mut self.layers[self.active].tex
     }
 
+    pub fn active_mask(&self) -> &Texture {
+        &self.layers[self.active].mask
+    }
+
+    pub fn active_mask_mut(&mut self) -> &mut Texture {
+        &mut self.layers[self.active].mask
+    }
+
     /// Add a transparent layer on top and make it active.
     pub fn add_layer(&mut self) {
         let size = self.size();
         let n = self.layers.len() + 1;
-        self.layers.push(Layer {
-            name: format!("Layer {n}"),
-            tex: Texture::new(size, size, [0, 0, 0, 0]),
-            visible: true,
-            opacity: 1.0,
-            blend: BlendMode::Normal,
-        });
+        self.layers.push(Layer::new(
+            format!("Layer {n}"),
+            Texture::new(size, size, [0, 0, 0, 0]),
+            BlendMode::Normal,
+            1.0,
+        ));
         self.active = self.layers.len() - 1;
     }
 
     /// Push a pre-built layer (e.g. a baked AO/highlight layer) on top and make
     /// it active.
     pub fn push_generated(&mut self, name: String, tex: Texture, blend: BlendMode, opacity: f32) {
-        self.layers.push(Layer {
-            name,
-            tex,
-            visible: true,
-            opacity,
-            blend,
-        });
+        self.layers.push(Layer::new(name, tex, blend, opacity));
         self.active = self.layers.len() - 1;
     }
 
@@ -137,10 +151,11 @@ impl Layers {
         }
     }
 
-    /// Resample every layer to a new square resolution.
+    /// Resample every layer (and its mask) to a new square resolution.
     pub fn resize(&mut self, n: u32) {
         for l in &mut self.layers {
             l.tex = l.tex.resampled(n, n);
+            l.mask = l.mask.resampled(n, n);
         }
     }
 
@@ -155,9 +170,13 @@ impl Layers {
                 continue;
             }
             let px = &layer.tex.pixels;
+            let mask = &layer.mask.pixels;
             for t in 0..count {
                 let i = t * 4;
-                let sa = (px[i + 3] as f32 / 255.0) * layer.opacity;
+                // Mask (red channel) gates the layer's contribution: 0 hides, 255
+                // reveals (G11).
+                let m = mask[i] as f32 / 255.0;
+                let sa = (px[i + 3] as f32 / 255.0) * layer.opacity * m;
                 if sa <= 0.0 {
                     continue;
                 }
@@ -210,6 +229,27 @@ mod tests {
         l.layers[1].blend = BlendMode::Multiply;
         let out = l.composite();
         assert_eq!([out[0], out[1], out[2]], [0, 0, 0]);
+    }
+
+    #[test]
+    fn black_mask_hides_a_layer() {
+        // Opaque green layer over red base, but its mask is black → base shows.
+        let mut l = one_px_base([255, 0, 0, 255]);
+        l.add_layer();
+        fill_active(&mut l, [0, 255, 0, 255]);
+        l.active_mask_mut().pixels.copy_from_slice(&[0, 0, 0, 255]); // hide
+        assert_eq!(
+            [l.composite()[0], l.composite()[1], l.composite()[2]],
+            [255, 0, 0]
+        );
+        // White mask reveals the green again.
+        l.active_mask_mut()
+            .pixels
+            .copy_from_slice(&[255, 255, 255, 255]);
+        assert_eq!(
+            [l.composite()[0], l.composite()[1], l.composite()[2]],
+            [0, 255, 0]
+        );
     }
 
     #[test]

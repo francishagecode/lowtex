@@ -15,14 +15,17 @@ mod app;
 mod bake;
 mod bvh;
 mod camera;
+mod fill;
 mod history;
 mod layers;
 mod mesh;
 mod model;
+mod noise;
 mod paint;
 mod palette;
 mod renderer;
 mod ui;
+mod unwrap;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -57,9 +60,14 @@ struct Args {
     no_dither: bool,
     /// Headless verification: paint base, add a layer, paint it a 2nd color.
     layer_demo: bool,
+    /// Headless verification: paint a layer, then carve a stripe out of its mask.
+    mask_demo: bool,
     /// Headless verification: bake an AO / edge-highlight layer at this strength.
     ao: Option<f32>,
     highlight: Option<f32>,
+    /// Headless verification: bucket-fill the whole object / the island at center.
+    fill_object: bool,
+    fill_island: bool,
 }
 
 fn parse_args() -> Args {
@@ -82,8 +90,11 @@ fn parse_args() -> Args {
         palette_builtin: None,
         no_dither: false,
         layer_demo: false,
+        mask_demo: false,
         ao: None,
         highlight: None,
+        fill_object: false,
+        fill_island: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -111,8 +122,11 @@ fn parse_args() -> Args {
             "--save-texture" => args.save_texture = it.next(),
             "--res" => args.res = it.next().and_then(|s| s.parse().ok()),
             "--layer-demo" => args.layer_demo = true,
+            "--mask-demo" => args.mask_demo = true,
             "--ao" => args.ao = it.next().and_then(|s| s.parse().ok()),
             "--highlight" => args.highlight = it.next().and_then(|s| s.parse().ok()),
+            "--fill-object" => args.fill_object = true,
+            "--fill-island" => args.fill_island = true,
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
             "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
@@ -231,6 +245,30 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         renderer.paint_segment((cx - 70.0, cy + 40.0), (cx + 70.0, cy + 40.0), &b);
         renderer.end_stroke();
     }
+    if args.mask_demo {
+        // Cover the front with green on a new layer, then hide a band in its mask
+        // so the base checkerboard shows through where the mask is black.
+        let green = Brush {
+            color: [0.2, 0.8, 0.3],
+            radius: 22.0,
+            ..Brush::default()
+        };
+        renderer.add_layer();
+        for dy in [-30.0, 0.0, 30.0] {
+            renderer.begin_stroke();
+            renderer.paint_segment((cx - 70.0, cy + dy), (cx + 70.0, cy + dy), &green);
+            renderer.end_stroke();
+        }
+        renderer.set_paint_target(renderer::PaintTarget::Mask);
+        renderer.set_mask_reveal(false); // hide
+        let eraser = Brush {
+            radius: 10.0,
+            ..Brush::default()
+        };
+        renderer.begin_stroke();
+        renderer.paint_segment((cx - 80.0, cy), (cx + 80.0, cy), &eraser);
+        renderer.end_stroke();
+    }
     if args.paint {
         dab(&mut renderer);
     }
@@ -249,10 +287,16 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     }
 
     if let Some(s) = args.ao {
-        renderer.apply_ao_layer(s);
+        renderer.apply_ao_layer(crate::bake::Levels::amount(s));
     }
     if let Some(s) = args.highlight {
-        renderer.apply_highlight_layer(s);
+        renderer.apply_highlight_layer(crate::bake::Levels::amount(s));
+    }
+    if args.fill_island {
+        renderer.fill_island_at((cx, cy), &brush);
+    }
+    if args.fill_object {
+        renderer.fill_object_at((cx, cy), &brush);
     }
 
     if let Some(path) = &args.save_texture {

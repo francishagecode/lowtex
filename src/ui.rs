@@ -6,9 +6,22 @@
 
 use egui::Context;
 
+use crate::bake::{Levels, MapSource};
 use crate::layers::BlendMode;
 use crate::paint::Brush;
 use crate::renderer::PaletteSettings;
+
+/// The active editing tool. The brush drags a stroke; the two fills are one-shot
+/// "paint bucket" clicks (solid color, ignoring what's already there).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    /// Freehand brush — drag to paint a stroke.
+    Brush,
+    /// Fill the UV island under the cursor.
+    FillIsland,
+    /// Fill the whole object (every texel its UVs cover).
+    FillObject,
+}
 
 /// A read-only snapshot of one layer, synced from the renderer for the UI list.
 #[derive(Clone)]
@@ -46,14 +59,23 @@ pub struct UiActions {
     pub set_layer_visible: Option<(usize, bool)>,
     pub set_layer_opacity: Option<(usize, f32)>,
     pub set_layer_blend: Option<(usize, BlendMode)>,
-    // AO suite: add a baked AO / edge-highlight layer at the given strength.
-    pub apply_ao: Option<f32>,
-    pub apply_highlight: Option<f32>,
+    // Mesh effects (AO + curvature → layers and masks), all sharing the Levels
+    // remap from the controls. Presets fix the source/color/blend; the two generic
+    // actions route the chosen `effect_source` into a brush-colored tint layer or
+    // into the active layer's reveal mask.
+    pub apply_ao: Option<Levels>,
+    pub apply_highlight: Option<Levels>,
+    pub apply_dirt: Option<Levels>,
+    pub apply_edge_wear: Option<Levels>,
+    pub apply_tint: Option<(MapSource, Levels, [f32; 3])>,
+    pub mask_from_map: Option<(MapSource, Levels)>,
 }
 
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
 pub struct UiState {
     pub brush: Brush,
+    /// Active tool — what a left-click on the mesh does.
+    pub tool: Tool,
     pub palette: PaletteSettings,
     /// Colors of the active palette, synced from the renderer for the swatch row.
     pub palette_swatches: Vec<[f32; 3]>,
@@ -62,8 +84,17 @@ pub struct UiState {
     /// Layer stack snapshot (bottom-first), synced from the renderer.
     pub layers: Vec<LayerInfo>,
     pub active_layer: usize,
-    /// Strength for the AO-suite bakes.
+    /// Mask painting (G11): paint the active layer's reveal mask instead of its
+    /// color, and (when masking) whether the brush reveals (white) or hides (black).
+    pub paint_mask: bool,
+    pub mask_reveal: bool,
+    /// Levels controls shared by every mesh effect: overall strength, mid-tone
+    /// contrast, and invert. `effect_source` is which baked channel the generic
+    /// "Tint layer" / "Mask layer" actions read from.
     pub ao_strength: f32,
+    pub effect_contrast: f32,
+    pub effect_invert: bool,
+    pub effect_source: MapSource,
     /// Mirror of the renderer's current texture resolution, shown in the picker.
     pub resolution: u32,
     /// Mirrors of the history state, to enable/disable the Undo/Redo buttons.
@@ -76,12 +107,18 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             brush: Brush::default(),
+            tool: Tool::Brush,
             palette: PaletteSettings::default(),
             palette_swatches: Vec::new(),
             palette_size: 16,
             layers: Vec::new(),
             active_layer: 0,
+            paint_mask: false,
+            mask_reveal: false,
             ao_strength: 0.75,
+            effect_contrast: 0.0,
+            effect_invert: false,
+            effect_source: MapSource::Cavities,
             resolution: 128,
             can_undo: false,
             can_redo: false,
@@ -135,12 +172,27 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             });
             ui.separator();
 
-            ui.label("Brush");
+            // Tool picker. The fills are one-shot bucket clicks; size/hardness only
+            // affect the brush, so they're disabled while a fill tool is active.
+            ui.label("Tool");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut state.tool, Tool::Brush, "🖌 Brush");
+                ui.selectable_value(&mut state.tool, Tool::FillIsland, "🪣 Island")
+                    .on_hover_text("Fill the UV island you click");
+                ui.selectable_value(&mut state.tool, Tool::FillObject, "🪣 All")
+                    .on_hover_text("Fill the whole object");
+            });
+            ui.add_space(6.0);
+
+            ui.label("Color");
             ui.color_edit_button_rgb(&mut state.brush.color);
             ui.add_space(6.0);
-            ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
-            ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
-            ui.add(egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"));
+            let brush_active = state.tool == Tool::Brush;
+            ui.add_enabled_ui(brush_active, |ui| {
+                ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
+                ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
+                ui.add(egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"));
+            });
 
             ui.add_space(10.0);
             ui.separator();
@@ -148,29 +200,7 @@ pub fn build(ctx: &Context, state: &mut UiState) {
 
             ui.add_space(10.0);
             ui.separator();
-            ui.label("Ambient occlusion");
-            ui.label(
-                egui::RichText::new("Bake shadow/highlights from the mesh into a layer")
-                    .weak()
-                    .small(),
-            );
-            ui.add(egui::Slider::new(&mut state.ao_strength, 0.0..=1.0).text("Strength"));
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Darken (AO)")
-                    .on_hover_text("Shadow in crevices")
-                    .clicked()
-                {
-                    state.actions.apply_ao = Some(state.ao_strength);
-                }
-                if ui
-                    .button("Highlights")
-                    .on_hover_text("Brighten exposed edges")
-                    .clicked()
-                {
-                    state.actions.apply_highlight = Some(state.ao_strength);
-                }
-            });
+            mesh_effects_section(ui, state);
 
             ui.add_space(10.0);
             ui.separator();
@@ -303,6 +333,100 @@ fn layers_section(ui: &mut egui::Ui, state: &mut UiState) {
             state.actions.set_layer_opacity = Some((i, op));
         }
     }
+
+    // Mask painting (G11): paint into the active layer's reveal mask.
+    ui.add_space(4.0);
+    ui.checkbox(&mut state.paint_mask, "Paint mask");
+    ui.add_enabled_ui(state.paint_mask, |ui| {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut state.mask_reveal, false, "Hide");
+            ui.selectable_value(&mut state.mask_reveal, true, "Reveal");
+        });
+    });
+}
+
+/// Mesh effects: the baked AO + curvature maps driving layers and masks, all
+/// through one shared Levels remap (Strength / Contrast / Invert). Presets are
+/// one-click; the Source combo plus Tint/Mask buttons are the generic route.
+fn mesh_effects_section(ui: &mut egui::Ui, state: &mut UiState) {
+    ui.label("Mesh effects");
+    ui.label(
+        egui::RichText::new("Drive layers & masks from baked AO and edges")
+            .weak()
+            .small(),
+    );
+
+    // Shared Levels controls.
+    ui.add(egui::Slider::new(&mut state.ao_strength, 0.0..=1.0).text("Strength"));
+    ui.add(egui::Slider::new(&mut state.effect_contrast, 0.0..=1.0).text("Contrast"));
+    ui.checkbox(&mut state.effect_invert, "Invert");
+    let levels = Levels {
+        invert: state.effect_invert,
+        contrast: state.effect_contrast,
+        strength: state.ao_strength,
+    };
+
+    // Presets — fixed source + color + blend, honoring the Levels above.
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui
+            .button("Darken (AO)")
+            .on_hover_text("Shadow in crevices")
+            .clicked()
+        {
+            state.actions.apply_ao = Some(levels);
+        }
+        if ui
+            .button("Highlights")
+            .on_hover_text("Brighten convex edges")
+            .clicked()
+        {
+            state.actions.apply_highlight = Some(levels);
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .button("Dirt")
+            .on_hover_text("Dark grime settling into cavities")
+            .clicked()
+        {
+            state.actions.apply_dirt = Some(levels);
+        }
+        if ui
+            .button("Edge wear")
+            .on_hover_text("Worn, lightened convex edges")
+            .clicked()
+        {
+            state.actions.apply_edge_wear = Some(levels);
+        }
+    });
+
+    // Generic route: pick a source, then drive a brush-colored tint layer or the
+    // active layer's reveal mask from it (the Substance-style mask workflow).
+    ui.add_space(6.0);
+    egui::ComboBox::from_label("Source")
+        .selected_text(state.effect_source.name())
+        .show_ui(ui, |ui| {
+            for src in MapSource::ALL {
+                ui.selectable_value(&mut state.effect_source, src, src.name());
+            }
+        });
+    ui.horizontal(|ui| {
+        if ui
+            .button("Tint layer")
+            .on_hover_text("New layer: the Color above, masked to the source")
+            .clicked()
+        {
+            state.actions.apply_tint = Some((state.effect_source, levels, state.brush.color));
+        }
+        if ui
+            .button("Mask layer")
+            .on_hover_text("Set the active layer's mask from the source")
+            .clicked()
+        {
+            state.actions.mask_from_map = Some((state.effect_source, levels));
+        }
+    });
 }
 
 /// Draw a wrapping row of small color swatches.

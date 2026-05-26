@@ -108,6 +108,14 @@ impl App {
         // Push the latest palette settings (cheap; re-quantizes the texture).
         renderer.set_palette_settings(self.ui.palette);
 
+        // Push the paint target (color vs mask) + mask polarity (G11).
+        renderer.set_paint_target(if self.ui.paint_mask {
+            crate::renderer::PaintTarget::Mask
+        } else {
+            crate::renderer::PaintTarget::Color
+        });
+        renderer.set_mask_reveal(self.ui.mask_reveal);
+
         let actions = std::mem::take(&mut self.ui.actions);
 
         if actions.open_model {
@@ -204,12 +212,30 @@ impl App {
             renderer.set_layer_blend(i, b);
         }
 
-        // AO suite — bakes mesh maps (cached) then adds a generated layer.
-        if let Some(s) = actions.apply_ao {
-            renderer.apply_ao_layer(s);
+        // Mesh effects — bake mesh maps (cached) then add a generated layer or fill
+        // the active layer's mask from a baked map.
+        if let Some(lv) = actions.apply_ao {
+            renderer.apply_ao_layer(lv);
         }
-        if let Some(s) = actions.apply_highlight {
-            renderer.apply_highlight_layer(s);
+        if let Some(lv) = actions.apply_highlight {
+            renderer.apply_highlight_layer(lv);
+        }
+        if let Some(lv) = actions.apply_dirt {
+            renderer.apply_dirt_layer(lv);
+        }
+        if let Some(lv) = actions.apply_edge_wear {
+            renderer.apply_edge_wear_layer(lv);
+        }
+        if let Some((src, lv, color)) = actions.apply_tint {
+            let rgb = [
+                (color[0] * 255.0).round() as u8,
+                (color[1] * 255.0).round() as u8,
+                (color[2] * 255.0).round() as u8,
+            ];
+            renderer.add_map_layer("Tint", src, lv, rgb, crate::layers::BlendMode::Normal);
+        }
+        if let Some((src, lv)) = actions.mask_from_map {
+            renderer.fill_active_mask_from_map(src, lv);
         }
 
         // Keep the UI mirrors in sync with the renderer.
@@ -339,9 +365,21 @@ impl ApplicationHandler for App {
                 }
                 match (button, pressed) {
                     (MouseButton::Left, true) => {
-                        self.drag = Drag::Paint;
-                        renderer.begin_stroke();
-                        renderer.paint_at(self.mouse_pos, &self.ui.brush);
+                        // The brush starts a drag-stroke; the fills are one-shot
+                        // bucket clicks that commit their own single undo step.
+                        match self.ui.tool {
+                            crate::ui::Tool::Brush => {
+                                self.drag = Drag::Paint;
+                                renderer.begin_stroke();
+                                renderer.paint_at(self.mouse_pos, &self.ui.brush);
+                            }
+                            crate::ui::Tool::FillIsland => {
+                                renderer.fill_island_at(self.mouse_pos, &self.ui.brush);
+                            }
+                            crate::ui::Tool::FillObject => {
+                                renderer.fill_object_at(self.mouse_pos, &self.ui.brush);
+                            }
+                        }
                         window.request_redraw();
                     }
                     (MouseButton::Right, true) => self.drag = Drag::Orbit,
