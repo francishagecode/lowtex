@@ -237,7 +237,7 @@ lowtex over a 2D editor.
   dramatic wobble (`--psx-grid 14`), faceted flat shading on the octahedron, and
   distance fog._
 
-### [ ] G8 — Palette system
+### [x] G8 — Palette system
 **Outcome:** Constrained palettes with quantize + dithering, generatable from images.
 - **Build:** palette as an ordered color list (16/32/256); quantize post-process
   (nearest palette color) as a final pass; ordered (Bayer) dithering brush/mode;
@@ -248,6 +248,15 @@ lowtex over a 2D editor.
 - **Done when:** painting with a 16-color palette + dither looks like a PS1
   texture; swapping palettes recolors the view instantly.
 - **Depends on:** G7
+- _2026-05-26: `src/palette.rs` (built-ins PICO-8/Game Boy/Grayscale + median-cut
+  `from_image_median_cut`). Quantize is a fullscreen post pass (`post.wgsl`):
+  scene → offscreen `scene_color` → nearest-palette + 4×4 Bayer dither → target,
+  with egui drawn after so the UI stays crisp. Palette uploaded LINEAR (256-vec4
+  uniform); scene sampled as linear from the sRGB target. `PaletteSettings` +
+  active `Palette` in renderer (`set_palette`/`set_palette_settings`/
+  `generate_palette_from_image`); UI has Quantize/Dither, swatch row, built-in
+  buttons, and "From image…". Tests: median-cut separates R/G/B/W; built-ins
+  non-empty. Verified headless: scene posterizes to PICO-8 with visible dither._
 
 ### [ ] G9 — Paint-view vs PSX-preview UX *(design decision)*
 **Outcome:** A resolved, deliberate answer to "do you paint in the wobble?"

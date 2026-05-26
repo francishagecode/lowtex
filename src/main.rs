@@ -17,6 +17,7 @@ mod camera;
 mod mesh;
 mod model;
 mod paint;
+mod palette;
 mod renderer;
 mod ui;
 
@@ -53,6 +54,10 @@ struct Args {
     fog: bool,
     flat: bool,
     psx_grid: Option<f32>,
+    /// Headless verification: enable palette quantize / pick a built-in / no dither.
+    quantize: bool,
+    palette_builtin: Option<usize>,
+    no_dither: bool,
 }
 
 fn parse_args() -> Args {
@@ -75,6 +80,9 @@ fn parse_args() -> Args {
         fog: false,
         flat: false,
         psx_grid: None,
+        quantize: false,
+        palette_builtin: None,
+        no_dither: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -105,6 +113,9 @@ fn parse_args() -> Args {
             "--fog" => args.fog = true,
             "--flat" => args.flat = true,
             "--psx-grid" => args.psx_grid = it.next().and_then(|s| s.parse().ok()),
+            "--quantize" => args.quantize = true,
+            "--no-dither" => args.no_dither = true,
+            "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
             "--width" => {
                 if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
                     args.width = v;
@@ -167,6 +178,19 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         ..defaults
     };
     renderer.set_psx_settings(psx);
+
+    if args.quantize {
+        renderer.set_palette_settings(renderer::PaletteSettings {
+            enabled: true,
+            dither: !args.no_dither,
+            dither_strength: 0.06,
+        });
+    }
+    if let Some(i) = args.palette_builtin {
+        if let Some(p) = palette::Palette::builtins().into_iter().nth(i) {
+            renderer.set_palette(p);
+        }
+    }
 
     let mut brush = Brush::default();
     if let Some(c) = args.brush_color {

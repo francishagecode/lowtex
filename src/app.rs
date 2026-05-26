@@ -101,10 +101,28 @@ impl App {
             return;
         };
 
-        // Push the latest PSX render settings (cheap; resolves to a uniform write).
+        // Push the latest PSX + palette settings (cheap; resolve to uniform writes).
         renderer.set_psx_settings(self.ui.psx);
+        renderer.set_palette_settings(self.ui.palette);
 
         let actions = std::mem::take(&mut self.ui.actions);
+
+        if let Some(i) = actions.select_builtin_palette {
+            if let Some(p) = crate::palette::Palette::builtins().into_iter().nth(i) {
+                renderer.set_palette(p);
+            }
+        }
+        if let Some(n) = actions.generate_palette {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Image", &["png", "jpg", "jpeg"])
+                .pick_file()
+            {
+                match renderer.generate_palette_from_image(&path.to_string_lossy(), n) {
+                    Ok(()) => log::info!("generated {n}-color palette from {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
 
         if let Some(size) = actions.set_resolution {
             renderer.set_texture_resolution(size);
@@ -133,8 +151,9 @@ impl App {
             }
         }
 
-        // Keep the resolution picker in sync with the renderer's actual size.
+        // Keep the resolution picker and palette swatches in sync with the renderer.
         self.ui.resolution = renderer.texture_resolution();
+        self.ui.palette_swatches = renderer.palette().colors.clone();
     }
 }
 

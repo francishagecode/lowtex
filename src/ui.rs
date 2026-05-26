@@ -7,7 +7,7 @@
 use egui::Context;
 
 use crate::paint::Brush;
-use crate::renderer::PsxSettings;
+use crate::renderer::{PaletteSettings, PsxSettings};
 
 /// One-shot requests the UI raises this frame, drained by the App after the egui
 /// run (file dialogs and texture ops happen outside the egui closure).
@@ -16,12 +16,21 @@ pub struct UiActions {
     pub save_png: bool,
     pub open_texture: bool,
     pub set_resolution: Option<u32>,
+    /// Index into `Palette::builtins()` to make active.
+    pub select_builtin_palette: Option<usize>,
+    /// Generate a palette from a chosen image with this many colors.
+    pub generate_palette: Option<usize>,
 }
 
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
 pub struct UiState {
     pub brush: Brush,
     pub psx: PsxSettings,
+    pub palette: PaletteSettings,
+    /// Colors of the active palette, synced from the renderer for the swatch row.
+    pub palette_swatches: Vec<[f32; 3]>,
+    /// Color count requested when generating a palette from an image.
+    pub palette_size: u32,
     /// Mirror of the renderer's current texture resolution, shown in the picker.
     pub resolution: u32,
     pub actions: UiActions,
@@ -32,6 +41,9 @@ impl Default for UiState {
         Self {
             brush: Brush::default(),
             psx: PsxSettings::default(),
+            palette: PaletteSettings::default(),
+            palette_swatches: Vec::new(),
+            palette_size: 16,
             resolution: 128,
             actions: UiActions::default(),
         }
@@ -116,10 +128,55 @@ pub fn build(ctx: &Context, state: &mut UiState) {
 
             ui.add_space(10.0);
             ui.separator();
+            ui.label("Palette");
+            ui.checkbox(&mut state.palette.enabled, "Quantize");
+            ui.add_enabled_ui(state.palette.enabled, |ui| {
+                ui.checkbox(&mut state.palette.dither, "Dither");
+                ui.add(
+                    egui::Slider::new(&mut state.palette.dither_strength, 0.0..=0.3)
+                        .text("Dither amt"),
+                );
+            });
+
+            // Swatch row of the active palette.
+            swatches(ui, &state.palette_swatches);
+
+            ui.horizontal_wrapped(|ui| {
+                for (i, p) in crate::palette::Palette::builtins().iter().enumerate() {
+                    if ui.button(&p.name).clicked() {
+                        state.actions.select_builtin_palette = Some(i);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut state.palette_size, 2..=64).text("colors"));
+                if ui.button("From image…").clicked() {
+                    state.actions.generate_palette = Some(state.palette_size as usize);
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
             ui.label(
                 egui::RichText::new("LMB paint · RMB orbit · MMB pan · wheel zoom")
                     .weak()
                     .small(),
             );
         });
+}
+
+/// Draw a wrapping row of small color swatches.
+fn swatches(ui: &mut egui::Ui, colors: &[[f32; 3]]) {
+    let size = egui::vec2(16.0, 16.0);
+    ui.horizontal_wrapped(|ui| {
+        for c in colors {
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            let color = egui::Color32::from_rgb(
+                (c[0] * 255.0) as u8,
+                (c[1] * 255.0) as u8,
+                (c[2] * 255.0) as u8,
+            );
+            ui.painter().rect_filled(rect, 2.0, color);
+        }
+    });
 }

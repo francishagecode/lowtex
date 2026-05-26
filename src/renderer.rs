@@ -33,6 +33,7 @@ use crate::bvh::Bvh;
 use crate::camera::Camera;
 use crate::mesh::{Mesh, Vertex};
 use crate::paint::{Brush, Ray, Texture as PaintTexture};
+use crate::palette::{srgb_to_linear, Palette};
 
 const TEX_SIZE: u32 = 128; // PSX-scale. Bump to 256 if you want.
 
@@ -73,6 +74,58 @@ impl Default for PsxSettings {
             fog_start: 3.0,
             fog_end: 7.0,
             flat: false,
+        }
+    }
+}
+
+/// Palette-quantize post-process settings (G8). The active `Palette` lives in the
+/// renderer; these toggle the post pass.
+#[derive(Clone, Copy)]
+pub struct PaletteSettings {
+    pub enabled: bool,
+    pub dither: bool,
+    pub dither_strength: f32,
+}
+
+impl Default for PaletteSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dither: true,
+            dither_strength: 0.06,
+        }
+    }
+}
+
+/// GPU uniform for the post pass. Matches `Palette` in post.wgsl. Colors are
+/// LINEAR (the renderer converts from the sRGB `Palette`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PaletteUniform {
+    params: [f32; 4], // enabled, count, dither, strength
+    colors: [[f32; 4]; 256],
+}
+
+impl PaletteUniform {
+    fn new(palette: &Palette, s: &PaletteSettings) -> Self {
+        let mut colors = [[0.0f32; 4]; 256];
+        let count = palette.colors.len().min(256);
+        for (i, c) in palette.colors.iter().take(256).enumerate() {
+            colors[i] = [
+                srgb_to_linear(c[0]),
+                srgb_to_linear(c[1]),
+                srgb_to_linear(c[2]),
+                1.0,
+            ];
+        }
+        Self {
+            params: [
+                if s.enabled { 1.0 } else { 0.0 },
+                count as f32,
+                if s.dither { 1.0 } else { 0.0 },
+                s.dither_strength,
+            ],
+            colors,
         }
     }
 }
@@ -127,6 +180,17 @@ pub struct Renderer {
     stroke_coverage: Vec<f32>,
 
     depth_view: wgpu::TextureView,
+
+    // Palette-quantize post-process (G8): scene renders to scene_color, then a
+    // fullscreen pass quantizes it to the target. egui draws after (stays crisp).
+    scene_color: wgpu::Texture,
+    scene_color_view: wgpu::TextureView,
+    post_pipeline: wgpu::RenderPipeline,
+    post_bind_group_layout: wgpu::BindGroupLayout,
+    post_bind_group: wgpu::BindGroup,
+    palette_uniform_buffer: wgpu::Buffer,
+    palette: Palette,
+    palette_settings: PaletteSettings,
 
     // egui overlay renderer; None in headless mode.
     egui_renderer: Option<egui_wgpu::Renderer>,
@@ -382,6 +446,93 @@ impl Renderer {
 
         let depth_view = make_depth_view(&device, width, height);
 
+        // --- Palette-quantize post-process (G8) ---
+        let scene_color = make_scene_color(&device, target_format, width, height);
+        let scene_color_view = scene_color.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let palette = Palette::builtins().remove(0); // PICO-8 by default
+        let palette_settings = PaletteSettings::default();
+        let palette_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette uniform"),
+            contents: bytemuck::bytes_of(&PaletteUniform::new(&palette, &palette_settings)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let post_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("post bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let post_bind_group = make_post_bind_group(
+            &device,
+            &post_bind_group_layout,
+            &scene_color_view,
+            &sampler,
+            &palette_uniform_buffer,
+        );
+
+        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("post shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/post.wgsl").into()),
+        });
+        let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("post pipeline layout"),
+            bind_group_layouts: &[&post_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("post pipeline"),
+            layout: Some(&post_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &post_shader,
+                entry_point: "vs",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &post_shader,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // BVH over the mesh triangles for fast ray picking (G5).
         let bvh = Bvh::build(&mesh);
 
@@ -408,6 +559,14 @@ impl Renderer {
             stroke_base,
             stroke_coverage,
             depth_view,
+            scene_color,
+            scene_color_view,
+            post_pipeline,
+            post_bind_group_layout,
+            post_bind_group,
+            palette_uniform_buffer,
+            palette,
+            palette_settings,
             egui_renderer: None,
             max_texture_dim,
             camera,
@@ -432,6 +591,19 @@ impl Renderer {
         }
         self.depth_view = make_depth_view(&self.device, width, height);
 
+        // The offscreen scene target tracks the surface size; rebind the post pass.
+        self.scene_color = make_scene_color(&self.device, self.config.format, width, height);
+        self.scene_color_view = self
+            .scene_color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.post_bind_group = make_post_bind_group(
+            &self.device,
+            &self.post_bind_group_layout,
+            &self.scene_color_view,
+            &self.sampler,
+            &self.palette_uniform_buffer,
+        );
+
         self.camera.aspect = width as f32 / height as f32;
         self.update_uniforms();
     }
@@ -447,6 +619,38 @@ impl Renderer {
     pub fn set_psx_settings(&mut self, psx: PsxSettings) {
         self.psx = psx;
         self.update_uniforms();
+    }
+
+    /// Write the palette + post-process settings to the GPU.
+    fn update_palette_uniform(&self) {
+        let u = PaletteUniform::new(&self.palette, &self.palette_settings);
+        self.queue
+            .write_buffer(&self.palette_uniform_buffer, 0, bytemuck::bytes_of(&u));
+    }
+
+    /// Replace the active palette (live swap).
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+        self.update_palette_uniform();
+    }
+
+    /// Update quantize/dither settings.
+    pub fn set_palette_settings(&mut self, settings: PaletteSettings) {
+        self.palette_settings = settings;
+        self.update_palette_uniform();
+    }
+
+    /// The active palette (for the UI swatch row).
+    pub fn palette(&self) -> &Palette {
+        &self.palette
+    }
+
+    /// Build a palette from an image file via median-cut and make it active.
+    pub fn generate_palette_from_image(&mut self, path: &str, n: usize) -> Result<(), String> {
+        let img = image::open(path).map_err(|e| format!("failed to open image: {e}"))?;
+        let rgba = img.to_rgba8();
+        self.set_palette(Palette::from_image_median_cut(&rgba, n));
+        Ok(())
     }
 
     /// Orbit the camera by drag deltas and refresh the uniform.
@@ -668,6 +872,27 @@ impl Renderer {
         rpass.draw_indexed(0..self.index_count, 0, 0..1);
     }
 
+    /// Fullscreen palette-quantize pass: read `scene_color`, write `target_view`.
+    fn encode_post(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("post pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rpass.set_pipeline(&self.post_pipeline);
+        rpass.set_bind_group(0, &self.post_bind_group, &[]);
+        rpass.draw(0..3, 0..1);
+    }
+
     pub fn render(&mut self, ui: Option<UiPaint>) {
         let Some(surface) = &self.surface else {
             return; // headless renderer has nothing to present
@@ -693,8 +918,9 @@ impl Renderer {
                 label: Some("frame encoder"),
             });
 
-        // Scene first (clears + depth), then the egui overlay on top.
-        self.draw_into(&mut encoder, &view);
+        // Scene → offscreen, quantize → surface, then egui on top (stays crisp).
+        self.draw_into(&mut encoder, &self.scene_color_view);
+        self.encode_post(&mut encoder, &view);
         if let Some(ui) = ui.as_ref() {
             self.encode_egui(&mut encoder, &view, ui);
         }
@@ -786,7 +1012,8 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture encoder"),
             });
-        self.draw_into(&mut encoder, &color_view);
+        self.draw_into(&mut encoder, &self.scene_color_view);
+        self.encode_post(&mut encoder, &color_view);
         if let Some(ui) = ui.as_ref() {
             self.encode_egui(&mut encoder, &color_view, ui);
         }
@@ -909,6 +1136,57 @@ fn make_paint_bind_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+/// Offscreen color target the scene renders into before the quantize post pass.
+fn make_scene_color(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene color"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+/// Bind group for the post pass: scene texture + sampler + palette uniform.
+fn make_post_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    palette_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("post bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: palette_buffer.as_entire_binding(),
             },
         ],
     })
