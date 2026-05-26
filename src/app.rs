@@ -129,6 +129,29 @@ impl App {
                 }
             }
         }
+        if actions.save_project {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name("untitled.lowtex")
+                .add_filter("lowtex project", &["lowtex"])
+                .save_file()
+            {
+                match renderer.save_project(&path.to_string_lossy()) {
+                    Ok(()) => log::info!("saved project {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
+        if actions.open_project {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("lowtex project", &["lowtex"])
+                .pick_file()
+            {
+                match renderer.load_project(&path.to_string_lossy()) {
+                    Ok(()) => log::info!("opened project {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
         if let Some(mode) = actions.unwrap {
             renderer.apply_unwrap(mode);
         }

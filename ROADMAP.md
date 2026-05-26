@@ -502,13 +502,21 @@ Target: an indie dev can adopt lowtex, finish a model, and get it into their eng
   the output decodes as Indexed with a PLTE. (Channel-packing + emissive deferred —
   albedo only; integer-UV snap on export deferred.)_
 
-### [ ] G24 — Project save/load (`.lowtex`)
+### [x] G24 — Project save/load (`.lowtex`)
 **Outcome:** Reopen a project with mesh reference, layers, palette, generators intact.
 - **Build:** serialize project state (mesh path + transform, layer stack, masks,
   palette, generators, baked-map cache refs). Versioned format.
 - **Touches:** new `src/project.rs`; **crates:** `serde`, `ron`/`serde_json`.
 - **Done when:** save → quit → reopen restores the exact editing state.
 - **Depends on:** G10, G20
+- _2026-05-26: `src/project.rs` — versioned RON `.lowtex` (`FORMAT_VERSION`),
+  pixel buffers base64'd to stay compact; serde kept off the core types via a DTO.
+  Stores the mesh geometry itself (so unwraps round-trip), every layer
+  (color + mask + blend + opacity), the palette, and quantize settings.
+  `Renderer::save_project`/`load_project`; UI Save/Open `.lowtex`; headless
+  `--save-project`/`--open-project`. Verified: paint+material+unwrap → save →
+  reopen in a fresh process renders **byte-identical**. (Generators are baked into
+  pixels here; a re-evaluatable generator *recipe* is G21.)_
 
 ### [ ] G25 — Robustness & performance pass
 **Outcome:** lowtex doesn't fall over on real-world input.

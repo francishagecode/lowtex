@@ -25,6 +25,7 @@ mod model;
 mod noise;
 mod paint;
 mod palette;
+mod project;
 mod renderer;
 mod ui;
 mod unwrap;
@@ -82,6 +83,9 @@ struct Args {
     /// Headless verification: material on a NEW layer, masked by AO (Cavities) —
     /// the "moss in the crevices" workflow.
     material_crevice: bool,
+    /// Headless verification: open a .lowtex first / save one after edits.
+    open_project: Option<String>,
+    save_project: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -115,6 +119,8 @@ fn parse_args() -> Args {
         material: None,
         material_tile: 4.0,
         material_crevice: false,
+        open_project: None,
+        save_project: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -157,6 +163,8 @@ fn parse_args() -> Args {
                 }
             }
             "--material-crevice" => args.material_crevice = true,
+            "--open-project" => args.open_project = it.next(),
+            "--save-project" => args.save_project = it.next(),
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
             "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
@@ -212,6 +220,13 @@ fn main() {
 fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     let (width, height) = (args.width, args.height);
     let mut renderer = pollster::block_on(Renderer::new_headless(width, height, mesh));
+
+    if let Some(path) = &args.open_project {
+        match renderer.load_project(path) {
+            Ok(()) => log::info!("opened project {path}"),
+            Err(e) => log::error!("{e}"),
+        }
+    }
 
     if let Some(m) = &args.unwrap {
         let mode = match m.as_str() {
@@ -367,6 +382,12 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     if let Some(path) = &args.export_indexed {
         match renderer.export_png(path, true) {
             Ok(()) => log::info!("exported indexed PNG {path}"),
+            Err(e) => log::error!("{e}"),
+        }
+    }
+    if let Some(path) = &args.save_project {
+        match renderer.save_project(path) {
+            Ok(()) => log::info!("saved project {path}"),
             Err(e) => log::error!("{e}"),
         }
     }

@@ -1092,6 +1092,133 @@ impl Renderer {
         self.fill_map = None;
     }
 
+    /// Save the entire editing state to a `.lowtex` file (G24).
+    pub fn save_project(&self, path: &str) -> Result<(), String> {
+        let blend_index = |b: crate::layers::BlendMode| {
+            crate::layers::BlendMode::ALL
+                .iter()
+                .position(|&m| m == b)
+                .unwrap_or(0) as u8
+        };
+        let layers = self
+            .layers
+            .layers
+            .iter()
+            .map(|l| crate::project::LayerDoc {
+                name: l.name.clone(),
+                blend: blend_index(l.blend),
+                visible: l.visible,
+                opacity: l.opacity,
+                color: crate::project::encode_pixels(&l.tex.pixels),
+                mask: crate::project::encode_pixels(&l.mask.pixels),
+            })
+            .collect();
+        let doc = crate::project::ProjectDoc {
+            version: crate::project::FORMAT_VERSION,
+            tex_size: self.tex_size,
+            active_layer: self.layers.active,
+            palette: self.palette.colors.clone(),
+            quantize: self.palette_settings.enabled,
+            dither: self.palette_settings.dither,
+            dither_strength: self.palette_settings.dither_strength,
+            positions: self.mesh.vertices.iter().map(|v| v.position).collect(),
+            normals: self.mesh.vertices.iter().map(|v| v.normal).collect(),
+            uvs: self.mesh.vertices.iter().map(|v| v.uv).collect(),
+            indices: self.mesh.indices.clone(),
+            layers,
+        };
+        doc.save(path)
+    }
+
+    /// Load editing state from a `.lowtex` file, replacing the current project.
+    pub fn load_project(&mut self, path: &str) -> Result<(), String> {
+        let doc = crate::project::ProjectDoc::load(path)?;
+
+        // Rebuild the mesh + GPU buffers + BVH.
+        let vertices: Vec<Vertex> = (0..doc.positions.len())
+            .map(|i| Vertex {
+                position: doc.positions[i],
+                normal: *doc.normals.get(i).unwrap_or(&[0.0, 1.0, 0.0]),
+                uv: *doc.uvs.get(i).unwrap_or(&[0.0, 0.0]),
+            })
+            .collect();
+        let mesh = Mesh {
+            vertices,
+            indices: doc.indices.clone(),
+            needs_normals: false,
+            needs_uvs: false,
+        };
+        self.vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("vertex buffer"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("index buffer"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.index_count = mesh.indices.len() as u32;
+        self.bvh = Bvh::build(&mesh);
+        self.mesh = mesh;
+        self.mesh_maps = None;
+        self.fill_map = None;
+
+        // Rebuild the layer stack.
+        let n = (doc.tex_size * doc.tex_size * 4) as usize;
+        let mut layers = Vec::with_capacity(doc.layers.len());
+        for d in &doc.layers {
+            let mut color = crate::project::decode_pixels(&d.color)?;
+            let mut mask = crate::project::decode_pixels(&d.mask)?;
+            color.resize(n, 0);
+            mask.resize(n, 255);
+            layers.push(crate::layers::Layer {
+                name: d.name.clone(),
+                tex: PaintTexture {
+                    width: doc.tex_size,
+                    height: doc.tex_size,
+                    pixels: color,
+                },
+                mask: PaintTexture {
+                    width: doc.tex_size,
+                    height: doc.tex_size,
+                    pixels: mask,
+                },
+                visible: d.visible,
+                opacity: d.opacity,
+                blend: crate::layers::BlendMode::ALL
+                    .get(d.blend as usize)
+                    .copied()
+                    .unwrap_or(crate::layers::BlendMode::Normal),
+            });
+        }
+        if layers.is_empty() {
+            return Err("project has no layers".into());
+        }
+        let active = doc.active_layer.min(layers.len() - 1);
+        self.layers = crate::layers::Layers { layers, active };
+        self.tex_size = doc.tex_size;
+
+        self.palette = Palette {
+            name: "Loaded".to_string(),
+            colors: doc.palette,
+        };
+        self.palette_settings = PaletteSettings {
+            enabled: doc.quantize,
+            dither: doc.dither,
+            dither_strength: doc.dither_strength,
+        };
+
+        // Recreate the GPU paint texture for the (possibly new) resolution and
+        // re-snapshot stroke buffers + refresh the display.
+        self.rebuild_paint_gpu();
+        Ok(())
+    }
+
     /// Fill the active layer's color with a loaded material image (brick, moss, …),
     /// UV-tiled `tile` times. Combine with a reveal mask (e.g. mask-from-Cavities)
     /// for "moss in the crevices". Undoable.

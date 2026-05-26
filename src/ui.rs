@@ -43,6 +43,9 @@ pub struct UiActions {
     pub save_png: bool,
     pub open_texture: bool,
     pub open_model: bool,
+    /// Project save/load (G24).
+    pub save_project: bool,
+    pub open_project: bool,
     // Undo/redo (history over the layer stack).
     pub undo: bool,
     pub redo: bool,
@@ -166,9 +169,17 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             ui.label(egui::RichText::new("low-poly texture painter").weak());
             ui.separator();
 
-            if ui.button("Open model…").clicked() {
-                state.actions.open_model = true;
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Open model…").clicked() {
+                    state.actions.open_model = true;
+                }
+                if ui.button("Save .lowtex").on_hover_text("Save the project").clicked() {
+                    state.actions.save_project = true;
+                }
+                if ui.button("Open .lowtex").clicked() {
+                    state.actions.open_project = true;
+                }
+            });
             ui.horizontal(|ui| {
                 ui.label("Unwrap:")
                     .on_hover_text("Reassign the model's UVs");
