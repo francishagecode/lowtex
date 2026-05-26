@@ -347,6 +347,30 @@ impl Renderer {
         );
     }
 
+    /// Orbit the camera by drag deltas and refresh the view-proj uniform.
+    pub fn orbit_camera(&mut self, dx: f32, dy: f32) {
+        self.camera.orbit(dx, dy);
+        self.update_camera_uniform();
+    }
+
+    /// Pan the camera target by drag deltas and refresh the view-proj uniform.
+    pub fn pan_camera(&mut self, dx: f32, dy: f32) {
+        self.camera.pan(dx, dy);
+        self.update_camera_uniform();
+    }
+
+    /// Zoom (dolly) the camera and refresh the view-proj uniform.
+    pub fn zoom_camera(&mut self, delta: f32) {
+        self.camera.zoom(delta);
+        self.update_camera_uniform();
+    }
+
+    /// Orbit by explicit angles (radians); for programmatic/headless control.
+    pub fn orbit_view_radians(&mut self, d_azimuth: f32, d_elevation: f32) {
+        self.camera.orbit_radians(d_azimuth, d_elevation);
+        self.update_camera_uniform();
+    }
+
     /// Called when the mouse moves while held, or on click.
     /// Casts a ray, finds the UV, stamps a brush, re-uploads the texture.
     pub fn paint_at(&mut self, mouse_px: (f32, f32)) {
@@ -361,7 +385,7 @@ impl Renderer {
         let mouse = Vec2::new(mouse_px.0, mouse_px.1);
 
         let inv_view_proj = self.camera.view_proj().inverse();
-        let ray_origin = self.camera.eye;
+        let ray_origin = self.camera.eye();
         let ray = Ray::from_screen(mouse, screen_size, inv_view_proj);
 
         // Pin the origin to the camera eye for stability — unproject can wobble

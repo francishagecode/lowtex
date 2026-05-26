@@ -121,7 +121,7 @@ paint → export a PNG.** That single loop is the line between tech demo and too
   (added `--paint` to the screenshot tool). Known limit: shared-vertex meshes get
   degenerate fallback UVs until proper per-tri unwrap (G14)._
 
-### [ ] G2 — Orbit camera
+### [x] G2 — Orbit camera
 **Outcome:** Drag rotates the model, scroll zooms, optional middle-drag pans.
 - **Build:** convert `Camera` to an orbit camera (azimuth/elevation/distance
   around `target`); wire RMB/MMB drag + wheel in `app.rs`; **disambiguate paint
@@ -130,6 +130,11 @@ paint → export a PNG.** That single loop is the line between tech demo and too
 - **Touches:** `src/camera.rs`, `src/app.rs`, `renderer.rs`.
 - **Done when:** you can orbit to the back of the model and paint there.
 - **Depends on:** G1
+- _2026-05-26: `camera.rs` is now a spherical orbit camera (azimuth/elevation/
+  distance around `target`). `app.rs` routes LMB=paint, RMB=orbit, MMB=pan,
+  wheel=zoom via a `Drag` state so they never fight. Renderer exposes
+  orbit/pan/zoom that refresh the view-proj uniform. Verified headless with
+  `--orbit 130 --paint`: view changes and pre-orbit paint persists on the surface._
 
 ### [ ] G3 — egui UI shell + brush controls
 **Outcome:** A side panel with a color picker, brush size, hardness/opacity.

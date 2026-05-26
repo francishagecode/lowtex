@@ -30,6 +30,8 @@ struct Args {
     height: u32,
     /// Headless verification: stamp a brush at screen center before capture.
     paint: bool,
+    /// Headless verification: orbit horizontally by this many degrees before capture.
+    orbit_deg: f32,
 }
 
 fn parse_args() -> Args {
@@ -39,12 +41,18 @@ fn parse_args() -> Args {
         width: 1024,
         height: 768,
         paint: false,
+        orbit_deg: 0.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--screenshot" => args.screenshot = it.next(),
             "--paint" => args.paint = true,
+            "--orbit" => {
+                if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
+                    args.orbit_deg = v;
+                }
+            }
             "--width" => {
                 if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
                     args.width = v;
@@ -80,7 +88,14 @@ fn main() {
     };
 
     if let Some(out) = args.screenshot {
-        run_screenshot(&out, args.width, args.height, mesh, args.paint);
+        run_screenshot(
+            &out,
+            args.width,
+            args.height,
+            mesh,
+            args.paint,
+            args.orbit_deg,
+        );
         return;
     }
 
@@ -92,12 +107,13 @@ fn main() {
 }
 
 /// Headless: render one frame to `out` as a PNG and exit. With `paint`, stamp a
-/// few brush dabs around screen center first, to verify the pick→paint→render
-/// loop without a window.
-fn run_screenshot(out: &str, width: u32, height: u32, mesh: Mesh, paint: bool) {
+/// few brush dabs around screen center first; with `orbit_deg`, paint, orbit,
+/// then paint again — verifying both that the camera moved and that paint stays
+/// fixed on the surface (so you can orbit to the back and paint there).
+fn run_screenshot(out: &str, width: u32, height: u32, mesh: Mesh, paint: bool, orbit_deg: f32) {
     let mut renderer = pollster::block_on(Renderer::new_headless(width, height, mesh));
-    if paint {
-        let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+    let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+    let dab = |r: &mut Renderer| {
         for (dx, dy) in [
             (0.0, 0.0),
             (-30.0, 0.0),
@@ -105,7 +121,16 @@ fn run_screenshot(out: &str, width: u32, height: u32, mesh: Mesh, paint: bool) {
             (0.0, -30.0),
             (0.0, 30.0),
         ] {
-            renderer.paint_at((cx + dx, cy + dy));
+            r.paint_at((cx + dx, cy + dy));
+        }
+    };
+    if paint {
+        dab(&mut renderer);
+    }
+    if orbit_deg != 0.0 {
+        renderer.orbit_view_radians(orbit_deg.to_radians(), 0.0);
+        if paint {
+            dab(&mut renderer);
         }
     }
     let (pixels, w, h) = renderer.capture();

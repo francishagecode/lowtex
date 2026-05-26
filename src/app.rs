@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, MouseButton, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::ActiveEventLoop,
     window::{Window, WindowId},
 };
@@ -15,13 +15,24 @@ use winit::{
 use crate::mesh::Mesh;
 use crate::renderer::Renderer;
 
+/// What the current mouse drag is doing. LMB paints; RMB orbits; MMB pans — so
+/// camera control and painting never fight over the same button.
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    None,
+    Paint,
+    Orbit,
+    Pan,
+}
+
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     // The mesh to paint, taken when the renderer is built on resume.
     mesh: Option<Mesh>,
     mouse_pos: (f32, f32),
-    mouse_down: bool,
+    last_pos: (f32, f32),
+    drag: Drag,
 }
 
 impl App {
@@ -31,7 +42,8 @@ impl App {
             renderer: None,
             mesh: Some(mesh),
             mouse_pos: (0.0, 0.0),
-            mouse_down: false,
+            last_pos: (0.0, 0.0),
+            drag: Drag::None,
         }
     }
 }
@@ -81,23 +93,51 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_pos = (position.x as f32, position.y as f32);
-                if self.mouse_down {
-                    renderer.paint_at(self.mouse_pos);
-                    window.request_redraw();
+                let pos = (position.x as f32, position.y as f32);
+                let dx = pos.0 - self.last_pos.0;
+                let dy = pos.1 - self.last_pos.1;
+                self.mouse_pos = pos;
+                self.last_pos = pos;
+                match self.drag {
+                    Drag::Paint => {
+                        renderer.paint_at(self.mouse_pos);
+                        window.request_redraw();
+                    }
+                    Drag::Orbit => {
+                        renderer.orbit_camera(dx, dy);
+                        window.request_redraw();
+                    }
+                    Drag::Pan => {
+                        renderer.pan_camera(dx, dy);
+                        window.request_redraw();
+                    }
+                    Drag::None => {}
                 }
             }
 
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.mouse_down = state == ElementState::Pressed;
-                if self.mouse_down {
-                    renderer.paint_at(self.mouse_pos);
-                    window.request_redraw();
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                self.last_pos = self.mouse_pos;
+                match (button, pressed) {
+                    (MouseButton::Left, true) => {
+                        self.drag = Drag::Paint;
+                        renderer.paint_at(self.mouse_pos);
+                        window.request_redraw();
+                    }
+                    (MouseButton::Right, true) => self.drag = Drag::Orbit,
+                    (MouseButton::Middle, true) => self.drag = Drag::Pan,
+                    (_, false) => self.drag = Drag::None,
+                    _ => {}
                 }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let amount = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05,
+                };
+                renderer.zoom_camera(amount);
+                window.request_redraw();
             }
 
             WindowEvent::RedrawRequested => {
