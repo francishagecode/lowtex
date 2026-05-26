@@ -462,7 +462,7 @@ noise, used as layer masks.
   preset buttons. Edge-wear puts paint on edges with zero hand-painting. (Noise
   modulation from G22 not yet wired — generators are mesh-map driven for now.)_
 
-### [ ] G21 — Smart palettes / preset looks
+### [x] G21 — Smart palettes / preset looks
 **Outcome:** A draggable preset (layer stack + generators + palette) that adapts
 to any mesh via its baked maps.
 - **Build:** serialize a layer stack + generators + palette as a reusable asset;
@@ -472,10 +472,23 @@ to any mesh via its baked maps.
 - **Done when:** applying a saved preset to a *different* mesh produces a coherent
   result that follows the new geometry.
 - **Depends on:** G20
-- _2026-05-26: not done. The preset *operations* (Dirt, Edge-wear, …) exist under
-  G20 and already re-evaluate against whatever mesh is loaded, but the core of G21
-  — serializing a layer-stack + generators + palette as a reusable, shareable
-  asset — depends on the `.lowtex` format (G24), which is still pending._
+- **Done (2026-05-26):** new `src/preset.rs` — a preset is a *recipe*, not pixels:
+  an ordered list of mesh-aware generator layers (map source + `Levels` +
+  color + blend) plus an optional palette, stored as versioned, hand-editable RON
+  (`.lowpreset`). Map sources / blend modes are written as names, not enum indices,
+  so a shared file survives refactors; unknown names fall back gracefully.
+  `Renderer` records each generator into a `recipe` as it runs (every generator
+  funnels through the single `add_map_layer` choke point), so the current look
+  serializes with `save_preset`; `apply_preset` replays the recipe through
+  `add_map_layer`, which re-bakes against **whatever mesh is loaded** — so the look
+  follows the new geometry for free. Three built-in looks ship: Mossy Stone, Worn
+  Metal, Dusty Relic. Headless `--preset <name>`, `--save-preset`, `--load-preset`.
+  **Verified end-to-end:** applied built-in "Mossy Stone" to the cube → recorded
+  3-layer recipe → saved RON → loaded that file onto the octahedron → AO/moss/edge
+  re-evaluated against the octahedron's own cavities and edges (coherent, geometry-
+  following). 4 unit tests (RON round-trip, op conversion, version gate, graceful
+  unknown-name fallback). _Limitation: the recipe tracks generator applies, not
+  manual layer deletes, so it's an approximate capture of a hand-edited stack._
 
 ### [~] G22 — Procedural noise library *(library done; generator wiring pending)*
 **Outcome:** Value/Perlin/Worley noise available to generators and as brushes.

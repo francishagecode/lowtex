@@ -82,6 +82,10 @@ pub struct UiActions {
     pub fill_material: Option<f32>,
     /// Re-unwrap the mesh's UVs (G14–G17).
     pub unwrap: Option<crate::unwrap::UnwrapMode>,
+    /// Preset looks (G21): apply a built-in by name, or save/load a `.lowpreset`.
+    pub apply_builtin_preset: Option<String>,
+    pub save_preset: bool,
+    pub load_preset: bool,
 }
 
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
@@ -500,6 +504,39 @@ fn mesh_effects_section(ui: &mut egui::Ui, state: &mut UiState) {
             .clicked()
         {
             state.actions.mask_from_map = Some((state.effect_source, levels));
+        }
+    });
+
+    // Preset looks (G21): one-click recipes that re-evaluate against this mesh, plus
+    // save/load so a look you build travels to any other model.
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label("Looks");
+    ui.horizontal_wrapped(|ui| {
+        for preset in crate::preset::builtins() {
+            if ui
+                .button(&preset.name)
+                .on_hover_text("Apply this look — follows the loaded mesh's geometry")
+                .clicked()
+            {
+                state.actions.apply_builtin_preset = Some(preset.name.clone());
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .button("Save look…")
+            .on_hover_text("Save the applied generators as a reusable preset")
+            .clicked()
+        {
+            state.actions.save_preset = true;
+        }
+        if ui
+            .button("Load look…")
+            .on_hover_text("Apply a saved .lowpreset to the current mesh")
+            .clicked()
+        {
+            state.actions.load_preset = true;
         }
     });
 }

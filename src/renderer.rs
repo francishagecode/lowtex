@@ -159,6 +159,10 @@ pub struct Renderer {
     // path; invalidated on geometry change. RefCell so the &self display helper can
     // populate it.
     coverage: std::cell::RefCell<Option<Vec<bool>>>,
+    // Ordered recipe of mesh-aware generator layers applied so far (G21). Recorded
+    // as each generator runs so the current look can be saved as a reusable,
+    // mesh-independent preset. Approximate: manual layer deletes aren't reflected.
+    recipe: Vec<crate::preset::PresetLayer>,
 }
 
 impl Renderer {
@@ -443,6 +447,7 @@ impl Renderer {
             mesh_maps: None,
             fill_map: None,
             coverage: std::cell::RefCell::new(None),
+            recipe: Vec::new(),
         }
     }
 
@@ -861,6 +866,10 @@ impl Renderer {
         }
         self.layers
             .push_generated(name.to_string(), tex, blend, 1.0);
+        // Record the recipe so this look can be saved as a reusable preset (G21).
+        self.recipe.push(crate::preset::PresetLayer::from_op(
+            name, src, levels, color, blend,
+        ));
         self.resync_stroke_base();
         self.refresh_display_texture();
     }
@@ -927,6 +936,54 @@ impl Renderer {
             [205, 200, 185],
             crate::layers::BlendMode::Normal,
         );
+    }
+
+    // --- Preset looks (G21) ---
+
+    /// Apply a preset's recipe to the *current* mesh: every generator layer is
+    /// re-evaluated against this mesh's freshly-baked maps, so the look follows the
+    /// new geometry. Layers are appended on top of the current stack.
+    pub fn apply_preset(&mut self, preset: &crate::preset::Preset) {
+        for pl in &preset.layers {
+            let (name, src, levels, color, blend) = pl.to_op();
+            self.add_map_layer(&name, src, levels, color, blend);
+        }
+        if let Some(pname) = &preset.palette {
+            if let Some(p) = Palette::builtins()
+                .into_iter()
+                .find(|p| p.name.eq_ignore_ascii_case(pname))
+            {
+                self.set_palette(p);
+            }
+        }
+    }
+
+    /// Apply a built-in preset by name (e.g. "Mossy Stone").
+    pub fn apply_builtin_preset(&mut self, name: &str) -> Result<(), String> {
+        let preset =
+            crate::preset::builtin(name).ok_or_else(|| format!("no built-in preset '{name}'"))?;
+        self.apply_preset(&preset);
+        Ok(())
+    }
+
+    /// Save the generator layers applied so far as a reusable, shareable preset.
+    /// Carries the active palette (by name) so the look travels with its colors.
+    pub fn save_preset(&self, path: &str, name: &str) -> Result<(), String> {
+        if self.recipe.is_empty() {
+            return Err("no generator layers to save — apply AO/Dirt/Edge-wear first".into());
+        }
+        let mut preset = crate::preset::Preset::new(name, self.recipe.clone());
+        if self.palette_settings.enabled {
+            preset.palette = Some(self.palette.name.clone());
+        }
+        preset.save(path)
+    }
+
+    /// Load a preset from disk and apply it to the current mesh.
+    pub fn load_and_apply_preset(&mut self, path: &str) -> Result<(), String> {
+        let preset = crate::preset::Preset::load(path)?;
+        self.apply_preset(&preset);
+        Ok(())
     }
 
     // --- Fill tools (paint bucket; FillMap-driven) ---

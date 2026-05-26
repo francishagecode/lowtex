@@ -26,6 +26,7 @@ mod model;
 mod noise;
 mod paint;
 mod palette;
+mod preset;
 mod project;
 mod renderer;
 mod ui;
@@ -87,6 +88,11 @@ struct Args {
     /// Headless verification: open a .lowtex first / save one after edits.
     open_project: Option<String>,
     save_project: Option<String>,
+    /// Headless verification: apply a built-in preset look by name (G21).
+    preset: Option<String>,
+    /// Headless verification: save the applied recipe to / load a preset from a path.
+    save_preset: Option<String>,
+    load_preset: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -122,6 +128,9 @@ fn parse_args() -> Args {
         material_crevice: false,
         open_project: None,
         save_project: None,
+        preset: None,
+        save_preset: None,
+        load_preset: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -166,6 +175,9 @@ fn parse_args() -> Args {
             "--material-crevice" => args.material_crevice = true,
             "--open-project" => args.open_project = it.next(),
             "--save-project" => args.save_project = it.next(),
+            "--preset" => args.preset = it.next(),
+            "--save-preset" => args.save_preset = it.next(),
+            "--load-preset" => args.load_preset = it.next(),
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
             "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
@@ -372,6 +384,25 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     }
     if args.fill_object {
         renderer.fill_object_at((cx, cy), &brush);
+    }
+
+    if let Some(name) = &args.preset {
+        match renderer.apply_builtin_preset(name) {
+            Ok(()) => log::info!("applied preset '{name}'"),
+            Err(e) => log::error!("{e}"),
+        }
+    }
+    if let Some(path) = &args.load_preset {
+        match renderer.load_and_apply_preset(path) {
+            Ok(()) => log::info!("applied preset from {path}"),
+            Err(e) => log::error!("{e}"),
+        }
+    }
+    if let Some(path) = &args.save_preset {
+        match renderer.save_preset(path, "Custom") {
+            Ok(()) => log::info!("saved preset {path}"),
+            Err(e) => log::error!("{e}"),
+        }
     }
 
     if let Some(path) = &args.save_texture {

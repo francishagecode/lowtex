@@ -155,6 +155,34 @@ impl App {
         if let Some(mode) = actions.unwrap {
             renderer.apply_unwrap(mode);
         }
+        if let Some(name) = &actions.apply_builtin_preset {
+            if let Err(e) = renderer.apply_builtin_preset(name) {
+                log::error!("{e}");
+            }
+        }
+        if actions.save_preset {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(format!("untitled.{}", crate::preset::PRESET_EXT))
+                .add_filter("lowtex preset", &[crate::preset::PRESET_EXT])
+                .save_file()
+            {
+                match renderer.save_preset(&path.to_string_lossy(), "Custom") {
+                    Ok(()) => log::info!("saved preset {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
+        if actions.load_preset {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("lowtex preset", &[crate::preset::PRESET_EXT])
+                .pick_file()
+            {
+                match renderer.load_and_apply_preset(&path.to_string_lossy()) {
+                    Ok(()) => log::info!("loaded preset {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
         if let Some(tile) = actions.fill_material {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("Image", &["png", "jpg", "jpeg"])
