@@ -65,9 +65,11 @@ struct Args {
     /// Headless verification: bake an AO / edge-highlight layer at this strength.
     ao: Option<f32>,
     highlight: Option<f32>,
-    /// Headless verification: bucket-fill the whole object / the island at center.
+    /// Headless verification: bucket-fill the whole object / the island / the flat
+    /// face at screen center.
     fill_object: bool,
     fill_island: bool,
+    fill_face: bool,
     /// Headless verification: unwrap the mesh (box|smart|per-face) before capture.
     unwrap: Option<String>,
 }
@@ -97,6 +99,7 @@ fn parse_args() -> Args {
         highlight: None,
         fill_object: false,
         fill_island: false,
+        fill_face: false,
         unwrap: None,
     };
     let mut it = std::env::args().skip(1);
@@ -130,6 +133,7 @@ fn parse_args() -> Args {
             "--highlight" => args.highlight = it.next().and_then(|s| s.parse().ok()),
             "--fill-object" => args.fill_object = true,
             "--fill-island" => args.fill_island = true,
+            "--fill-face" => args.fill_face = true,
             "--unwrap" => args.unwrap = it.next(),
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
@@ -304,6 +308,9 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     }
     if let Some(s) = args.highlight {
         renderer.apply_highlight_layer(crate::bake::Levels::amount(s));
+    }
+    if args.fill_face {
+        renderer.fill_face_at((cx, cy), &brush);
     }
     if args.fill_island {
         renderer.fill_island_at((cx, cy), &brush);

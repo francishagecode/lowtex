@@ -149,7 +149,7 @@ pub struct Renderer {
     mesh_maps: Option<crate::bake::MeshMaps>,
     // Cached UV-island map at the current resolution, driving the fill tools.
     // Invalidated alongside mesh_maps (geometry or resolution change).
-    island_map: Option<crate::fill::IslandMap>,
+    fill_map: Option<crate::fill::FillMap>,
 }
 
 impl Renderer {
@@ -432,7 +432,7 @@ impl Renderer {
             mesh,
             bvh,
             mesh_maps: None,
-            island_map: None,
+            fill_map: None,
         }
     }
 
@@ -585,7 +585,7 @@ impl Renderer {
         if self.tex_size != self.layers.size() {
             // rebuild_paint_gpu re-snapshots stroke buffers and refreshes for us.
             self.mesh_maps = None; // baked at the previous resolution
-            self.island_map = None; // rasterized at the previous resolution
+            self.fill_map = None; // rasterized at the previous resolution
             self.rebuild_paint_gpu();
         } else {
             self.stroke_base = self.target_pixels().to_vec();
@@ -767,7 +767,7 @@ impl Renderer {
         self.checkpoint();
         self.layers.resize(size);
         self.mesh_maps = None; // baked at the old resolution
-        self.island_map = None; // rasterized at the old resolution
+        self.fill_map = None; // rasterized at the old resolution
         self.rebuild_paint_gpu();
     }
 
@@ -877,18 +877,18 @@ impl Renderer {
         );
     }
 
-    // --- Fill tools (paint bucket; UV-island map driven) ---
+    // --- Fill tools (paint bucket; FillMap-driven) ---
 
-    /// Build the UV-island map for the current resolution if not already cached.
-    /// Cheap (union-find + a UV-space scan-fill, no ray-casting), so unlike the AO
-    /// bake it's fine to do lazily on the first fill click.
-    fn ensure_island_map(&mut self) {
+    /// Build the fill map (UV islands + coplanar facets) for the current resolution
+    /// if not already cached. Cheap (union-find + a UV-space scan-fill, no
+    /// ray-casting), so unlike the AO bake it's fine to do lazily on the first click.
+    fn ensure_fill_map(&mut self) {
         let stale = self
-            .island_map
+            .fill_map
             .as_ref()
             .is_none_or(|m| m.size != self.tex_size);
         if stale {
-            self.island_map = Some(crate::fill::IslandMap::build(&self.mesh, self.tex_size));
+            self.fill_map = Some(crate::fill::FillMap::build(&self.mesh, self.tex_size));
         }
     }
 
@@ -900,8 +900,8 @@ impl Renderer {
         if self.bvh.pick(&ray).is_none() {
             return false;
         }
-        self.ensure_island_map();
-        let map = self.island_map.as_ref().unwrap();
+        self.ensure_fill_map();
+        let map = self.fill_map.as_ref().unwrap();
         let covered: Vec<bool> = map.texel_island.iter().map(|&i| i >= 0).collect();
         self.checkpoint();
         let keep = covered.clone();
@@ -920,14 +920,40 @@ impl Renderer {
         let Some(hit) = self.bvh.pick(&ray) else {
             return false;
         };
-        self.ensure_island_map();
-        let map = self.island_map.as_ref().unwrap();
+        self.ensure_fill_map();
+        let map = self.fill_map.as_ref().unwrap();
         let Some(island) = map.island_for_tri(hit.tri) else {
             return false;
         };
         let island = island as i32;
         let covered: Vec<bool> = map.texel_island.iter().map(|&i| i >= 0).collect();
         let keep: Vec<bool> = map.texel_island.iter().map(|&i| i == island).collect();
+        self.checkpoint();
+        self.fill_texels(brush, &keep, &covered);
+        self.resync_stroke_base();
+        self.refresh_display_texture();
+        true
+    }
+
+    /// Face fill: a click floods the one flat facet of the model under the cursor
+    /// — the connected, near-coplanar triangles the picked triangle belongs to
+    /// (a cube side; a quad; a triangulated flat wall). Unlike island fill this is
+    /// geometric, so it stops at hard edges regardless of UV layout, and a facet
+    /// split across UV islands still fills as one. Returns whether it hit the mesh.
+    /// One undo step.
+    pub fn fill_face_at(&mut self, mouse_px: (f32, f32), brush: &Brush) -> bool {
+        let ray = self.pick_ray(Vec2::new(mouse_px.0, mouse_px.1));
+        let Some(hit) = self.bvh.pick(&ray) else {
+            return false;
+        };
+        self.ensure_fill_map();
+        let map = self.fill_map.as_ref().unwrap();
+        let Some(facet) = map.facet_for_tri(hit.tri) else {
+            return false;
+        };
+        let facet = facet as i32;
+        let covered: Vec<bool> = map.texel_island.iter().map(|&i| i >= 0).collect();
+        let keep: Vec<bool> = map.texel_facet.iter().map(|&i| i == facet).collect();
         self.checkpoint();
         self.fill_texels(brush, &keep, &covered);
         self.resync_stroke_base();
@@ -1010,7 +1036,7 @@ impl Renderer {
         self.bvh = Bvh::build(&mesh);
         self.mesh = mesh;
         self.mesh_maps = None; // geometry changed; baked maps are stale
-        self.island_map = None; // geometry changed; island map is stale
+        self.fill_map = None; // geometry changed; island map is stale
         Ok(())
     }
 
@@ -1038,7 +1064,7 @@ impl Renderer {
         self.bvh = Bvh::build(&mesh);
         self.mesh = mesh;
         self.mesh_maps = None;
-        self.island_map = None;
+        self.fill_map = None;
     }
 
     /// Begin a new stroke: snapshot the texture and clear stroke coverage, so

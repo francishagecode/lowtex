@@ -376,6 +376,9 @@ impl ApplicationHandler for App {
                                 renderer.begin_stroke();
                                 renderer.paint_at(self.mouse_pos, &self.ui.brush);
                             }
+                            crate::ui::Tool::FillFace => {
+                                renderer.fill_face_at(self.mouse_pos, &self.ui.brush);
+                            }
                             crate::ui::Tool::FillIsland => {
                                 renderer.fill_island_at(self.mouse_pos, &self.ui.brush);
                             }

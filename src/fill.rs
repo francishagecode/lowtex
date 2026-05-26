@@ -243,6 +243,19 @@ impl UnionFind {
         self.parent[rb] = ra;
         self.size[ra] += self.size[rb];
     }
+
+    /// Compact the roots of `0..n` into dense component ids `[0, count)`, returning
+    /// the per-element id vector and the component count.
+    fn dense_ids(&mut self, n: usize) -> (Vec<u32>, u32) {
+        let mut root_to_id: HashMap<usize, u32> = HashMap::new();
+        let mut ids = vec![0u32; n];
+        for x in 0..n {
+            let root = self.find(x);
+            let next = root_to_id.len() as u32;
+            ids[x] = *root_to_id.entry(root).or_insert(next);
+        }
+        (ids, root_to_id.len() as u32)
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +268,7 @@ mod tests {
         // cells are stacked in the atlas and share the top-front edge with matching
         // UVs, so the texture is continuous across it (no seam) — a fill correctly
         // treats them as one region. The other four faces are separate islands.
-        let map = IslandMap::build(&Mesh::cube(), 64);
+        let map = FillMap::build(&Mesh::cube(), 64);
         assert_eq!(map.island_count, 5);
 
         // The two triangles of every face always land in the same island.
@@ -282,7 +295,7 @@ mod tests {
     fn object_coverage_matches_island_fill_sum() {
         // Every covered texel belongs to exactly one island, so the object-fill
         // set (texel_island >= 0) equals the union of all per-island fill sets.
-        let map = IslandMap::build(&Mesh::cube(), 64);
+        let map = FillMap::build(&Mesh::cube(), 64);
         let covered = map.texel_island.iter().filter(|&&i| i >= 0).count();
         assert!(covered > 0, "the cube must cover some texels");
 
@@ -297,9 +310,32 @@ mod tests {
     fn island_fill_is_a_strict_subset() {
         // Filling one island touches fewer texels than filling the whole object,
         // and only texels of that island.
-        let map = IslandMap::build(&Mesh::cube(), 64);
+        let map = FillMap::build(&Mesh::cube(), 64);
         let covered = map.texel_island.iter().filter(|&&i| i >= 0).count();
         let island0 = map.texel_island.iter().filter(|&&i| i == 0).count();
         assert!(island0 > 0 && island0 < covered);
+    }
+
+    #[test]
+    fn cube_has_six_facets() {
+        // Unlike islands, facets are geometric: each cube side is one flat facet
+        // (its two coplanar triangles merge across their shared diagonal), and the
+        // 90° hard edges between sides are facet boundaries — so six, one per side.
+        let map = FillMap::build(&Mesh::cube(), 64);
+        assert_eq!(map.facet_count, 6);
+        for face in 0..6 {
+            let (a, b) = (map.facet_of_tri[face * 2], map.facet_of_tri[face * 2 + 1]);
+            assert_eq!(a, b, "face {face}'s two triangles share a facet");
+        }
+        // Every distinct cube side gets its own facet id.
+        let mut ids: Vec<u32> = (0..6).map(|f| map.facet_of_tri[f * 2]).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 6, "all six sides are distinct facets");
+
+        // A single facet is a strict subset of the whole object's coverage.
+        let covered = map.texel_facet.iter().filter(|&&i| i >= 0).count();
+        let facet0 = map.texel_facet.iter().filter(|&&i| i == 0).count();
+        assert!(facet0 > 0 && facet0 < covered);
     }
 }

@@ -11,12 +11,15 @@ use crate::layers::BlendMode;
 use crate::paint::Brush;
 use crate::renderer::PaletteSettings;
 
-/// The active editing tool. The brush drags a stroke; the two fills are one-shot
-/// "paint bucket" clicks (solid color, ignoring what's already there).
+/// The active editing tool. The brush drags a stroke; the fills are one-shot
+/// "paint bucket" clicks (solid color, ignoring what's already there), scoped from
+/// smallest to largest region: a flat face, a UV island, the whole object.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     /// Freehand brush — drag to paint a stroke.
     Brush,
+    /// Fill the flat face (coplanar facet) of the model under the cursor.
+    FillFace,
     /// Fill the UV island under the cursor.
     FillIsland,
     /// Fill the whole object (every texel its UVs cover).
@@ -186,8 +189,10 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             // Tool picker. The fills are one-shot bucket clicks; size/hardness only
             // affect the brush, so they're disabled while a fill tool is active.
             ui.label("Tool");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut state.tool, Tool::Brush, "🖌 Brush");
+                ui.selectable_value(&mut state.tool, Tool::FillFace, "🪣 Face")
+                    .on_hover_text("Fill the flat face you click");
                 ui.selectable_value(&mut state.tool, Tool::FillIsland, "🪣 Island")
                     .on_hover_text("Fill the UV island you click");
                 ui.selectable_value(&mut state.tool, Tool::FillObject, "🪣 All")
