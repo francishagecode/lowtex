@@ -1,13 +1,14 @@
 // src/palette.rs
 //
-// Constrained color palettes (G8): an ordered list of sRGB colors used by the
-// quantize post-process (renderer + post.wgsl). Includes a few built-ins and
-// median-cut generation from an arbitrary image, so an artist can lift a palette
-// straight off reference art.
+// Constrained color palettes (G8): an ordered list of sRGB colors. The renderer
+// applies these to the *paint texture* on the CPU (`quantize_rgba`) — nearest
+// palette color + optional Bayer dither — so the model and the exported PNG show
+// the quantized result (WYSIWYG). Includes a few built-ins and median-cut
+// generation from an arbitrary image, so an artist can lift a palette off
+// reference art.
 //
-// Colors are stored as sRGB in 0..1 (matching the UI color pickers). The renderer
-// converts to linear before upload, since the post pass samples the (sRGB) scene
-// texture as linear.
+// Colors are sRGB in 0..1 (matching the UI color pickers); quantization compares
+// in sRGB byte space, which is fine for chunky low-res textures.
 
 /// An ordered palette. Empty is treated as "no constraint" by the renderer.
 #[derive(Clone)]
@@ -129,9 +130,7 @@ impl Palette {
         }
     }
 
-    /// Nearest palette color to an sRGB color (squared distance). Used by export
-    /// (G23) and as a CPU oracle; the live view quantizes on the GPU.
-    #[allow(dead_code)]
+    /// Nearest palette color to an sRGB color (squared distance).
     pub fn nearest(&self, c: [f32; 3]) -> [f32; 3] {
         self.colors
             .iter()
@@ -139,21 +138,56 @@ impl Palette {
             .min_by(|a, b| dist2(*a, c).total_cmp(&dist2(*b, c)))
             .unwrap_or(c)
     }
+
+    /// Nearest palette color as u8, with an optional pre-quantize bias (for
+    /// ordered dithering).
+    fn nearest_u8(&self, rgb: [u8; 3], bias: f32) -> [u8; 3] {
+        let c = [
+            (rgb[0] as f32 / 255.0 + bias).clamp(0.0, 1.0),
+            (rgb[1] as f32 / 255.0 + bias).clamp(0.0, 1.0),
+            (rgb[2] as f32 / 255.0 + bias).clamp(0.0, 1.0),
+        ];
+        let p = self.nearest(c);
+        [
+            (p[0] * 255.0).round() as u8,
+            (p[1] * 255.0).round() as u8,
+            (p[2] * 255.0).round() as u8,
+        ]
+    }
+
+    /// Quantize an RGBA8 image in place to this palette, optionally adding 4×4
+    /// ordered (Bayer) dithering to break up banding. Works directly in sRGB
+    /// byte space — fine for chunky textures and keeps export WYSIWYG. Alpha is
+    /// left untouched. `width` is needed to index the dither matrix per texel.
+    pub fn quantize_rgba(&self, pixels: &mut [u8], width: u32, dither: bool, strength: f32) {
+        if self.colors.is_empty() {
+            return;
+        }
+        for (i, px) in pixels.chunks_exact_mut(4).enumerate() {
+            let bias = if dither {
+                let x = (i as u32 % width) as usize;
+                let y = (i as u32 / width) as usize;
+                (bayer4(x, y) - 0.5) * strength
+            } else {
+                0.0
+            };
+            let q = self.nearest_u8([px[0], px[1], px[2]], bias);
+            px[0] = q[0];
+            px[1] = q[1];
+            px[2] = q[2];
+        }
+    }
 }
 
-#[allow(dead_code)]
+/// 4×4 Bayer threshold (normalized 0..1), used for ordered dithering.
+fn bayer4(x: usize, y: usize) -> f32 {
+    const M: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+    (M[y % 4][x % 4] as f32 + 0.5) / 16.0
+}
+
 fn dist2(a: [f32; 3], b: [f32; 3]) -> f32 {
     let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
     d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
-}
-
-/// sRGB component (0..1) → linear.
-pub fn srgb_to_linear(c: f32) -> f32 {
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
 }
 
 #[cfg(test)]

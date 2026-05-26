@@ -216,8 +216,9 @@ paint → export a PNG.** That single loop is the line between tech demo and too
 Target: the viewport *is* the vibe. This is the hook that makes someone choose
 lowtex over a 2D editor.
 
-### [x] G7 — PSX render shader
-**Outcome:** Toggleable affine-UV warp, vertex snap/jitter, optional fog.
+### [~] G7 — PSX render shader *(implemented then removed — descoped)*
+**Outcome:** ~~Toggleable affine-UV warp, vertex snap/jitter, optional fog.~~
+Descoped 2026-05-26: the look comes from the texture, not screen-space effects.
 - **Build:** affine (perspective-incorrect) UV interpolation — emit UVs without
   perspective divide to get the warp; vertex position snapping to a low-res grid
   in clip/screen space (the wobble); nearest sampling is already in place; flat /
@@ -226,16 +227,11 @@ lowtex over a 2D editor.
 - **Done when:** toggling "PSX mode" visibly warps textures and wobbles vertices
   in real time.
 - **Depends on:** G2
-- _2026-05-26: All effects runtime-toggleable via uniform flags (no pipeline
-  switching). main.wgsl carries a `@interpolate(linear)` UV copy (affine warp)
-  and selects it per-fragment; vertex snap quantizes projected NDC.xy to a grid
-  (`PsxSettings::grid`); flat shading derives the face normal from
-  `dpdx/dpdy(world_pos)`; linear depth fog over `[start,end]`. New `Uniforms`
-  block (binding 0, VERTEX_FRAGMENT). `PsxSettings` (master `enabled` + per-effect
-  flags) lives in renderer, edited in the UI's "PSX mode" section, pushed via
-  `set_psx_settings`. Verified headless: affine checker warp (on vs `--psx-off`),
-  dramatic wobble (`--psx-grid 14`), faceted flat shading on the octahedron, and
-  distance fog._
+- _2026-05-26: Implemented (affine warp, vertex wobble, flat shading, fog as
+  runtime-toggleable uniform flags) **then removed the same day** per a design
+  decision: the PSX/low-poly look should be driven by the **texture** (low-res +
+  limited palette + dither) and nearest-neighbor sampling, not screen-space
+  warp/wobble. main.wgsl reverted to a clean perspective-correct shader. See G9._
 
 ### [x] G8 — Palette system
 **Outcome:** Constrained palettes with quantize + dithering, generatable from images.
@@ -249,16 +245,17 @@ lowtex over a 2D editor.
   texture; swapping palettes recolors the view instantly.
 - **Depends on:** G7
 - _2026-05-26: `src/palette.rs` (built-ins PICO-8/Game Boy/Grayscale + median-cut
-  `from_image_median_cut`). Quantize is a fullscreen post pass (`post.wgsl`):
-  scene → offscreen `scene_color` → nearest-palette + 4×4 Bayer dither → target,
-  with egui drawn after so the UI stays crisp. Palette uploaded LINEAR (256-vec4
-  uniform); scene sampled as linear from the sRGB target. `PaletteSettings` +
-  active `Palette` in renderer (`set_palette`/`set_palette_settings`/
-  `generate_palette_from_image`); UI has Quantize/Dither, swatch row, built-in
-  buttons, and "From image…". Tests: median-cut separates R/G/B/W; built-ins
-  non-empty. Verified headless: scene posterizes to PICO-8 with visible dither._
+  `from_image_median_cut`). **Reworked same day to a texture-space effect** (per
+  the G7/G9 pivot): `Palette::quantize_rgba` applies nearest-palette + 4×4 Bayer
+  dither to the paint texture on the CPU, non-destructively (full-color
+  `paint_texture_cpu` preserved; `refresh_display_texture` uploads the quantized
+  result; `display_pixels` used for export). Originally a fullscreen post pass —
+  removed. `PaletteSettings`/active `Palette` in renderer; UI Quantize/Dither,
+  swatch row, built-ins, "From image…". Tests: median-cut separates R/G/B/W.
+  Verified headless: the texture posterizes to PICO-8 with dither; background
+  stays un-quantized (proving it's texture-space); export PNG matches the model._
 
-### [ ] G9 — Paint-view vs PSX-preview UX *(design decision)*
+### [x] G9 — Paint-view vs PSX-preview UX *(design decision)*
 **Outcome:** A resolved, deliberate answer to "do you paint in the wobble?"
 - **Build:** implement the chosen model — most likely a clean editing view + a
   live PSX preview (toggle or split/secondary view). Decide and document in
@@ -267,6 +264,13 @@ lowtex over a 2D editor.
 - **Touches:** `ui.rs`, `renderer.rs`, `DESIGN.md`.
 - **Done when:** the decision is implemented and written down with rationale.
 - **Depends on:** G7, G8
+- _2026-05-26: **Resolved — there is no wobble to paint in.** PSX screen-space
+  rendering (G7) was removed; the look is driven entirely by the texture (low
+  resolution + limited palette + dither) and nearest-neighbor sampling. The
+  viewport always shows the final, clean, perspective-correct result, so painting
+  is precise and WYSIWYG. Palette quantize is applied to the texture
+  non-destructively (toggle on/off without losing the full-color paint), and the
+  exported PNG is exactly what's on the model. Rationale documented in DESIGN.md._
 
 ---
 

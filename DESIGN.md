@@ -49,11 +49,13 @@ src/
   camera.rs     orbit camera (azimuth / elevation / distance around a target)
   mesh.rs       Vertex layout + procedural cube + bounds/normal helpers
   model.rs      glTF / OBJ loaders → our Vertex/index buffers
+  bvh.rs        bounding-volume hierarchy over triangles for fast ray picking
   paint.rs      ray/triangle intersection, UV picking, CPU brush stamping
+  palette.rs    palettes + median-cut generation + CPU quantize/dither
   renderer.rs   wgpu setup, GPU resources, draw + paint plumbing, offscreen capture
-  ui.rs         egui panels (brush, palette, layers, generators, export)
+  ui.rs         egui panels (brush, texture, palette)
   shaders/
-    main.wgsl   scene vertex + fragment shaders (incl. PSX effects)
+    main.wgsl   scene vertex + fragment shaders (clean, nearest-sampled)
 ```
 
 Read in that order. `renderer.rs` is the biggest piece because wgpu has a lot of
@@ -64,9 +66,9 @@ boilerplate for resource setup.
 ```
 mouse pixel
   → Ray::from_screen (unproject through inverse view-projection)
-  → pick_uv (Möller–Trumbore vs. triangles → barycentric UV)
-  → Texture::paint_brush (CPU-side RGBA stamp)
-  → upload to GPU + redraw (nearest-neighbor sampling)
+  → Bvh::pick_uv (Möller–Trumbore vs. triangles → barycentric UV)
+  → Texture::stamp_stroke (CPU-side RGBA stamp, per-stroke coverage)
+  → (palette quantize/dither if enabled) → upload to GPU + redraw (nearest sampling)
 ```
 
 CPU is the source of truth for paint in v0.1. This moves to the GPU at G12; the CPU
@@ -92,12 +94,25 @@ This exists so the rendering pipeline can be verified without a visible window
   flag. The window path and the offscreen path share the same scene-draw code so a
   screenshot is faithful to what the window shows. *(decided G0.1, 2026-05-26)*
 
+- **The PSX look is texture-driven, not screen-space.** No affine warp, no vertex
+  wobble, no fog render effects. The aesthetic comes entirely from the *texture* —
+  low resolution, limited palette, ordered dithering — plus nearest-neighbor
+  sampling. An early screen-space PSX shader (G7) was built and then removed.
+  Rationale: screen-space warp/wobble fight precise painting (the rendered surface
+  no longer matches where the cursor picks), they don't survive export, and they
+  add real complexity for an effect the texture already implies. Keeping the look
+  in the texture means the viewport is always the clean, perspective-correct,
+  WYSIWYG result. *(decided G9, 2026-05-26)*
+
+- **G9 — Paint in the PSX wobble, or clean view + live preview?** Resolved: neither
+  — there is no wobble. The viewport always shows the clean final result; the
+  limited-palette/dither look is applied to the texture, non-destructively, so it
+  toggles on/off without losing full-color paint and the export matches the model.
+  *(decided G9, 2026-05-26)*
+
 ## Open design questions
 
 These shape multiple goals; resolved answers move up to the section above.
-
-- **G9 — Paint in the PSX wobble, or clean view + live preview?** Leaning clean +
-  preview. Blocks how the viewport is structured.
 - **Texture resolution model:** fixed per project, or resolution-independent
   re-evaluation like Substance? Affects layers/generators architecture — decide
   before G10.

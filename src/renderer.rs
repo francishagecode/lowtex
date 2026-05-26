@@ -16,12 +16,14 @@
 // so a screenshot is faithful to what the window shows.
 //
 // Flow on each paint:
-//   mouse pixel → Ray::from_screen → pick_uv → Texture::paint_brush
-//                                              ↓
-//                                       Queue::write_texture (CPU → GPU)
+//   mouse pixel → Ray::from_screen → BVH pick_uv → Texture::stamp_stroke →
+//   (palette quantize if enabled) → Queue::write_texture (CPU → GPU)
 //
 // Flow on each frame:
 //   acquire target view → encode draw → submit → present
+//
+// The PSX/low-poly look comes from the texture (low-res, limited palette, dither)
+// plus nearest-neighbor sampling — not from screen-space warp/wobble.
 
 use std::sync::Arc;
 
@@ -33,7 +35,7 @@ use crate::bvh::Bvh;
 use crate::camera::Camera;
 use crate::mesh::{Mesh, Vertex};
 use crate::paint::{Brush, Ray, Texture as PaintTexture};
-use crate::palette::{srgb_to_linear, Palette};
+use crate::palette::Palette;
 
 const TEX_SIZE: u32 = 128; // PSX-scale. Bump to 256 if you want.
 
@@ -47,39 +49,10 @@ pub struct UiPaint<'a> {
     pub pixels_per_point: f32,
 }
 
-/// PSX-look render settings (G7). `enabled` is the master toggle; the individual
-/// flags dial each effect. `effective_*` resolves `enabled && flag`.
-#[derive(Clone, Copy)]
-pub struct PsxSettings {
-    pub enabled: bool,
-    pub affine: bool,
-    pub snap: bool,
-    pub grid: f32,
-    pub fog: bool,
-    pub fog_color: [f32; 3],
-    pub fog_start: f32,
-    pub fog_end: f32,
-    pub flat: bool,
-}
-
-impl Default for PsxSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            affine: true,
-            snap: true,
-            grid: 64.0,
-            fog: false,
-            fog_color: [0.04, 0.06, 0.08], // matches the viewport clear
-            fog_start: 3.0,
-            fog_end: 7.0,
-            flat: false,
-        }
-    }
-}
-
-/// Palette-quantize post-process settings (G8). The active `Palette` lives in the
-/// renderer; these toggle the post pass.
+/// Palette-quantize settings (G8). The active `Palette` lives in the renderer.
+/// Quantize is applied to the *texture* on the CPU (non-destructive: the
+/// full-color paint buffer is preserved), so the model and the exported PNG show
+/// the quantized result.
 #[derive(Clone, Copy)]
 pub struct PaletteSettings {
     pub enabled: bool,
@@ -93,62 +66,6 @@ impl Default for PaletteSettings {
             enabled: false,
             dither: true,
             dither_strength: 0.06,
-        }
-    }
-}
-
-/// GPU uniform for the post pass. Matches `Palette` in post.wgsl. Colors are
-/// LINEAR (the renderer converts from the sRGB `Palette`).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct PaletteUniform {
-    params: [f32; 4], // enabled, count, dither, strength
-    colors: [[f32; 4]; 256],
-}
-
-impl PaletteUniform {
-    fn new(palette: &Palette, s: &PaletteSettings) -> Self {
-        let mut colors = [[0.0f32; 4]; 256];
-        let count = palette.colors.len().min(256);
-        for (i, c) in palette.colors.iter().take(256).enumerate() {
-            colors[i] = [
-                srgb_to_linear(c[0]),
-                srgb_to_linear(c[1]),
-                srgb_to_linear(c[2]),
-                1.0,
-            ];
-        }
-        Self {
-            params: [
-                if s.enabled { 1.0 } else { 0.0 },
-                count as f32,
-                if s.dither { 1.0 } else { 0.0 },
-                s.dither_strength,
-            ],
-            colors,
-        }
-    }
-}
-
-/// GPU uniform block. Layout matches `Uniforms` in main.wgsl (std140-friendly:
-/// mat4 then 16-byte-aligned vec4s).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    view_proj: [[f32; 4]; 4],
-    fog_color: [f32; 4],
-    params: [f32; 4],  // affine, snap, grid, fog
-    params2: [f32; 4], // flat, fog_start, fog_end, unused
-}
-
-impl Uniforms {
-    fn new(view_proj: glam::Mat4, psx: &PsxSettings) -> Self {
-        let on = |b: bool| if psx.enabled && b { 1.0 } else { 0.0 };
-        Self {
-            view_proj: view_proj.to_cols_array_2d(),
-            fog_color: [psx.fog_color[0], psx.fog_color[1], psx.fog_color[2], 1.0],
-            params: [on(psx.affine), on(psx.snap), psx.grid.max(1.0), on(psx.fog)],
-            params2: [on(psx.flat), psx.fog_start, psx.fog_end, 0.0],
         }
     }
 }
@@ -181,14 +98,9 @@ pub struct Renderer {
 
     depth_view: wgpu::TextureView,
 
-    // Palette-quantize post-process (G8): scene renders to scene_color, then a
-    // fullscreen pass quantizes it to the target. egui draws after (stays crisp).
-    scene_color: wgpu::Texture,
-    scene_color_view: wgpu::TextureView,
-    post_pipeline: wgpu::RenderPipeline,
-    post_bind_group_layout: wgpu::BindGroupLayout,
-    post_bind_group: wgpu::BindGroup,
-    palette_uniform_buffer: wgpu::Buffer,
+    // Palette quantize (G8) — applied to the texture on the CPU, non-destructively
+    // (paint_texture_cpu keeps full color; the GPU texture holds the quantized
+    // result when enabled).
     palette: Palette,
     palette_settings: PaletteSettings,
 
@@ -199,7 +111,6 @@ pub struct Renderer {
     max_texture_dim: u32,
 
     camera: Camera,
-    psx: PsxSettings,
     // Kept for goals that re-read geometry (unwrap G14, bake G19); the BVH owns
     // its own triangle copy for picking.
     #[allow(dead_code)]
@@ -342,13 +253,11 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Uniform buffer: view-projection + PSX params.
+        // Uniform buffer: the view-projection matrix.
         let camera = Camera::new(width as f32 / height as f32);
-        let psx = PsxSettings::default();
-        let uniforms = Uniforms::new(camera.view_proj(), &psx);
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniform buffer"),
-            contents: bytemuck::bytes_of(&uniforms),
+            contents: bytemuck::cast_slice(&[camera.view_proj().to_cols_array_2d()]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -357,8 +266,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    // Vertex reads view_proj + snap; fragment reads affine/flat/fog flags.
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -446,92 +354,9 @@ impl Renderer {
 
         let depth_view = make_depth_view(&device, width, height);
 
-        // --- Palette-quantize post-process (G8) ---
-        let scene_color = make_scene_color(&device, target_format, width, height);
-        let scene_color_view = scene_color.create_view(&wgpu::TextureViewDescriptor::default());
-
+        // Palette quantize is applied to the texture on the CPU (G8).
         let palette = Palette::builtins().remove(0); // PICO-8 by default
         let palette_settings = PaletteSettings::default();
-        let palette_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("palette uniform"),
-            contents: bytemuck::bytes_of(&PaletteUniform::new(&palette, &palette_settings)),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let post_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("post bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let post_bind_group = make_post_bind_group(
-            &device,
-            &post_bind_group_layout,
-            &scene_color_view,
-            &sampler,
-            &palette_uniform_buffer,
-        );
-
-        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("post shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/post.wgsl").into()),
-        });
-        let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("post pipeline layout"),
-            bind_group_layouts: &[&post_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("post pipeline"),
-            layout: Some(&post_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &post_shader,
-                entry_point: "vs",
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &post_shader,
-                entry_point: "fs",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
 
         // BVH over the mesh triangles for fast ray picking (G5).
         let bvh = Bvh::build(&mesh);
@@ -559,18 +384,11 @@ impl Renderer {
             stroke_base,
             stroke_coverage,
             depth_view,
-            scene_color,
-            scene_color_view,
-            post_pipeline,
-            post_bind_group_layout,
-            post_bind_group,
-            palette_uniform_buffer,
             palette,
             palette_settings,
             egui_renderer: None,
             max_texture_dim,
             camera,
-            psx,
             mesh,
             bvh,
         }
@@ -591,53 +409,73 @@ impl Renderer {
         }
         self.depth_view = make_depth_view(&self.device, width, height);
 
-        // The offscreen scene target tracks the surface size; rebind the post pass.
-        self.scene_color = make_scene_color(&self.device, self.config.format, width, height);
-        self.scene_color_view = self
-            .scene_color
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        self.post_bind_group = make_post_bind_group(
-            &self.device,
-            &self.post_bind_group_layout,
-            &self.scene_color_view,
-            &self.sampler,
-            &self.palette_uniform_buffer,
-        );
-
         self.camera.aspect = width as f32 / height as f32;
         self.update_uniforms();
     }
 
-    /// Write the view-proj + PSX uniform block to the GPU.
+    /// Write the view-projection matrix to the GPU.
     fn update_uniforms(&self) {
-        let uniforms = Uniforms::new(self.camera.view_proj(), &self.psx);
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        let view_proj = self.camera.view_proj();
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[view_proj.to_cols_array_2d()]),
+        );
     }
 
-    /// Replace the PSX render settings and refresh the uniform.
-    pub fn set_psx_settings(&mut self, psx: PsxSettings) {
-        self.psx = psx;
-        self.update_uniforms();
+    /// Re-derive the GPU texture from the full-color paint buffer: quantized to
+    /// the palette (with optional dither) when enabled, otherwise the raw paint.
+    /// Non-destructive — `paint_texture_cpu` always keeps full color.
+    fn refresh_display_texture(&self) {
+        if self.palette_settings.enabled && !self.palette.colors.is_empty() {
+            let mut display = self.paint_texture_cpu.pixels.clone();
+            self.palette.quantize_rgba(
+                &mut display,
+                self.tex_size,
+                self.palette_settings.dither,
+                self.palette_settings.dither_strength,
+            );
+            upload_pixels(
+                &self.queue,
+                &self.paint_texture_gpu,
+                &display,
+                self.tex_size,
+                self.tex_size,
+            );
+        } else {
+            upload_texture(
+                &self.queue,
+                &self.paint_texture_gpu,
+                &self.paint_texture_cpu,
+            );
+        }
     }
 
-    /// Write the palette + post-process settings to the GPU.
-    fn update_palette_uniform(&self) {
-        let u = PaletteUniform::new(&self.palette, &self.palette_settings);
-        self.queue
-            .write_buffer(&self.palette_uniform_buffer, 0, bytemuck::bytes_of(&u));
-    }
-
-    /// Replace the active palette (live swap).
+    /// Replace the active palette (live swap) and refresh the display.
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
-        self.update_palette_uniform();
+        self.refresh_display_texture();
     }
 
-    /// Update quantize/dither settings.
+    /// Update quantize/dither settings and refresh the display.
     pub fn set_palette_settings(&mut self, settings: PaletteSettings) {
         self.palette_settings = settings;
-        self.update_palette_uniform();
+        self.refresh_display_texture();
+    }
+
+    /// The quantized texture pixels as currently shown (for export). Full color
+    /// when quantize is off.
+    pub fn display_pixels(&self) -> Vec<u8> {
+        let mut px = self.paint_texture_cpu.pixels.clone();
+        if self.palette_settings.enabled && !self.palette.colors.is_empty() {
+            self.palette.quantize_rgba(
+                &mut px,
+                self.tex_size,
+                self.palette_settings.dither,
+                self.palette_settings.dither_strength,
+            );
+        }
+        px
     }
 
     /// The active palette (for the UI swatch row).
@@ -687,11 +525,6 @@ impl Renderer {
     fn rebuild_paint_gpu(&mut self) {
         self.tex_size = self.paint_texture_cpu.width;
         self.paint_texture_gpu = make_paint_texture(&self.device, &self.paint_texture_cpu);
-        upload_texture(
-            &self.queue,
-            &self.paint_texture_gpu,
-            &self.paint_texture_cpu,
-        );
         self.bind_group = make_paint_bind_group(
             &self.device,
             &self.bind_group_layout,
@@ -702,18 +535,18 @@ impl Renderer {
         // The stroke buffers must track the (possibly resized) texture.
         self.stroke_base = self.paint_texture_cpu.pixels.clone();
         self.stroke_coverage = vec![0.0; (self.tex_size * self.tex_size) as usize];
+        self.refresh_display_texture();
     }
 
-    /// Save the painted texture to a PNG. The CPU texture holds sRGB-encoded
-    /// bytes (the GPU texture is `Rgba8UnormSrgb`), and PNG is sRGB, so the bytes
-    /// are written through unchanged.
+    /// Save the displayed texture to a PNG — quantized when quantize is on, so the
+    /// exported file matches the model (WYSIWYG). Bytes are sRGB; PNG is sRGB.
     pub fn save_texture_png(&self, path: &str) -> Result<(), String> {
-        let cpu = &self.paint_texture_cpu;
+        let pixels = self.display_pixels();
         image::save_buffer(
             path,
-            &cpu.pixels,
-            cpu.width,
-            cpu.height,
+            &pixels,
+            self.tex_size,
+            self.tex_size,
             image::ColorType::Rgba8,
         )
         .map_err(|e| format!("failed to save PNG: {e}"))
@@ -742,6 +575,30 @@ impl Renderer {
         }
         self.paint_texture_cpu = self.paint_texture_cpu.resampled(size, size);
         self.rebuild_paint_gpu();
+    }
+
+    /// Load a new mesh from a file, rebuilding the GPU buffers and the pick BVH.
+    /// The painted texture is preserved (it re-maps onto the new model's UVs).
+    pub fn load_model(&mut self, path: &str) -> Result<(), String> {
+        let mesh = crate::model::load(path)?;
+        self.vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("vertex buffer"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("index buffer"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.index_count = mesh.indices.len() as u32;
+        self.bvh = Bvh::build(&mesh);
+        self.mesh = mesh;
+        Ok(())
     }
 
     /// Begin a new stroke: snapshot the texture and clear stroke coverage, so
@@ -802,11 +659,7 @@ impl Renderer {
     /// click of a stroke and for headless verification.
     pub fn paint_at(&mut self, mouse_px: (f32, f32), brush: &Brush) {
         if self.stamp_screen(Vec2::new(mouse_px.0, mouse_px.1), brush) {
-            upload_texture(
-                &self.queue,
-                &self.paint_texture_gpu,
-                &self.paint_texture_cpu,
-            );
+            self.refresh_display_texture();
         }
     }
 
@@ -827,11 +680,7 @@ impl Renderer {
             hit_any |= self.stamp_screen(from.lerp(to, t), brush);
         }
         if hit_any {
-            upload_texture(
-                &self.queue,
-                &self.paint_texture_gpu,
-                &self.paint_texture_cpu,
-            );
+            self.refresh_display_texture();
         }
     }
 
@@ -872,27 +721,6 @@ impl Renderer {
         rpass.draw_indexed(0..self.index_count, 0, 0..1);
     }
 
-    /// Fullscreen palette-quantize pass: read `scene_color`, write `target_view`.
-    fn encode_post(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("post pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        rpass.set_pipeline(&self.post_pipeline);
-        rpass.set_bind_group(0, &self.post_bind_group, &[]);
-        rpass.draw(0..3, 0..1);
-    }
-
     pub fn render(&mut self, ui: Option<UiPaint>) {
         let Some(surface) = &self.surface else {
             return; // headless renderer has nothing to present
@@ -919,8 +747,7 @@ impl Renderer {
             });
 
         // Scene → offscreen, quantize → surface, then egui on top (stays crisp).
-        self.draw_into(&mut encoder, &self.scene_color_view);
-        self.encode_post(&mut encoder, &view);
+        self.draw_into(&mut encoder, &view);
         if let Some(ui) = ui.as_ref() {
             self.encode_egui(&mut encoder, &view, ui);
         }
@@ -1012,8 +839,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture encoder"),
             });
-        self.draw_into(&mut encoder, &self.scene_color_view);
-        self.encode_post(&mut encoder, &color_view);
+        self.draw_into(&mut encoder, &color_view);
         if let Some(ui) = ui.as_ref() {
             self.encode_egui(&mut encoder, &color_view, ui);
         }
@@ -1141,57 +967,6 @@ fn make_paint_bind_group(
     })
 }
 
-/// Offscreen color target the scene renders into before the quantize post pass.
-fn make_scene_color(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-    width: u32,
-    height: u32,
-) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scene color"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    })
-}
-
-/// Bind group for the post pass: scene texture + sampler + palette uniform.
-fn make_post_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    scene_view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-    palette_buffer: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("post bind group"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(scene_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: palette_buffer.as_entire_binding(),
-            },
-        ],
-    })
-}
-
 fn make_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth texture"),
@@ -1211,6 +986,11 @@ fn make_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Text
 }
 
 fn upload_texture(queue: &wgpu::Queue, gpu: &wgpu::Texture, cpu: &PaintTexture) {
+    upload_pixels(queue, gpu, &cpu.pixels, cpu.width, cpu.height);
+}
+
+/// Upload a raw RGBA8 pixel slice into a GPU texture.
+fn upload_pixels(queue: &wgpu::Queue, gpu: &wgpu::Texture, pixels: &[u8], width: u32, height: u32) {
     queue.write_texture(
         wgpu::ImageCopyTexture {
             texture: gpu,
@@ -1218,15 +998,15 @@ fn upload_texture(queue: &wgpu::Queue, gpu: &wgpu::Texture, cpu: &PaintTexture) 
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &cpu.pixels,
+        pixels,
         wgpu::ImageDataLayout {
             offset: 0,
-            bytes_per_row: Some(cpu.width * 4),
-            rows_per_image: Some(cpu.height),
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
         },
         wgpu::Extent3d {
-            width: cpu.width,
-            height: cpu.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
     );

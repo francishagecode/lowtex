@@ -101,12 +101,22 @@ impl App {
             return;
         };
 
-        // Push the latest PSX + palette settings (cheap; resolve to uniform writes).
-        renderer.set_psx_settings(self.ui.psx);
+        // Push the latest palette settings (cheap; re-quantizes the texture).
         renderer.set_palette_settings(self.ui.palette);
 
         let actions = std::mem::take(&mut self.ui.actions);
 
+        if actions.open_model {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Mesh", &["gltf", "glb", "obj"])
+                .pick_file()
+            {
+                match renderer.load_model(&path.to_string_lossy()) {
+                    Ok(()) => log::info!("loaded model {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
         if let Some(i) = actions.select_builtin_palette {
             if let Some(p) = crate::palette::Palette::builtins().into_iter().nth(i) {
                 renderer.set_palette(p);

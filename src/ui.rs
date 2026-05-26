@@ -7,7 +7,7 @@
 use egui::Context;
 
 use crate::paint::Brush;
-use crate::renderer::{PaletteSettings, PsxSettings};
+use crate::renderer::PaletteSettings;
 
 /// One-shot requests the UI raises this frame, drained by the App after the egui
 /// run (file dialogs and texture ops happen outside the egui closure).
@@ -15,6 +15,7 @@ use crate::renderer::{PaletteSettings, PsxSettings};
 pub struct UiActions {
     pub save_png: bool,
     pub open_texture: bool,
+    pub open_model: bool,
     pub set_resolution: Option<u32>,
     /// Index into `Palette::builtins()` to make active.
     pub select_builtin_palette: Option<usize>,
@@ -25,7 +26,6 @@ pub struct UiActions {
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
 pub struct UiState {
     pub brush: Brush,
-    pub psx: PsxSettings,
     pub palette: PaletteSettings,
     /// Colors of the active palette, synced from the renderer for the swatch row.
     pub palette_swatches: Vec<[f32; 3]>,
@@ -40,7 +40,6 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             brush: Brush::default(),
-            psx: PsxSettings::default(),
             palette: PaletteSettings::default(),
             palette_swatches: Vec::new(),
             palette_size: 16,
@@ -70,7 +69,12 @@ pub fn build(ctx: &Context, state: &mut UiState) {
         .show(ctx, |ui| {
             ui.add_space(4.0);
             ui.heading("lowtex");
-            ui.label(egui::RichText::new("PSX texture painter").weak());
+            ui.label(egui::RichText::new("low-poly texture painter").weak());
+            ui.separator();
+
+            if ui.button("Open model…").clicked() {
+                state.actions.open_model = true;
+            }
             ui.separator();
 
             ui.label("Brush");
@@ -106,24 +110,6 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 if ui.button("Save PNG…").clicked() {
                     state.actions.save_png = true;
                 }
-            });
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.checkbox(&mut state.psx.enabled, "PSX mode");
-            ui.add_enabled_ui(state.psx.enabled, |ui| {
-                ui.checkbox(&mut state.psx.affine, "Texture warp");
-                ui.checkbox(&mut state.psx.snap, "Vertex wobble");
-                ui.add(egui::Slider::new(&mut state.psx.grid, 8.0..=256.0).text("Wobble grid"));
-                ui.checkbox(&mut state.psx.flat, "Flat shading");
-                ui.checkbox(&mut state.psx.fog, "Fog");
-                ui.add_enabled_ui(state.psx.fog, |ui| {
-                    ui.color_edit_button_rgb(&mut state.psx.fog_color);
-                    ui.add(
-                        egui::Slider::new(&mut state.psx.fog_start, 0.0..=10.0).text("Fog near"),
-                    );
-                    ui.add(egui::Slider::new(&mut state.psx.fog_end, 0.0..=20.0).text("Fog far"));
-                });
             });
 
             ui.add_space(10.0);
