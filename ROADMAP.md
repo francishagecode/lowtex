@@ -157,7 +157,7 @@ paint → export a PNG.** That single loop is the line between tech demo and too
   (`--ui --paint --brush-color --brush-size`): panel renders, color/size change
   the stroke. Verified live in the window too._
 
-### [ ] G4 — Texture import/export (PNG)
+### [x] G4 — Texture import/export (PNG)
 **Outcome:** Save the painted texture to PNG; optionally load a starting texture.
 - **Build:** "Save PNG" writes the CPU texture; "Open texture" loads one into the
   buffer (resampled to `TEX_SIZE` if needed). Configurable texture resolution
@@ -168,6 +168,14 @@ paint → export a PNG.** That single loop is the line between tech demo and too
 - **Done when:** paint → Save PNG → reopen the file in an image viewer shows the
   same result; reloading it back into lowtex round-trips.
 - **Depends on:** G3
+- _2026-05-26: `rfd` native dialogs. UI "Texture" section: Resolution combo
+  (64/128/256), Open…, Save PNG…. Renderer gained `save_texture_png`,
+  `load_texture_png` (resampled to current res), `set_texture_resolution`, and
+  nearest-neighbour `Texture::resampled`. CPU texture holds sRGB bytes
+  (`Rgba8UnormSrgb`) written straight to PNG, so it round-trips. UI actions drain
+  via `UiState::actions` handled outside the egui closure (`App::handle_ui_actions`).
+  Verified headless: paint→save→load reproduces the paint on a fresh cube; 64²
+  renders chunkier._
 
 ### [ ] G5 — BVH-accelerated picking
 **Outcome:** Picking is fast on real (thousands-of-tris) meshes.

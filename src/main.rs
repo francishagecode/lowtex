@@ -39,6 +39,10 @@ struct Args {
     /// Headless verification: override the brush (color r,g,b in 0..1 and size).
     brush_color: Option<[f32; 3]>,
     brush_size: Option<f32>,
+    /// Headless verification: load a starting texture / save the result / set res.
+    load_texture: Option<String>,
+    save_texture: Option<String>,
+    res: Option<u32>,
 }
 
 fn parse_args() -> Args {
@@ -52,6 +56,9 @@ fn parse_args() -> Args {
         ui: false,
         brush_color: None,
         brush_size: None,
+        load_texture: None,
+        save_texture: None,
+        res: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -73,6 +80,9 @@ fn parse_args() -> Args {
                 }
             }
             "--brush-size" => args.brush_size = it.next().and_then(|s| s.parse().ok()),
+            "--load-texture" => args.load_texture = it.next(),
+            "--save-texture" => args.save_texture = it.next(),
+            "--res" => args.res = it.next().and_then(|s| s.parse().ok()),
             "--width" => {
                 if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
                     args.width = v;
@@ -134,6 +144,16 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         brush.radius = s;
     }
 
+    if let Some(size) = args.res {
+        renderer.set_texture_resolution(size);
+    }
+    if let Some(path) = &args.load_texture {
+        match renderer.load_texture_png(path) {
+            Ok(()) => log::info!("loaded texture {path}"),
+            Err(e) => log::error!("{e}"),
+        }
+    }
+
     let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
     let dab = |r: &mut Renderer| {
         for (dx, dy) in [
@@ -153,6 +173,13 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         renderer.orbit_view_radians(args.orbit_deg.to_radians(), 0.0);
         if args.paint {
             dab(&mut renderer);
+        }
+    }
+
+    if let Some(path) = &args.save_texture {
+        match renderer.save_texture_png(path) {
+            Ok(()) => log::info!("saved texture {path}"),
+            Err(e) => log::error!("{e}"),
         }
     }
 

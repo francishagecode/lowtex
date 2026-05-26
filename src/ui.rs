@@ -8,10 +8,31 @@ use egui::Context;
 
 use crate::paint::Brush;
 
-/// All live editor state the UI mutates. The renderer reads `brush` when painting.
+/// One-shot requests the UI raises this frame, drained by the App after the egui
+/// run (file dialogs and texture ops happen outside the egui closure).
 #[derive(Default)]
+pub struct UiActions {
+    pub save_png: bool,
+    pub open_texture: bool,
+    pub set_resolution: Option<u32>,
+}
+
+/// All live editor state the UI mutates. The renderer reads `brush` when painting.
 pub struct UiState {
     pub brush: Brush,
+    /// Mirror of the renderer's current texture resolution, shown in the picker.
+    pub resolution: u32,
+    pub actions: UiActions,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            brush: Brush::default(),
+            resolution: 128,
+            actions: UiActions::default(),
+        }
+    }
 }
 
 /// Apply a chunky, dark theme that suits the retro vibe. Called once on startup.
@@ -23,8 +44,11 @@ pub fn install_style(ctx: &Context) {
     ctx.set_visuals(egui::Visuals::dark());
 }
 
-/// Build the controls panel for this frame. Mutates `state` in place.
+/// Build the controls panel for this frame. Mutates `state` in place and records
+/// one-shot requests in `state.actions` (reset each call).
 pub fn build(ctx: &Context, state: &mut UiState) {
+    state.actions = UiActions::default();
+
     egui::SidePanel::right("controls")
         .resizable(false)
         .default_width(220.0)
@@ -34,13 +58,40 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             ui.label(egui::RichText::new("PSX texture painter").weak());
             ui.separator();
 
-            ui.label("Color");
+            ui.label("Brush");
             ui.color_edit_button_rgb(&mut state.brush.color);
             ui.add_space(6.0);
-
             ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
             ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
             ui.add(egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"));
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label("Texture");
+
+            // Resolution picker. A change requests a resample at that size.
+            let mut res = state.resolution;
+            egui::ComboBox::from_label("Resolution")
+                .selected_text(format!("{res}×{res}"))
+                .show_ui(ui, |ui| {
+                    for size in [64u32, 128, 256] {
+                        ui.selectable_value(&mut res, size, format!("{size}×{size}"));
+                    }
+                });
+            if res != state.resolution {
+                state.resolution = res;
+                state.actions.set_resolution = Some(res);
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open…").clicked() {
+                    state.actions.open_texture = true;
+                }
+                if ui.button("Save PNG…").clicked() {
+                    state.actions.save_png = true;
+                }
+            });
 
             ui.add_space(10.0);
             ui.separator();

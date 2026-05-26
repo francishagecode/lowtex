@@ -59,9 +59,12 @@ pub struct Renderer {
 
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
 
     paint_texture_gpu: wgpu::Texture,
     paint_texture_cpu: PaintTexture,
+    tex_size: u32,
 
     depth_view: wgpu::TextureView,
 
@@ -193,24 +196,10 @@ impl Renderer {
         let index_count = mesh.indices.len() as u32;
 
         // Paint texture: faint checkerboard so the UV layout is visible pre-paint.
-        let paint_texture_cpu = make_checkerboard(TEX_SIZE, TEX_SIZE);
-        let paint_texture_gpu = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("paint texture"),
-            size: wgpu::Extent3d {
-                width: TEX_SIZE,
-                height: TEX_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let tex_size = TEX_SIZE;
+        let paint_texture_cpu = make_checkerboard(tex_size, tex_size);
+        let paint_texture_gpu = make_paint_texture(&device, &paint_texture_cpu);
         upload_texture(&queue, &paint_texture_gpu, &paint_texture_cpu);
-        let paint_texture_view =
-            paint_texture_gpu.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Nearest-neighbor sampler — pure PSX, no filtering.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -265,24 +254,13 @@ impl Renderer {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&paint_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let bind_group = make_paint_bind_group(
+            &device,
+            &bind_group_layout,
+            &uniform_buffer,
+            &paint_texture_gpu,
+            &sampler,
+        );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("main shader"),
@@ -349,8 +327,11 @@ impl Renderer {
             index_count,
             uniform_buffer,
             bind_group,
+            bind_group_layout,
+            sampler,
             paint_texture_gpu,
             paint_texture_cpu,
+            tex_size,
             depth_view,
             egui_renderer: None,
             max_texture_dim,
@@ -409,6 +390,70 @@ impl Renderer {
     pub fn orbit_view_radians(&mut self, d_azimuth: f32, d_elevation: f32) {
         self.camera.orbit_radians(d_azimuth, d_elevation);
         self.update_camera_uniform();
+    }
+
+    /// The current paint texture resolution (square).
+    pub fn texture_resolution(&self) -> u32 {
+        self.tex_size
+    }
+
+    /// Recreate the GPU paint texture + bind group from the current CPU texture.
+    /// Call after the CPU texture is replaced or resized.
+    fn rebuild_paint_gpu(&mut self) {
+        self.tex_size = self.paint_texture_cpu.width;
+        self.paint_texture_gpu = make_paint_texture(&self.device, &self.paint_texture_cpu);
+        upload_texture(
+            &self.queue,
+            &self.paint_texture_gpu,
+            &self.paint_texture_cpu,
+        );
+        self.bind_group = make_paint_bind_group(
+            &self.device,
+            &self.bind_group_layout,
+            &self.uniform_buffer,
+            &self.paint_texture_gpu,
+            &self.sampler,
+        );
+    }
+
+    /// Save the painted texture to a PNG. The CPU texture holds sRGB-encoded
+    /// bytes (the GPU texture is `Rgba8UnormSrgb`), and PNG is sRGB, so the bytes
+    /// are written through unchanged.
+    pub fn save_texture_png(&self, path: &str) -> Result<(), String> {
+        let cpu = &self.paint_texture_cpu;
+        image::save_buffer(
+            path,
+            &cpu.pixels,
+            cpu.width,
+            cpu.height,
+            image::ColorType::Rgba8,
+        )
+        .map_err(|e| format!("failed to save PNG: {e}"))
+    }
+
+    /// Load a PNG into the paint buffer, resampling to the current resolution.
+    pub fn load_texture_png(&mut self, path: &str) -> Result<(), String> {
+        let img = image::open(path).map_err(|e| format!("failed to open image: {e}"))?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let loaded = PaintTexture {
+            width: w,
+            height: h,
+            pixels: rgba.into_raw(),
+        };
+        self.paint_texture_cpu = loaded.resampled(self.tex_size, self.tex_size);
+        self.rebuild_paint_gpu();
+        Ok(())
+    }
+
+    /// Change the paint texture resolution, resampling existing paint into it.
+    pub fn set_texture_resolution(&mut self, size: u32) {
+        let size = size.clamp(8, self.max_texture_dim);
+        if size == self.tex_size {
+            return;
+        }
+        self.paint_texture_cpu = self.paint_texture_cpu.resampled(size, size);
+        self.rebuild_paint_gpu();
     }
 
     /// Called when the mouse moves while held, or on click.
@@ -679,6 +724,53 @@ async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) 
         )
         .await
         .expect("failed to request device")
+}
+
+/// Create the GPU paint texture sized to match a CPU texture.
+fn make_paint_texture(device: &wgpu::Device, cpu: &PaintTexture) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("paint texture"),
+        size: wgpu::Extent3d {
+            width: cpu.width,
+            height: cpu.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// Bind group for the scene: view-proj uniform + paint texture + sampler.
+fn make_paint_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform_buffer: &wgpu::Buffer,
+    paint_texture: &wgpu::Texture,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    let view = paint_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 fn make_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

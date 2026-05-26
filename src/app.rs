@@ -83,6 +83,8 @@ impl App {
             .egui_ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
 
+        self.handle_ui_actions();
+
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.render(Some(UiPaint {
                 jobs: &jobs,
@@ -90,6 +92,45 @@ impl App {
                 pixels_per_point: full_output.pixels_per_point,
             }));
         }
+    }
+
+    /// Apply this frame's UI requests (file dialogs, resolution change). Runs
+    /// outside the egui closure so native dialogs can block safely.
+    fn handle_ui_actions(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let actions = std::mem::take(&mut self.ui.actions);
+
+        if let Some(size) = actions.set_resolution {
+            renderer.set_texture_resolution(size);
+        }
+        if actions.save_png {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name("texture.png")
+                .add_filter("PNG", &["png"])
+                .save_file()
+            {
+                match renderer.save_texture_png(&path.to_string_lossy()) {
+                    Ok(()) => log::info!("saved {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
+        if actions.open_texture {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Image", &["png", "jpg", "jpeg"])
+                .pick_file()
+            {
+                match renderer.load_texture_png(&path.to_string_lossy()) {
+                    Ok(()) => log::info!("loaded {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
+
+        // Keep the resolution picker in sync with the renderer's actual size.
+        self.ui.resolution = renderer.texture_resolution();
     }
 }
 

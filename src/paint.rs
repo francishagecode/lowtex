@@ -71,6 +71,22 @@ impl Texture {
         }
     }
 
+    /// Return a copy resampled to `new_w` × `new_h` with nearest-neighbor
+    /// sampling (no blur — PSX-correct, and the right choice for chunky textures).
+    pub fn resampled(&self, new_w: u32, new_h: u32) -> Texture {
+        let mut out = Texture::new(new_w, new_h, [0, 0, 0, 255]);
+        for y in 0..new_h {
+            let sy = (y * self.height / new_h).min(self.height - 1);
+            for x in 0..new_w {
+                let sx = (x * self.width / new_w).min(self.width - 1);
+                let si = ((sy * self.width + sx) * 4) as usize;
+                let di = ((y * new_w + x) * 4) as usize;
+                out.pixels[di..di + 4].copy_from_slice(&self.pixels[si..si + 4]);
+            }
+        }
+        out
+    }
+
     /// Stamp a brush at a UV coordinate, blending by the brush's opacity and a
     /// hardness-controlled radial falloff. UV is in [0,1] with V=0 at the top
     /// (matches wgpu texture orientation).
