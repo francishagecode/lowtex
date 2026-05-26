@@ -68,6 +68,9 @@ pub struct Renderer {
     // egui overlay renderer; None in headless mode.
     egui_renderer: Option<egui_wgpu::Renderer>,
 
+    // Surface/texture dimensions are clamped to this (GPU limit).
+    max_texture_dim: u32,
+
     camera: Camera,
     mesh: Mesh,
 }
@@ -109,9 +112,11 @@ impl Renderer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &config);
 
+        // build() clamps config to the GPU's max texture size; configure the
+        // surface afterwards with those clamped dimensions.
         let mut r = Self::build(device, queue, config, mesh);
+        surface.configure(&r.device, &r.config);
         // egui overlay renders to the surface format, no depth, single-sampled.
         r.egui_renderer = Some(egui_wgpu::Renderer::new(
             &r.device,
@@ -163,9 +168,13 @@ impl Renderer {
     fn build(
         device: wgpu::Device,
         queue: wgpu::Queue,
-        config: wgpu::SurfaceConfiguration,
+        mut config: wgpu::SurfaceConfiguration,
         mesh: Mesh,
     ) -> Self {
+        // Never ask for a surface/depth texture larger than the GPU allows.
+        let max_texture_dim = device.limits().max_texture_dimension_2d;
+        config.width = config.width.clamp(1, max_texture_dim);
+        config.height = config.height.clamp(1, max_texture_dim);
         let width = config.width;
         let height = config.height;
         let target_format = config.format;
@@ -344,6 +353,7 @@ impl Renderer {
             paint_texture_cpu,
             depth_view,
             egui_renderer: None,
+            max_texture_dim,
             camera,
             mesh,
         }
@@ -353,6 +363,10 @@ impl Renderer {
         if width == 0 || height == 0 {
             return;
         }
+        // Clamp to the GPU's max texture size so a huge/HiDPI window can't make
+        // Surface::configure fail (it did, at 2056 vs a 2048 cap).
+        let width = width.min(self.max_texture_dim);
+        let height = height.min(self.max_texture_dim);
         self.config.width = width;
         self.config.height = height;
         if let Some(surface) = &self.surface {
@@ -656,7 +670,9 @@ async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) 
             &wgpu::DeviceDescriptor {
                 label: Some("lowtex device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                // Use the adapter's real limits (downlevel_defaults caps textures
+                // at 2048, which a HiDPI window surface can exceed).
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
