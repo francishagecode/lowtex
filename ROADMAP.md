@@ -299,7 +299,7 @@ visibility, reorder; composited on the GPU.
   Verified headless (`--layer-demo`): base red + layer green both composite.
   (Emissive channel deferred — albedo layers only for now.)_
 
-### [ ] G11 — Layer masks
+### [x] G11 — Layer masks
 **Outcome:** Each layer has a paintable mask that reveals/hides it.
 - **Build:** mask = single-channel texture per layer; brush can target mask or
   color; masks feed the compositor.
@@ -307,6 +307,11 @@ visibility, reorder; composited on the GPU.
 - **Done when:** painting black into a layer's mask hides those texels; white
   reveals them.
 - **Depends on:** G10
+- _2026-05-26: each `Layer` carries a reveal mask (`Texture`, red channel); the
+  compositor multiplies the layer's alpha by it. `PaintTarget::{Color,Mask}` routes
+  the brush; UI "Paint mask" + Hide/Reveal. Mask painting reuses the stroke
+  machinery (white reveals, black hides). Tests: black mask hides a layer / white
+  reveals. Verified headless (`--mask-demo`)._
 
 ### [ ] G12 — Move painting & compositing to the GPU
 **Outcome:** Brush stamps and compositing run on the GPU; CPU is no longer the
@@ -344,15 +349,21 @@ source of truth for paint.
 Target: most downloaded/hand-modeled low-poly assets have bad or no UVs.
 lowtex should unwrap them in-style. Projection methods fit PSX better than LSCM.
 
-### [ ] G14 — Box-projection unwrap
+### [x] G14 — Box-projection unwrap
 **Outcome:** "Box Unwrap" assigns UVs by each triangle's dominant axis (≤6 charts).
 - **Build:** per-triangle dominant normal axis → planar project → 2×3 grid (this
   is exactly the cube's existing scheme, generalized).
 - **Touches:** new `src/unwrap.rs`, `ui.rs`.
 - **Done when:** an unwrapped imported mesh paints with predictable per-face UVs.
 - **Depends on:** G1
+- _2026-05-26: `src/unwrap.rs::box_unwrap` — splits vertices, projects each
+  triangle along its dominant axis into one of the six 2×3 cells (column by sign,
+  row by axis), normalized by mesh bounds. Wired: UI "Unwrap: Box/Smart/Per-face"
+  buttons → `Renderer::apply_unwrap` (rebuilds buffers/BVH, undoable). Verified
+  headless (`--unwrap box`): the octahedron's degenerate fallback UVs become clean
+  per-face cells and paint localizes per face. Tests in unwrap.rs._
 
-### [ ] G15 — Smart-projection unwrap *(default)*
+### [x] G15 — Smart-projection unwrap *(default)*
 **Outcome:** Faces clustered by normal similarity, each cluster planar-projected.
 - **Build:** greedy normal clustering (angle threshold, à la Blender Smart UV
   Project) → planar project each cluster → hand charts to the packer (G17).
@@ -360,16 +371,22 @@ lowtex should unwrap them in-style. Projection methods fit PSX better than LSCM.
 - **Done when:** a curved-ish low-poly mesh unwraps into sensible islands with
   less stretch than box projection.
 - **Depends on:** G14, G17
+- _2026-05-26: `smart_unwrap` — greedy normal clustering (50° default), planar
+  projection per cluster, charts handed to the G17 packer. Wired via the same
+  "Unwrap: Smart" button. Test: cube → 6 clusters, UVs in unit._
 
-### [ ] G16 — Per-face unwrap
+### [x] G16 — Per-face unwrap
 **Outcome:** "Per-Face Unwrap" gives every triangle its own island.
 - **Build:** trivial chart-per-triangle; useful for "texture each face" workflows
   and as a zero-seam-bleed mode.
 - **Touches:** `unwrap.rs`, `ui.rs`.
 - **Done when:** selecting it produces one island per triangle in the packed atlas.
 - **Depends on:** G14, G17
+- _2026-05-26: `per_face_unwrap` — each triangle a square chart in a
+  ceil(√n) grid with an 8% gutter (no bleed). Wired via "Unwrap: Per-face". Test:
+  one chart per triangle, UVs in unit._
 
-### [ ] G17 — Chart packing
+### [x] G17 — Chart packing
 **Outcome:** 2D charts arranged in the 0–1 atlas without overlap.
 - **Build:** sort-by-area first-fit with 90° rotation; **snap chart positions/
   sizes to 8px / power-of-two** boundaries for PSX-correct UVs; optional final
@@ -377,6 +394,10 @@ lowtex should unwrap them in-style. Projection methods fit PSX better than LSCM.
 - **Touches:** `unwrap.rs`; **crates:** `rectangle-pack` or `crunch`.
 - **Done when:** packed charts don't overlap and fill the atlas reasonably.
 - **Depends on:** G14
+- _2026-05-26: `pack_rects` — hand-rolled sort-by-height shelf packer, uniform
+  scale to fit [0,1]² with a gutter; drives `smart_unwrap`. Test asserts charts
+  stay in the atlas and don't overlap. (90°-rotation + 8px snapping deferred as a
+  refinement; basic non-overlapping fill is in.)_
 
 ### [ ] G18 — Seam-aware painting + island bleed
 **Outcome:** Strokes across UV-island boundaries don't leave visible seams.
@@ -432,13 +453,18 @@ to any mesh via its baked maps.
   result that follows the new geometry.
 - **Depends on:** G20
 
-### [ ] G22 — Procedural noise library
+### [~] G22 — Procedural noise library *(library done; generator wiring pending)*
 **Outcome:** Value/Perlin/Worley noise available to generators and as brushes.
 - **Build:** noise sampled in UV or world space; parameters (scale, octaves);
   used to break up masks and as dither/texture brushes.
 - **Touches:** new `src/noise.rs`; **crates:** `noise` (or hand-rolled).
 - **Done when:** a generator mask modulated by noise looks non-uniform/organic.
 - **Depends on:** —
+- _2026-05-26: `src/noise.rs` — hand-rolled value / Perlin / Worley + fBm, sampled
+  in world space (no seam breaks), deterministic. Tests: range, determinism,
+  non-uniformity, seed sensitivity. **Library complete; not yet consumed** — the
+  "mask × noise" wiring belongs to the generator system (G20, parallel session),
+  so it's `#![allow(dead_code)]` until hooked in._
 
 ---
 

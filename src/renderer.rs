@@ -1014,6 +1014,33 @@ impl Renderer {
         Ok(())
     }
 
+    /// Re-unwrap the current mesh's UVs (G14–G17). Geometry is unchanged but
+    /// vertices are split and re-UV'd, so the GPU buffers, BVH, and cached maps are
+    /// rebuilt; the painted texture stays and re-maps onto the new UVs.
+    pub fn apply_unwrap(&mut self, mode: crate::unwrap::UnwrapMode) {
+        self.checkpoint();
+        let mesh = crate::unwrap::unwrap(&self.mesh, mode);
+        self.vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("vertex buffer"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("index buffer"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.index_count = mesh.indices.len() as u32;
+        self.bvh = Bvh::build(&mesh);
+        self.mesh = mesh;
+        self.mesh_maps = None;
+        self.island_map = None;
+    }
+
     /// Begin a new stroke: snapshot the texture and clear stroke coverage, so
     /// overlap within the stroke accumulates by max-coverage (no double-darken).
     pub fn begin_stroke(&mut self) {

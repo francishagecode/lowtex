@@ -21,6 +21,36 @@ use glam::{Vec2, Vec3};
 
 use crate::mesh::{Mesh, Vertex};
 
+/// The available unwrap methods, for the UI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UnwrapMode {
+    Box,
+    Smart,
+    PerFace,
+}
+
+impl UnwrapMode {
+    pub const ALL: [UnwrapMode; 3] = [UnwrapMode::Box, UnwrapMode::Smart, UnwrapMode::PerFace];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            UnwrapMode::Box => "Box",
+            UnwrapMode::Smart => "Smart",
+            UnwrapMode::PerFace => "Per-face",
+        }
+    }
+}
+
+/// Unwrap `mesh` by the chosen method, returning a fresh split-vertex mesh with
+/// new UVs. Smart uses a 50° normal-clustering threshold (a sane default).
+pub fn unwrap(mesh: &Mesh, mode: UnwrapMode) -> Mesh {
+    match mode {
+        UnwrapMode::Box => box_unwrap(mesh),
+        UnwrapMode::Smart => smart_unwrap(mesh, 50.0),
+        UnwrapMode::PerFace => per_face_unwrap(mesh),
+    }
+}
+
 /// The dominant axis (0=X,1=Y,2=Z) of a vector, by largest absolute component.
 fn dominant_axis(n: Vec3) -> usize {
     let a = n.abs();

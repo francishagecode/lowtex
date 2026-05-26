@@ -28,61 +28,106 @@ use glam::{Vec2, Vec3};
 
 use crate::mesh::Mesh;
 
-/// Per-resolution UV-island data. `island_of_tri` maps a triangle index to its
-/// island id; `texel_island` is the rasterized map (row-major, V down to match
-/// the paint texture), with `-1` for texels no triangle covers.
-pub struct IslandMap {
+/// Two cosine of the largest angle between adjacent triangles that still counts
+/// them as the same flat face. ~8° — merges the triangles of a (near-)planar quad
+/// or a triangulated flat wall, but keeps a cube's 90° sides, and the facets of a
+/// faceted curve, apart.
+const FACET_COS: f32 = 0.99;
+
+/// Per-resolution partitions of the mesh into fill regions, plus their rasterized
+/// texel maps (row-major, V down to match the paint texture; `-1` where no
+/// triangle covers a texel). Two independent partitions drive the two scoped
+/// bucket tools:
+///
+///   - *island*: connected components in UV space (split at seams) — the region a
+///     2D paint bucket would flood. `island_of_tri` / `texel_island`.
+///   - *facet*: connected, near-coplanar triangles — a flat "face" of the model,
+///     regardless of UV layout. `facet_of_tri` / `texel_facet`.
+pub struct FillMap {
     pub size: u32,
     pub island_of_tri: Vec<u32>,
     pub texel_island: Vec<i32>,
     pub island_count: u32,
+    pub facet_of_tri: Vec<u32>,
+    pub texel_facet: Vec<i32>,
+    pub facet_count: u32,
 }
 
-impl IslandMap {
-    /// Build islands (UV connectivity) and rasterize them into a `size`×`size`
-    /// texel map. Cheap for low-poly assets — no ray-casting.
+impl FillMap {
+    /// Build the island + facet partitions and rasterize both into `size`×`size`
+    /// texel maps in a single pass. Cheap for low-poly assets — no ray-casting.
     pub fn build(mesh: &Mesh, size: u32) -> Self {
         let tri_count = mesh.indices.len() / 3;
-        let mut uf = UnionFind::new(tri_count);
 
-        // Union triangles that share a non-seam edge. An edge endpoint is keyed by
-        // both its position and its UV, so a seam (same position, split UV) yields
-        // different keys on the two sides and the edge doesn't match across it.
-        // The first triangle on an edge key is remembered; later ones union with it.
-        let mut edge_owner: HashMap<(VertKey, VertKey), usize> = HashMap::new();
+        // Geometric (face) normal per triangle, for the coplanarity test below.
+        let face_n: Vec<Vec3> = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|tri| {
+                let p0 = Vec3::from(mesh.vertices[tri[0] as usize].position);
+                let p1 = Vec3::from(mesh.vertices[tri[1] as usize].position);
+                let p2 = Vec3::from(mesh.vertices[tri[2] as usize].position);
+                (p1 - p0).cross(p2 - p0).normalize_or_zero()
+            })
+            .collect();
+
+        // Islands: union triangles sharing a non-seam edge — endpoints keyed by
+        // position *and* UV, so a seam (same position, split UV) yields different
+        // keys on its two sides and the edge doesn't match across it.
+        let mut island_uf = UnionFind::new(tri_count);
+        let mut uv_edge_owner: HashMap<(VertKey, VertKey), usize> = HashMap::new();
+
+        // Facets: union triangles sharing a position edge whose face normals are
+        // near-parallel — i.e. one flat surface. Keyed by position only, so it
+        // ignores UV seams; gated by FACET_COS so a hard edge (e.g. a cube corner)
+        // is a boundary even though the position edge is shared.
+        let mut facet_uf = UnionFind::new(tri_count);
+        let mut pos_edge_owner: HashMap<(PosKey, PosKey), usize> = HashMap::new();
+
         for (ti, tri) in mesh.indices.chunks_exact(3).enumerate() {
             let vk = [
-                vert_key(&mesh, tri[0]),
-                vert_key(&mesh, tri[1]),
-                vert_key(&mesh, tri[2]),
+                vert_key(mesh, tri[0]),
+                vert_key(mesh, tri[1]),
+                vert_key(mesh, tri[2]),
+            ];
+            let pk = [
+                pos_key(mesh, tri[0]),
+                pos_key(mesh, tri[1]),
+                pos_key(mesh, tri[2]),
             ];
             for e in 0..3 {
-                let a = vk[e];
-                let b = vk[(e + 1) % 3];
-                let key = if a <= b { (a, b) } else { (b, a) };
-                match edge_owner.get(&key) {
-                    Some(&other) => uf.union(ti, other),
+                let (va, vb) = (vk[e], vk[(e + 1) % 3]);
+                let uv_key = if va <= vb { (va, vb) } else { (vb, va) };
+                match uv_edge_owner.get(&uv_key) {
+                    Some(&other) => island_uf.union(ti, other),
                     None => {
-                        edge_owner.insert(key, ti);
+                        uv_edge_owner.insert(uv_key, ti);
+                    }
+                }
+
+                let (pa, pb) = (pk[e], pk[(e + 1) % 3]);
+                let pos_key = if pa <= pb { (pa, pb) } else { (pb, pa) };
+                match pos_edge_owner.get(&pos_key) {
+                    Some(&other) => {
+                        if face_n[ti].dot(face_n[other]) >= FACET_COS {
+                            facet_uf.union(ti, other);
+                        }
+                    }
+                    None => {
+                        pos_edge_owner.insert(pos_key, ti);
                     }
                 }
             }
         }
 
-        // Compact the union-find roots into dense island ids [0, island_count).
-        let mut root_to_id: HashMap<usize, u32> = HashMap::new();
-        let mut island_of_tri = vec![0u32; tri_count];
-        for ti in 0..tri_count {
-            let root = uf.find(ti);
-            let next = root_to_id.len() as u32;
-            let id = *root_to_id.entry(root).or_insert(next);
-            island_of_tri[ti] = id;
-        }
-        let island_count = root_to_id.len() as u32;
+        let (island_of_tri, island_count) = island_uf.dense_ids(tri_count);
+        let (facet_of_tri, facet_count) = facet_uf.dense_ids(tri_count);
 
-        // Rasterize each triangle's UV footprint, stamping its island id.
+        // Rasterize each triangle's UV footprint, stamping both its island and
+        // facet ids into the texel maps.
         let n = (size * size) as usize;
         let mut texel_island = vec![-1i32; n];
+        let mut texel_facet = vec![-1i32; n];
         for (ti, tri) in mesh.indices.chunks_exact(3).enumerate() {
             let t = [
                 Vec2::from(mesh.vertices[tri[0] as usize].uv) * size as f32,
@@ -97,7 +142,7 @@ impl IslandMap {
             let max_x = t[0].x.max(t[1].x).max(t[2].x).ceil().min(size as f32) as i32;
             let min_y = t[0].y.min(t[1].y).min(t[2].y).floor().max(0.0) as i32;
             let max_y = t[0].y.max(t[1].y).max(t[2].y).ceil().min(size as f32) as i32;
-            let id = island_of_tri[ti] as i32;
+            let (isl, fac) = (island_of_tri[ti] as i32, facet_of_tri[ti] as i32);
             for y in min_y..max_y {
                 for x in min_x..max_x {
                     let pt = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
@@ -107,7 +152,9 @@ impl IslandMap {
                     if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
                         continue;
                     }
-                    texel_island[(y as u32 * size + x as u32) as usize] = id;
+                    let idx = (y as u32 * size + x as u32) as usize;
+                    texel_island[idx] = isl;
+                    texel_facet[idx] = fac;
                 }
             }
         }
@@ -117,12 +164,20 @@ impl IslandMap {
             island_of_tri,
             texel_island,
             island_count,
+            facet_of_tri,
+            texel_facet,
+            facet_count,
         }
     }
 
     /// The island id for a triangle index, or `None` if out of range.
     pub fn island_for_tri(&self, tri: u32) -> Option<u32> {
         self.island_of_tri.get(tri as usize).copied()
+    }
+
+    /// The facet id for a triangle index, or `None` if out of range.
+    pub fn facet_for_tri(&self, tri: u32) -> Option<u32> {
+        self.facet_of_tri.get(tri as usize).copied()
     }
 }
 
@@ -138,6 +193,16 @@ fn vert_key(mesh: &Mesh, idx: u32) -> VertKey {
     let uv = Vec2::from(v.uv);
     let q = |x: f32| (x * 1e4).round() as i32;
     (q(p.x), q(p.y), q(p.z), q(uv.x), q(uv.y))
+}
+
+/// A vertex keyed by quantized position only, for facet adjacency: two triangles
+/// touch on a position edge regardless of how their UVs are laid out.
+type PosKey = (i32, i32, i32);
+
+fn pos_key(mesh: &Mesh, idx: u32) -> PosKey {
+    let p = Vec3::from(mesh.vertices[idx as usize].position);
+    let q = |x: f32| (x * 1e4).round() as i32;
+    (q(p.x), q(p.y), q(p.z))
 }
 
 /// 2D edge function (twice the signed area of triangle a,b,c). Mirrors `bake.rs`.

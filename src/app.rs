@@ -129,6 +129,9 @@ impl App {
                 }
             }
         }
+        if let Some(mode) = actions.unwrap {
+            renderer.apply_unwrap(mode);
+        }
         if let Some(i) = actions.select_builtin_palette {
             if let Some(p) = crate::palette::Palette::builtins().into_iter().nth(i) {
                 renderer.set_palette(p);

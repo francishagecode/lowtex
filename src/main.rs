@@ -68,6 +68,8 @@ struct Args {
     /// Headless verification: bucket-fill the whole object / the island at center.
     fill_object: bool,
     fill_island: bool,
+    /// Headless verification: unwrap the mesh (box|smart|per-face) before capture.
+    unwrap: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -95,6 +97,7 @@ fn parse_args() -> Args {
         highlight: None,
         fill_object: false,
         fill_island: false,
+        unwrap: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -127,6 +130,7 @@ fn parse_args() -> Args {
             "--highlight" => args.highlight = it.next().and_then(|s| s.parse().ok()),
             "--fill-object" => args.fill_object = true,
             "--fill-island" => args.fill_island = true,
+            "--unwrap" => args.unwrap = it.next(),
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
             "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
@@ -182,6 +186,15 @@ fn main() {
 fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     let (width, height) = (args.width, args.height);
     let mut renderer = pollster::block_on(Renderer::new_headless(width, height, mesh));
+
+    if let Some(m) = &args.unwrap {
+        let mode = match m.as_str() {
+            "smart" => unwrap::UnwrapMode::Smart,
+            "per-face" | "perface" => unwrap::UnwrapMode::PerFace,
+            _ => unwrap::UnwrapMode::Box,
+        };
+        renderer.apply_unwrap(mode);
+    }
 
     if args.quantize {
         renderer.set_palette_settings(renderer::PaletteSettings {

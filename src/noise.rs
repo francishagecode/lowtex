@@ -9,6 +9,11 @@
 //   - Value   : smooth interpolated lattice hash — soft, cloudy.
 //   - Perlin  : gradient noise — the classic organic look.
 //   - Worley  : cellular (F1 distance to feature points) — cracks, scales, stone.
+//
+// This is a self-contained primitive library (G22). It's consumed by the
+// generator/mask system (G20) — "edge wear = curvature × noise" — which is still
+// being wired up; until then the public API is unused, hence the module allow.
+#![allow(dead_code)]
 
 use glam::Vec3;
 

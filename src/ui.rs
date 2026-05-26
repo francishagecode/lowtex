@@ -69,6 +69,8 @@ pub struct UiActions {
     pub apply_edge_wear: Option<Levels>,
     pub apply_tint: Option<(MapSource, Levels, [f32; 3])>,
     pub mask_from_map: Option<(MapSource, Levels)>,
+    /// Re-unwrap the mesh's UVs (G14–G17).
+    pub unwrap: Option<crate::unwrap::UnwrapMode>,
 }
 
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
@@ -153,6 +155,15 @@ pub fn build(ctx: &Context, state: &mut UiState) {
             if ui.button("Open model…").clicked() {
                 state.actions.open_model = true;
             }
+            ui.horizontal(|ui| {
+                ui.label("Unwrap:")
+                    .on_hover_text("Reassign the model's UVs");
+                for mode in crate::unwrap::UnwrapMode::ALL {
+                    if ui.small_button(mode.name()).clicked() {
+                        state.actions.unwrap = Some(mode);
+                    }
+                }
+            });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui
