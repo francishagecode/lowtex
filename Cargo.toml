@@ -39,3 +39,10 @@ egui-winit = { version = "0.29", default-features = false }
 
 # Native file dialogs (open/save).
 rfd = "0.15"
+
+# Indexed-PNG export for retro pipelines (true paletted PNG).
+png = "0.17"
+
+# Project (.lowtex) serialization.
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"

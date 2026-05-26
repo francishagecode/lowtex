@@ -484,7 +484,7 @@ to any mesh via its baked maps.
 
 Target: an indie dev can adopt lowtex, finish a model, and get it into their engine.
 
-### [ ] G23 — Export presets
+### [x] G23 — Export presets
 **Outcome:** One click to engine-ready output, including true indexed PNG.
 - **Build:** presets for Unity/Unreal/Godot/glTF (correct names, packed channels
   e.g. albedo + emissive, power-of-two sizing, nearest/no-mip flags); **indexed
@@ -493,6 +493,14 @@ Target: an indie dev can adopt lowtex, finish a model, and get it into their eng
 - **Done when:** exporting drops correctly-named files that import into a target
   engine with the intended look (no filtering, right channels).
 - **Depends on:** G10, G8
+- _2026-05-26: `src/export.rs` — **true indexed PNG** (real PLTE chunk, 8-bit
+  indices, via the `png` crate) when a palette is active; RGBA8 otherwise.
+  `ExportPreset` (Unity/Unreal/Godot/glTF/Plain) sets the engine-correct filename
+  (`_albedo`/`_BaseColor`/`_baseColor`) and surfaces the one import flag a PNG
+  can't carry (point filtering / no mips). Renderer `export_png`; UI Engine combo +
+  Export indexed/RGBA buttons; headless `--export-indexed`. Tests + headless verify
+  the output decodes as Indexed with a PLTE. (Channel-packing + emissive deferred —
+  albedo only; integer-UV snap on export deferred.)_
 
 ### [ ] G24 — Project save/load (`.lowtex`)
 **Outcome:** Reopen a project with mesh reference, layers, palette, generators intact.

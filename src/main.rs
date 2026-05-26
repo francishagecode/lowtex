@@ -15,6 +15,7 @@ mod app;
 mod bake;
 mod bvh;
 mod camera;
+mod export;
 mod fill;
 mod history;
 mod layers;
@@ -72,6 +73,8 @@ struct Args {
     fill_face: bool,
     /// Headless verification: unwrap the mesh (box|smart|per-face) before capture.
     unwrap: Option<String>,
+    /// Headless verification: export an indexed PNG to this path (needs --quantize).
+    export_indexed: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -101,6 +104,7 @@ fn parse_args() -> Args {
         fill_island: false,
         fill_face: false,
         unwrap: None,
+        export_indexed: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -135,6 +139,7 @@ fn parse_args() -> Args {
             "--fill-island" => args.fill_island = true,
             "--fill-face" => args.fill_face = true,
             "--unwrap" => args.unwrap = it.next(),
+            "--export-indexed" => args.export_indexed = it.next(),
             "--quantize" => args.quantize = true,
             "--no-dither" => args.no_dither = true,
             "--palette" => args.palette_builtin = it.next().and_then(|s| s.parse().ok()),
@@ -322,6 +327,12 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     if let Some(path) = &args.save_texture {
         match renderer.save_texture_png(path) {
             Ok(()) => log::info!("saved texture {path}"),
+            Err(e) => log::error!("{e}"),
+        }
+    }
+    if let Some(path) = &args.export_indexed {
+        match renderer.export_png(path, true) {
+            Ok(()) => log::info!("exported indexed PNG {path}"),
             Err(e) => log::error!("{e}"),
         }
     }

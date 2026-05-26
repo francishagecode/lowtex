@@ -7,6 +7,7 @@
 use egui::Context;
 
 use crate::bake::{Levels, MapSource};
+use crate::export::ExportPreset;
 use crate::layers::BlendMode;
 use crate::paint::Brush;
 use crate::renderer::PaletteSettings;
@@ -72,6 +73,8 @@ pub struct UiActions {
     pub apply_edge_wear: Option<Levels>,
     pub apply_tint: Option<(MapSource, Levels, [f32; 3])>,
     pub mask_from_map: Option<(MapSource, Levels)>,
+    /// Export the texture (G23): `true` = true indexed PNG, `false` = RGBA8.
+    pub export_png: Option<bool>,
     /// Re-unwrap the mesh's UVs (G14–G17).
     pub unwrap: Option<crate::unwrap::UnwrapMode>,
 }
@@ -93,6 +96,8 @@ pub struct UiState {
     /// color, and (when masking) whether the brush reveals (white) or hides (black).
     pub paint_mask: bool,
     pub mask_reveal: bool,
+    /// Target engine for export naming/hints (G23).
+    pub export_preset: ExportPreset,
     /// Levels controls shared by every mesh effect: overall strength, mid-tone
     /// contrast, and invert. `effect_source` is which baked channel the generic
     /// "Tint layer" / "Mask layer" actions read from.
@@ -120,6 +125,7 @@ impl Default for UiState {
             active_layer: 0,
             paint_mask: false,
             mask_reveal: false,
+            export_preset: ExportPreset::Plain,
             ao_strength: 0.75,
             effect_contrast: 0.0,
             effect_invert: false,
@@ -243,6 +249,30 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 }
                 if ui.button("Save PNG…").clicked() {
                     state.actions.save_png = true;
+                }
+            });
+            egui::ComboBox::from_label("Engine")
+                .selected_text(state.export_preset.name())
+                .show_ui(ui, |ui| {
+                    for p in ExportPreset::ALL {
+                        ui.selectable_value(&mut state.export_preset, p, p.name());
+                    }
+                });
+            ui.label(
+                egui::RichText::new(state.export_preset.import_hint())
+                    .weak()
+                    .small(),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Export indexed…")
+                    .on_hover_text("True paletted PNG for retro pipelines (needs Quantize on)")
+                    .clicked()
+                {
+                    state.actions.export_png = Some(true);
+                }
+                if ui.button("Export RGBA…").clicked() {
+                    state.actions.export_png = Some(false);
                 }
             });
 

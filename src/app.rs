@@ -132,6 +132,21 @@ impl App {
         if let Some(mode) = actions.unwrap {
             renderer.apply_unwrap(mode);
         }
+        if let Some(indexed) = actions.export_png {
+            let preset = self.ui.export_preset;
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(preset.suggested_filename())
+                .add_filter("PNG", &["png"])
+                .save_file()
+            {
+                match renderer.export_png(&path.to_string_lossy(), indexed) {
+                    Ok(()) => {
+                        log::info!("exported {} — {}", path.display(), preset.import_hint())
+                    }
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
         if let Some(i) = actions.select_builtin_palette {
             if let Some(p) = crate::palette::Palette::builtins().into_iter().nth(i) {
                 renderer.set_palette(p);

@@ -740,6 +740,31 @@ impl Renderer {
         .map_err(|e| format!("failed to save PNG: {e}"))
     }
 
+    /// Export the displayed texture (G23). When `indexed` and a palette is active,
+    /// writes a true indexed PNG; otherwise RGBA8. The displayed pixels are already
+    /// quantized to the palette, so the index mapping is exact.
+    pub fn export_png(&self, path: &str, indexed: bool) -> Result<(), String> {
+        let pixels = self.display_pixels();
+        let palette_u8: Vec<[u8; 3]> = self
+            .palette
+            .colors
+            .iter()
+            .map(|c| {
+                [
+                    (c[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (c[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (c[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                ]
+            })
+            .collect();
+        let palette = if indexed && self.palette_settings.enabled && !palette_u8.is_empty() {
+            Some(palette_u8.as_slice())
+        } else {
+            None
+        };
+        crate::export::export_png(path, &pixels, self.tex_size, self.tex_size, palette)
+    }
+
     /// Load a PNG into the paint buffer, resampling to the current resolution.
     pub fn load_texture_png(&mut self, path: &str) -> Result<(), String> {
         let img = image::open(path).map_err(|e| format!("failed to open image: {e}"))?;
