@@ -1,72 +1,127 @@
 // src/unwrap.rs
 //
 // UV unwrapping (Phase 4). Most downloaded / hand-modeled low-poly assets have
-// bad or no UVs; lowtex unwraps them in a PSX-friendly way. Projection methods
-// fit the aesthetic better than LSCM/ABF, so these are all planar projections:
+// bad or no UVs; lowtex unwraps them in a PSX-friendly way.
 //
-//   - box_unwrap     (G14): per-triangle dominant-axis planar projection into a
-//                           2×3 grid (six cells, one per ±axis) — the cube's
-//                           scheme, generalized.
-//   - per_face_unwrap(G16): every triangle gets its own square chart, packed into
-//                           a grid — zero seam-bleed, "texture each face".
-//   - smart_unwrap   (G15): triangles clustered by normal similarity, each cluster
-//                           planar-projected, the charts packed (G17).
+// One auto-unwrap, built for "it just works" over tight packing — the user paints
+// at very low resolution, so there's headroom to trade atlas space for correctness:
+//
+//   1. Connectivity charts (no overlaps). Triangles are welded by position and
+//      region-grown into charts along shared edges, staying within an angle cone of
+//      the seed normal. Because charts are *connected* and span < 2·cone < 180°, two
+//      separate parts of the mesh can never share UV space and a chart's planar
+//      projection can't fold onto itself. This kills the old normal-only clustering
+//      bug where parallel-but-separate faces stacked in the atlas.
+//
+//   2. Constant world-space texel density. Each chart is projected onto its
+//      area-weighted average normal (an orthonormal basis, so the 2D coords are in
+//      world units), then *every* chart is scaled by one global "texels per world
+//      unit" D. One world unit is D texels everywhere → the same physical pixel size
+//      across the whole surface, regardless of which chart a face landed in.
+//
+//   3. Derived atlas size. Charts are packed in pixels at scale D and the atlas
+//      resolution is rounded up to the next power of two to fit them. Denser meshes
+//      (or a higher `Density`) just produce a bigger texture — the texel size stays
+//      put. The caller resizes its paint layers to `UnwrapResult::atlas_size`.
 //
 // Every unwrap splits vertices (3 per triangle): a vertex shared across faces with
-// different projections needs different UVs, so unwrapping rebuilds the vertex
-// list as 3·triangle_count flat vertices. Output is always a fresh `Mesh` with
+// different projections needs different UVs, so unwrapping rebuilds the vertex list
+// as 3·triangle_count flat vertices. Output is always a fresh `Mesh` with
 // `needs_uvs = false`.
+
+use std::collections::HashMap;
 
 use glam::{Vec2, Vec3};
 
 use crate::mesh::{Mesh, Vertex};
 
-/// The available unwrap methods, for the UI.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum UnwrapMode {
-    Box,
-    Smart,
-    PerFace,
+/// Coarse texel-density knob for the UI. The constant-density invariant holds at
+/// every setting — the multiplier only scales the absolute texels-per-world-unit
+/// (and therefore the derived atlas size).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Density {
+    Low,
+    #[default]
+    Medium,
+    High,
 }
 
-impl UnwrapMode {
-    pub const ALL: [UnwrapMode; 3] = [UnwrapMode::Box, UnwrapMode::Smart, UnwrapMode::PerFace];
+impl Density {
+    pub const ALL: [Density; 3] = [Density::Low, Density::Medium, Density::High];
 
     pub fn name(self) -> &'static str {
         match self {
-            UnwrapMode::Box => "Box",
-            UnwrapMode::Smart => "Smart",
-            UnwrapMode::PerFace => "Per-face",
+            Density::Low => "Low",
+            Density::Medium => "Medium",
+            Density::High => "High",
+        }
+    }
+
+    fn multiplier(self) -> f32 {
+        match self {
+            Density::Low => 0.5,
+            Density::Medium => 1.0,
+            Density::High => 2.0,
         }
     }
 }
 
-/// Unwrap `mesh` by the chosen method, returning a fresh split-vertex mesh with
-/// new UVs. Smart uses a 50° normal-clustering threshold (a sane default).
-pub fn unwrap(mesh: &Mesh, mode: UnwrapMode) -> Mesh {
-    match mode {
-        UnwrapMode::Box => box_unwrap(mesh),
-        UnwrapMode::Smart => smart_unwrap(mesh, 50.0),
-        UnwrapMode::PerFace => per_face_unwrap(mesh),
+/// Tunables for `auto_unwrap`. `Default` is the sane GUI configuration.
+#[derive(Clone, Copy)]
+pub struct UnwrapOptions {
+    pub density: Density,
+    /// Chart growth cone, in degrees, measured from the seed normal. Kept < 90° so a
+    /// chart can't fold over its own projection. Tighter → flatter charts (more
+    /// uniform density) at the cost of more charts / a bigger atlas.
+    pub angle_cone_deg: f32,
+    /// Empty pixels reserved around each chart so nearest-neighbour sampling and the
+    /// island-bleed dilate can't cross a seam.
+    pub gutter_px: u32,
+    /// Hard upper bound on the atlas (the renderer passes its GPU max texture dim).
+    pub max_atlas: u32,
+    /// The `Medium` density aims the atlas near this size for the current mesh.
+    pub target_atlas_px: u32,
+}
+
+impl Default for UnwrapOptions {
+    fn default() -> Self {
+        Self {
+            density: Density::Medium,
+            angle_cone_deg: 40.0,
+            gutter_px: 2,
+            max_atlas: 8192,
+            target_atlas_px: 128,
+        }
     }
 }
 
-/// The dominant axis (0=X,1=Y,2=Z) of a vector, by largest absolute component.
-fn dominant_axis(n: Vec3) -> usize {
-    let a = n.abs();
-    if a.x >= a.y && a.x >= a.z {
-        0
-    } else if a.y >= a.z {
-        1
-    } else {
-        2
-    }
+/// The product of an unwrap: the re-UV'd mesh plus the atlas size the caller should
+/// resize its paint layers to.
+pub struct UnwrapResult {
+    /// Split-vertex mesh, `needs_uvs = false`, all UVs in `[0,1]`.
+    pub mesh: Mesh,
+    /// Square, power-of-two atlas resolution that holds the packed charts.
+    pub atlas_size: u32,
+    /// `true` if density was reduced to keep the atlas within `max_atlas`.
+    pub clamped: bool,
+    /// The final texels-per-world-unit actually used (after any clamp).
+    pub density_d: f32,
 }
 
-/// The geometric normal of a triangle (un-normalized cross is fine for axis pick,
-/// but we normalize so output normals are usable).
+/// Unwrap `mesh` into connectivity-based charts at a constant world-space texel
+/// density, deriving the atlas size from `opts.density`.
+pub fn auto_unwrap(mesh: &Mesh, opts: &UnwrapOptions) -> UnwrapResult {
+    unwrap_impl(mesh, opts).0
+}
+
+/// The geometric normal of a triangle (zero for a degenerate triangle).
 fn face_normal(p: [Vec3; 3]) -> Vec3 {
     (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero()
+}
+
+/// Twice the area vector's length → triangle area (0 for degenerate).
+fn tri_area(p: [Vec3; 3]) -> f32 {
+    0.5 * (p[1] - p[0]).cross(p[2] - p[0]).length()
 }
 
 /// Iterate a mesh's triangles as `[Vec3; 3]` world positions.
@@ -78,6 +133,14 @@ fn tri_positions(mesh: &Mesh) -> impl Iterator<Item = [Vec3; 3]> + '_ {
             Vec3::from(mesh.vertices[t[2] as usize].position),
         ]
     })
+}
+
+/// An orthonormal (tangent, bitangent) spanning the plane perpendicular to `n`.
+fn planar_basis(n: Vec3) -> (Vec3, Vec3) {
+    let up = if n.y.abs() < 0.99 { Vec3::Y } else { Vec3::X };
+    let t = up.cross(n).normalize_or_zero();
+    let b = n.cross(t);
+    (t, b)
 }
 
 /// Build a split-vertex mesh from per-triangle (positions, normal, uvs).
@@ -101,212 +164,289 @@ fn build_split(tris: &[([Vec3; 3], Vec3, [Vec2; 3])]) -> Mesh {
     }
 }
 
-/// G14 — Box projection. Each triangle is projected along its dominant axis into
-/// one cell of a 2×3 grid: column by the axis sign (+ = 0, − = 1), row by the axis
-/// (X=0, Y=1, Z=2). Positions are normalized by the mesh bounds so coplanar faces
-/// share a consistent scale. The result paints with predictable per-face UVs.
-pub fn box_unwrap(mesh: &Mesh) -> Mesh {
-    let (min, max) = mesh.bounds();
-    let size = (max - min).max(Vec3::splat(1e-6));
-
-    let tris: Vec<_> = tri_positions(mesh)
-        .map(|p| {
-            let n = face_normal(p);
-            let axis = dominant_axis(n);
-            let col = if n[axis] >= 0.0 { 0.0 } else { 1.0 };
-            let row = axis as f32;
-            // The two axes perpendicular to the dominant one become (u, v).
-            let ua = (axis + 1) % 3;
-            let va = (axis + 2) % 3;
-            let uv = p.map(|pt| {
-                let cu = (pt[ua] - min[ua]) / size[ua];
-                let cv = (pt[va] - min[va]) / size[va];
-                Vec2::new((col + cu) / 2.0, (row + cv) / 3.0)
-            });
-            (p, n, uv)
-        })
-        .collect();
-    build_split(&tris)
+/// Weld vertices by quantized position → a representative id per input vertex. This
+/// recovers topology on meshes that are already split (e.g. a prior unwrap), which
+/// is what lets connectivity (not normals) drive chart membership.
+fn weld_positions(mesh: &Mesh, eps: f32) -> Vec<u32> {
+    let inv = 1.0 / eps as f64;
+    let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut weld = Vec::with_capacity(mesh.vertices.len());
+    let mut next = 0u32;
+    for v in &mesh.vertices {
+        let key = (
+            (v.position[0] as f64 * inv).round() as i64,
+            (v.position[1] as f64 * inv).round() as i64,
+            (v.position[2] as f64 * inv).round() as i64,
+        );
+        let id = *map.entry(key).or_insert_with(|| {
+            let id = next;
+            next += 1;
+            id
+        });
+        weld.push(id);
+    }
+    weld
 }
 
-/// G16 — Per-face. Every triangle becomes its own square chart in a near-square
-/// grid of `ceil(sqrt(n))` columns. Each triangle is planar-projected by its own
-/// normal, fit to its cell with a small gutter so nearest-neighbour sampling can't
-/// bleed between charts. Useful for "texture each face" workflows and as a
-/// zero-seam-bleed mode.
-pub fn per_face_unwrap(mesh: &Mesh) -> Mesh {
+/// Per-triangle adjacency: two triangles are neighbours if they share a welded edge.
+fn build_adjacency(mesh: &Mesh, weld: &[u32]) -> Vec<Vec<usize>> {
     let tri_count = mesh.indices.len() / 3;
-    if tri_count == 0 {
-        return build_split(&[]);
+    let mut edges: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (ti, t) in mesh.indices.chunks_exact(3).enumerate() {
+        let w = [
+            weld[t[0] as usize],
+            weld[t[1] as usize],
+            weld[t[2] as usize],
+        ];
+        for k in 0..3 {
+            let (a, b) = (w[k], w[(k + 1) % 3]);
+            let key = if a <= b { (a, b) } else { (b, a) };
+            edges.entry(key).or_default().push(ti);
+        }
     }
-    let cols = (tri_count as f32).sqrt().ceil() as usize;
-    let rows = tri_count.div_ceil(cols);
-    let cell_w = 1.0 / cols as f32;
-    let cell_h = 1.0 / rows as f32;
-    const GUTTER: f32 = 0.08; // fraction of the cell kept empty around each chart
-
-    let tris: Vec<_> = tri_positions(mesh)
-        .enumerate()
-        .map(|(i, p)| {
-            let n = face_normal(p);
-            let (tu, tv) = planar_basis(n);
-            // Project to the triangle's tangent plane, then normalize to its bbox.
-            let proj: [Vec2; 3] = p.map(|pt| Vec2::new(pt.dot(tu), pt.dot(tv)));
-            let (pmin, pmax) = bounds2(&proj);
-            let psize = (pmax - pmin).max(Vec2::splat(1e-6));
-
-            let col = i % cols;
-            let row = i / cols;
-            let uv = proj.map(|q| {
-                let local = (q - pmin) / psize; // 0..1 within the chart
-                let inset = local * (1.0 - 2.0 * GUTTER) + Vec2::splat(GUTTER);
-                Vec2::new(
-                    (col as f32 + inset.x) * cell_w,
-                    (row as f32 + inset.y) * cell_h,
-                )
-            });
-            (p, n, uv)
-        })
-        .collect();
-    build_split(&tris)
-}
-
-/// An orthonormal (tangent, bitangent) spanning the plane perpendicular to `n`.
-fn planar_basis(n: Vec3) -> (Vec3, Vec3) {
-    let up = if n.y.abs() < 0.99 { Vec3::Y } else { Vec3::X };
-    let t = up.cross(n).normalize_or_zero();
-    let b = n.cross(t);
-    (t, b)
-}
-
-fn bounds2(pts: &[Vec2; 3]) -> (Vec2, Vec2) {
-    let mut mn = pts[0];
-    let mut mx = pts[0];
-    for p in &pts[1..] {
-        mn = mn.min(*p);
-        mx = mx.max(*p);
-    }
-    (mn, mx)
-}
-
-/// G15 — Smart projection. Triangles are greedily clustered by normal similarity
-/// (within `angle_threshold_deg`), each cluster is planar-projected by its average
-/// normal, and the clusters are packed into the atlas (G17). Clustered faces stay
-/// together, so a curved-ish low-poly mesh unwraps into a few sensible islands
-/// with less stretch than box projection. `angle_threshold_deg` ~ 40–66 is sane.
-pub fn smart_unwrap(mesh: &Mesh, angle_threshold_deg: f32) -> Mesh {
-    let tri_count = mesh.indices.len() / 3;
-    if tri_count == 0 {
-        return build_split(&[]);
-    }
-    let cos_thresh = angle_threshold_deg.to_radians().cos();
-
-    let positions: Vec<[Vec3; 3]> = tri_positions(mesh).collect();
-    let normals: Vec<Vec3> = positions.iter().map(|p| face_normal(*p)).collect();
-
-    // Greedy normal clustering: each triangle joins the first cluster whose mean
-    // normal is within the threshold, else starts a new one.
-    let mut cluster_of = vec![0usize; tri_count];
-    let mut cluster_normal: Vec<Vec3> = Vec::new();
-    let mut cluster_count: Vec<u32> = Vec::new();
-    for ti in 0..tri_count {
-        let n = normals[ti];
-        let found = cluster_normal.iter().position(|cn| cn.dot(n) >= cos_thresh);
-        match found {
-            Some(c) => {
-                cluster_of[ti] = c;
-                // Running mean of the cluster normal.
-                let k = cluster_count[c] as f32;
-                cluster_normal[c] = ((cluster_normal[c] * k + n) / (k + 1.0)).normalize_or_zero();
-                cluster_count[c] += 1;
-            }
-            None => {
-                cluster_of[ti] = cluster_normal.len();
-                cluster_normal.push(n);
-                cluster_count.push(1);
+    let mut adj = vec![Vec::new(); tri_count];
+    for tris in edges.values() {
+        for i in 0..tris.len() {
+            for j in (i + 1)..tris.len() {
+                adj[tris[i]].push(tris[j]);
+                adj[tris[j]].push(tris[i]);
             }
         }
     }
+    adj
+}
 
-    let num_clusters = cluster_normal.len();
-    // Project each triangle in its cluster's tangent frame; track per-cluster bbox.
-    let bases: Vec<(Vec3, Vec3)> = cluster_normal.iter().map(|n| planar_basis(*n)).collect();
+/// Region-grow charts by flood fill. A triangle joins a chart only if its normal is
+/// within `cos_cone` of the chart's *seed* normal — frozen, so the chart spans
+/// < 2·cone and the projection onto its average normal stays injective. Returns the
+/// chart id per triangle and each chart's area-weighted average normal.
+fn grow_charts(
+    normals: &[Vec3],
+    areas: &[f32],
+    adj: &[Vec<usize>],
+    cos_cone: f32,
+) -> (Vec<usize>, Vec<Vec3>) {
+    let tri_count = normals.len();
+    let mut chart_of = vec![usize::MAX; tri_count];
+    let mut chart_normal: Vec<Vec3> = Vec::new();
+    for seed in 0..tri_count {
+        if chart_of[seed] != usize::MAX {
+            continue;
+        }
+        let c = chart_normal.len();
+        let seed_n = normals[seed];
+        let valid_seed = seed_n.length_squared() > 1e-12;
+        chart_of[seed] = c;
+        let mut acc = seed_n * areas[seed];
+        let mut stack = vec![seed];
+        while let Some(t) = stack.pop() {
+            for &nb in &adj[t] {
+                if chart_of[nb] != usize::MAX {
+                    continue;
+                }
+                let n = normals[nb];
+                // Zero-area neighbours carry no orientation — let them ride along.
+                let degenerate = n.length_squared() < 1e-12;
+                let joins = degenerate || (valid_seed && seed_n.dot(n) >= cos_cone);
+                if joins {
+                    chart_of[nb] = c;
+                    acc += n * areas[nb];
+                    stack.push(nb);
+                }
+            }
+        }
+        let avg = if acc.length_squared() > 1e-20 {
+            acc.normalize()
+        } else {
+            seed_n
+        };
+        chart_normal.push(avg);
+    }
+    (chart_of, chart_normal)
+}
+
+/// Tallest-first shelf packing of chart *pixel* footprints (chart size · `d`, plus a
+/// gutter on every side). Returns each chart's pixel offset and the used extent.
+fn shelf_pack(csize: &[Vec2], d: f32, gutter_px: u32) -> (Vec<Vec2>, f32, f32) {
+    let n = csize.len();
+    let g = gutter_px as f32;
+    let psize: Vec<Vec2> = csize
+        .iter()
+        .map(|s| Vec2::new((s.x * d).ceil() + 2.0 * g, (s.y * d).ceil() + 2.0 * g))
+        .collect();
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| psize[b].y.total_cmp(&psize[a].y));
+
+    let total_area: f32 = psize.iter().map(|s| s.x * s.y).sum();
+    let widest = psize.iter().map(|s| s.x).fold(0.0_f32, f32::max);
+    // Aim for a *square* layout (width ≈ √area) so the square power-of-two atlas
+    // wastes little — never narrower than the widest chart.
+    let shelf_w = total_area.sqrt().max(widest);
+
+    let mut offsets = vec![Vec2::ZERO; n];
+    let (mut x, mut y, mut shelf_h, mut max_x) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for &i in &order {
+        let s = psize[i];
+        if x > 0.0 && x + s.x > shelf_w {
+            y += shelf_h;
+            x = 0.0;
+            shelf_h = 0.0;
+        }
+        offsets[i] = Vec2::new(x, y);
+        x += s.x;
+        max_x = max_x.max(x);
+        shelf_h = shelf_h.max(s.y);
+    }
+    (offsets, max_x, y + shelf_h)
+}
+
+/// Smallest power of two ≥ `x`, floored at 8.
+fn next_pow2(x: u32) -> u32 {
+    let mut p = 8u32;
+    while p < x {
+        p <<= 1;
+    }
+    p
+}
+
+/// Pack charts at density `d`, deriving a square power-of-two atlas and then scaling
+/// density so the layout *fills* it (the rounded-up slack becomes extra texels, not
+/// blank space). If the natural atlas would exceed `max_atlas`, density is reduced to
+/// fit instead (and `clamped` is set). Returns chart pixel offsets, the atlas size,
+/// the final (filled) density, and the flag.
+fn pack_pixels(
+    csize: &[Vec2],
+    d: f32,
+    gutter_px: u32,
+    max_atlas: u32,
+) -> (Vec<Vec2>, u32, f32, bool) {
+    if csize.is_empty() {
+        return (Vec::new(), 8, d, false);
+    }
+    // Largest power of two that still fits the GPU limit (≥ 8).
+    let mut max_pow2 = 8u32;
+    while (max_pow2 << 1) <= max_atlas {
+        max_pow2 <<= 1;
+    }
+
+    // Pack once at the requested density to discover the natural footprint, then pick
+    // the power-of-two atlas that holds it (clamped to the GPU limit).
+    let (mut offsets, mut w, mut h) = shelf_pack(csize, d, gutter_px);
+    let natural = next_pow2(w.max(h).ceil() as u32);
+    let clamped = natural > max_pow2;
+    let atlas = natural.min(max_pow2);
+
+    // Scale density so the layout *fills* the atlas rather than leaving the rounded-up
+    // power-of-two slack blank: since we're paying for the texture either way, spend
+    // the leftover room on more (still uniform) texels. The same loop shrinks density
+    // when the content is too big for the GPU max. Fixed-pixel gutters make this
+    // non-linear, so we re-pack and converge (toward the atlas from below).
+    let mut d = d;
+    for _ in 0..8 {
+        let cur = w.max(h).max(1.0);
+        if (atlas as f32 / cur - 1.0).abs() < 0.01 {
+            break;
+        }
+        d *= atlas as f32 / cur;
+        let r = shelf_pack(csize, d, gutter_px);
+        offsets = r.0;
+        w = r.1;
+        h = r.2;
+    }
+    // Never exceed the atlas (keep UVs ≤ 1) — trim density if a re-pack overshot.
+    let mut guard = 0;
+    while w.max(h) > atlas as f32 && guard < 6 {
+        d *= atlas as f32 / w.max(h);
+        let r = shelf_pack(csize, d, gutter_px);
+        offsets = r.0;
+        w = r.1;
+        h = r.2;
+        guard += 1;
+    }
+    (offsets, atlas, d, clamped)
+}
+
+/// The full pipeline; returns the chart id per output triangle alongside the result
+/// (used by tests). Output triangle order matches `chart_of` order.
+fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) {
+    let tri_count = mesh.indices.len() / 3;
+    if tri_count == 0 {
+        return (
+            UnwrapResult {
+                mesh: build_split(&[]),
+                atlas_size: opts.target_atlas_px.max(8),
+                clamped: false,
+                density_d: 1.0,
+            },
+            Vec::new(),
+        );
+    }
+
+    let positions: Vec<[Vec3; 3]> = tri_positions(mesh).collect();
+    let normals: Vec<Vec3> = positions.iter().map(|p| face_normal(*p)).collect();
+    let areas: Vec<f32> = positions.iter().map(|p| tri_area(*p)).collect();
+
+    let (min, max) = mesh.bounds();
+    let eps = ((max - min).length() * 1e-5).max(1e-6);
+    let weld = weld_positions(mesh, eps);
+    let adj = build_adjacency(mesh, &weld);
+
+    let cos_cone = opts.angle_cone_deg.to_radians().cos();
+    let (chart_of, chart_normal) = grow_charts(&normals, &areas, &adj, cos_cone);
+    let num_charts = chart_normal.len();
+
+    // Project each triangle into its chart's tangent frame (coords in world units),
+    // tracking each chart's world-space bounding box.
+    let bases: Vec<(Vec3, Vec3)> = chart_normal.iter().map(|n| planar_basis(*n)).collect();
     let mut proj: Vec<[Vec2; 3]> = Vec::with_capacity(tri_count);
-    let mut cmin = vec![Vec2::splat(f32::INFINITY); num_clusters];
-    let mut cmax = vec![Vec2::splat(f32::NEG_INFINITY); num_clusters];
+    let mut cmin = vec![Vec2::splat(f32::INFINITY); num_charts];
+    let mut cmax = vec![Vec2::splat(f32::NEG_INFINITY); num_charts];
     for ti in 0..tri_count {
-        let (tu, tv) = bases[cluster_of[ti]];
+        let c = chart_of[ti];
+        let (tu, tv) = bases[c];
         let q = positions[ti].map(|pt| Vec2::new(pt.dot(tu), pt.dot(tv)));
-        let c = cluster_of[ti];
         for v in &q {
             cmin[c] = cmin[c].min(*v);
             cmax[c] = cmax[c].max(*v);
         }
         proj.push(q);
     }
-
-    // Pack clusters into the atlas (G17) and remap each triangle into its rect.
-    let csize: Vec<Vec2> = (0..num_clusters)
+    let csize: Vec<Vec2> = (0..num_charts)
         .map(|c| (cmax[c] - cmin[c]).max(Vec2::splat(1e-6)))
         .collect();
-    let rects = pack_rects(&csize);
+
+    // Choose density D so a `Medium` mesh lands near `target_atlas_px`. Total chart
+    // bbox area is the natural scale; √η accounts for shelf-packing slack.
+    const ETA: f32 = 0.65;
+    let a_world: f32 = csize.iter().map(|s| s.x * s.y).sum::<f32>().max(1e-6);
+    let d_base = ETA.sqrt() * opts.target_atlas_px as f32 / a_world.sqrt();
+    let d = d_base * opts.density.multiplier();
+
+    let (offsets, atlas, d, clamped) = pack_pixels(&csize, d, opts.gutter_px, opts.max_atlas);
+    let g = Vec2::splat(opts.gutter_px as f32);
+    let inv_atlas = 1.0 / atlas as f32;
 
     let tris: Vec<_> = (0..tri_count)
         .map(|ti| {
-            let c = cluster_of[ti];
-            let (offset, scale) = rects[c];
+            let c = chart_of[ti];
             let uv = proj[ti].map(|q| {
-                let local = (q - cmin[c]) * scale; // chart-local UV scaled into its rect
-                offset + local
+                let px = (q - cmin[c]) * d + offsets[c] + g;
+                px * inv_atlas
             });
             (positions[ti], normals[ti], uv)
         })
         .collect();
-    build_split(&tris)
-}
 
-/// G17 — Chart packing. Sort-by-area shelf packing of axis-aligned rects (given by
-/// world-space `sizes`) into the unit square, scaled uniformly to fit with a small
-/// gutter so nearest-neighbour sampling can't bleed across charts. Returns, per
-/// input rect, `(uv_offset, scale)` mapping its local [0,size] coords into [0,1].
-fn pack_rects(sizes: &[Vec2]) -> Vec<(Vec2, f32)> {
-    const GUTTER: f32 = 0.01; // empty margin (in UV) around each chart
-
-    // Aspect-preserving: pack at the raw sizes, then scale the whole layout to fit.
-    // Order tallest-first (classic shelf packing).
-    let mut order: Vec<usize> = (0..sizes.len()).collect();
-    order.sort_by(|&a, &b| sizes[b].y.total_cmp(&sizes[a].y));
-
-    // Shelf width in raw units: the widest chart, or the running average — use the
-    // total width spread so rows stay roughly square overall.
-    let total_w: f32 = sizes.iter().map(|s| s.x).sum();
-    let shelf_w = (total_w / (sizes.len() as f32).sqrt().max(1.0)).max(
-        sizes.iter().map(|s| s.x).fold(0.0_f32, f32::max), // never narrower than the widest chart
-    );
-
-    let mut placed = vec![(Vec2::ZERO, 0.0f32); sizes.len()];
-    let (mut x, mut y, mut shelf_h) = (0.0f32, 0.0f32, 0.0f32);
-    for &i in &order {
-        let s = sizes[i];
-        if x > 0.0 && x + s.x > shelf_w {
-            // New shelf.
-            y += shelf_h;
-            x = 0.0;
-            shelf_h = 0.0;
-        }
-        placed[i] = (Vec2::new(x, y), 1.0);
-        x += s.x;
-        shelf_h = shelf_h.max(s.y);
-    }
-    let total_h = y + shelf_h;
-
-    // Uniform scale so the whole layout fits [0,1]² inside the gutter margin.
-    let span = shelf_w.max(total_h).max(1e-6);
-    let scale = (1.0 - 2.0 * GUTTER) / span;
-    placed
-        .iter()
-        .map(|(pos, _)| (*pos * scale + Vec2::splat(GUTTER), scale))
-        .collect()
+    (
+        UnwrapResult {
+            mesh: build_split(&tris),
+            atlas_size: atlas,
+            clamped,
+            density_d: d,
+        },
+        chart_of,
+    )
 }
 
 #[cfg(test)]
@@ -316,94 +456,192 @@ mod tests {
     fn assert_uvs_in_unit(mesh: &Mesh) {
         for v in &mesh.vertices {
             assert!(
-                (0.0..=1.0).contains(&v.uv[0]) && (0.0..=1.0).contains(&v.uv[1]),
+                (-1e-4..=1.0 + 1e-4).contains(&v.uv[0])
+                    && (-1e-4..=1.0 + 1e-4).contains(&v.uv[1]),
                 "uv out of range: {:?}",
                 v.uv
             );
         }
     }
 
-    #[test]
-    fn box_unwrap_splits_and_stays_in_unit() {
-        let cube = Mesh::cube();
-        let u = box_unwrap(&cube);
-        // 12 triangles → 36 split vertices.
-        assert_eq!(u.vertices.len(), 36);
-        assert_eq!(u.indices.len(), 36);
-        assert!(!u.needs_uvs);
-        assert_uvs_in_unit(&u);
+    /// A flat quad (two triangles, +Z normal) at x ∈ [x0, x0+1], y ∈ [0,1].
+    fn quad(x0: f32) -> [Vertex; 6] {
+        let v = |x: f32, y: f32| Vertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+        };
+        [
+            v(x0, 0.0),
+            v(x0 + 1.0, 0.0),
+            v(x0 + 1.0, 1.0),
+            v(x0, 0.0),
+            v(x0 + 1.0, 1.0),
+            v(x0, 1.0),
+        ]
     }
 
-    #[test]
-    fn box_unwrap_separates_opposite_faces_into_different_cells() {
-        // +X and -X faces share an axis (row) but must land in different columns,
-        // so their UV cells don't overlap.
-        let cube = Mesh::cube();
-        let u = box_unwrap(&cube);
-        // Each triangle's centroid UV; collect the distinct cell (col,row) keys.
-        let mut cells = std::collections::HashSet::new();
-        for tri in u.indices.chunks_exact(3) {
-            let c = (tri.iter().map(|&i| Vec2::from(u.vertices[i as usize].uv)))
-                .fold(Vec2::ZERO, |a, b| a + b)
-                / 3.0;
-            let col = (c.x * 2.0).floor() as i32;
-            let row = (c.y * 3.0).floor() as i32;
-            cells.insert((col, row));
+    /// Two coplanar, same-normal quads that share no edge — the exact case the old
+    /// normal-only clustering stacked on top of each other.
+    fn two_separate_quads() -> Mesh {
+        let mut vertices = quad(0.0).to_vec();
+        vertices.extend_from_slice(&quad(5.0)); // gap so no shared vertices/edges
+        Mesh {
+            indices: (0..vertices.len() as u32).collect(),
+            vertices,
+            needs_normals: false,
+            needs_uvs: false,
         }
-        // A cube exercises all six axis cells.
-        assert_eq!(cells.len(), 6, "expected 6 box cells, got {cells:?}");
+    }
+
+    /// Per-triangle UV bounding boxes in pixel space, in output triangle order.
+    fn pixel_bboxes(mesh: &Mesh, atlas: u32) -> Vec<(Vec2, Vec2)> {
+        mesh.indices
+            .chunks_exact(3)
+            .map(|t| {
+                let uvs =
+                    [0, 1, 2].map(|k| Vec2::from(mesh.vertices[t[k] as usize].uv) * atlas as f32);
+                let mn = uvs.iter().copied().fold(Vec2::splat(f32::INFINITY), Vec2::min);
+                let mx = uvs
+                    .iter()
+                    .copied()
+                    .fold(Vec2::splat(f32::NEG_INFINITY), Vec2::max);
+                (mn, mx)
+            })
+            .collect()
+    }
+
+    fn disjoint(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> bool {
+        a.1.x <= b.0.x + 1e-3 || b.1.x <= a.0.x + 1e-3 || a.1.y <= b.0.y + 1e-3 || b.1.y <= a.0.y + 1e-3
     }
 
     #[test]
-    fn per_face_unwrap_gives_one_chart_per_triangle_in_unit() {
-        let cube = Mesh::cube();
-        let u = per_face_unwrap(&cube);
-        assert_eq!(u.vertices.len(), 36);
-        assert_uvs_in_unit(&u);
+    fn auto_unwrap_uvs_in_unit() {
+        let r = auto_unwrap(&Mesh::cube(), &UnwrapOptions::default());
+        assert_eq!(r.mesh.vertices.len(), 36); // 12 tris → 36 split verts
+        assert!(!r.mesh.needs_uvs);
+        assert!(r.atlas_size >= 8 && r.atlas_size.is_power_of_two());
+        assert_uvs_in_unit(&r.mesh);
     }
 
     #[test]
-    fn smart_unwrap_clusters_cube_into_six_and_stays_in_unit() {
-        // With a tight angle threshold the cube's six flat faces form six clusters;
-        // the packed charts must stay inside the unit square.
-        let cube = Mesh::cube();
-        let u = smart_unwrap(&cube, 30.0);
-        assert_eq!(u.vertices.len(), 36);
-        assert_uvs_in_unit(&u);
-    }
-
-    #[test]
-    fn packed_rects_stay_in_unit_and_dont_overlap() {
-        // A handful of differently-sized charts pack without leaving the atlas.
-        let sizes = [
-            Vec2::new(1.0, 0.5),
-            Vec2::new(0.3, 0.9),
-            Vec2::new(0.6, 0.6),
-            Vec2::new(0.2, 0.2),
-        ];
-        let rects = pack_rects(&sizes);
-        // Each chart's far corner (offset + size*scale) lands inside [0,1].
-        for (i, (offset, scale)) in rects.iter().enumerate() {
-            let far = *offset + sizes[i] * *scale;
+    fn packing_fills_the_atlas() {
+        // Density is scaled so the layout fills the power-of-two atlas rather than
+        // leaving the rounded-up slack blank. The global UV bbox must therefore reach
+        // the atlas edge in its limiting dimension, and cover a healthy area overall.
+        for mesh in [Mesh::cube(), two_separate_quads()] {
+            let r = auto_unwrap(&mesh, &UnwrapOptions::default());
+            let (mut mn, mut mx) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+            for v in &r.mesh.vertices {
+                let uv = Vec2::from(v.uv);
+                mn = mn.min(uv);
+                mx = mx.max(uv);
+            }
+            let span = mx - mn;
             assert!(
-                offset.x >= -1e-4
-                    && offset.y >= -1e-4
-                    && far.x <= 1.0 + 1e-4
-                    && far.y <= 1.0 + 1e-4,
-                "chart {i} escaped the atlas: {offset:?}..{far:?}"
+                span.x.max(span.y) >= 0.9,
+                "layout leaves the atlas mostly blank: span {span:?}"
             );
+            // Sum of chart bbox areas vs atlas — a lower bound on real coverage.
+            let bb = pixel_bboxes(&r.mesh, r.atlas_size);
+            let covered: f32 = bb.iter().map(|(a, b)| (b.x - a.x) * (b.y - a.y)).sum();
+            let frac = covered / (r.atlas_size * r.atlas_size) as f32;
+            assert!(frac >= 0.4, "atlas only {:.0}% covered", frac * 100.0);
         }
-        // No two chart rects overlap (axis-aligned overlap test).
-        for a in 0..sizes.len() {
-            for b in (a + 1)..sizes.len() {
-                let (ao, asz) = (rects[a].0, sizes[a] * rects[a].1);
-                let (bo, bsz) = (rects[b].0, sizes[b] * rects[b].1);
-                let disjoint = ao.x + asz.x <= bo.x + 1e-5
-                    || bo.x + bsz.x <= ao.x + 1e-5
-                    || ao.y + asz.y <= bo.y + 1e-5
-                    || bo.y + bsz.y <= ao.y + 1e-5;
-                assert!(disjoint, "charts {a} and {b} overlap");
+    }
+
+    #[test]
+    fn disconnected_same_normal_parts_get_separate_charts() {
+        let (r, chart_of) = unwrap_impl(&two_separate_quads(), &UnwrapOptions::default());
+        // The two quads (tris 0-1 and 2-3) must land in different charts...
+        let charts: std::collections::HashSet<_> = chart_of.iter().copied().collect();
+        assert!(charts.len() >= 2, "separate quads collapsed into one chart");
+        assert_ne!(chart_of[0], chart_of[2]);
+        // ...and occupy non-overlapping pixel regions (the old overlap bug).
+        let bb = pixel_bboxes(&r.mesh, r.atlas_size);
+        for a in [0usize, 1] {
+            for b in [2usize, 3] {
+                assert!(disjoint(bb[a], bb[b]), "charts overlap: {:?} {:?}", bb[a], bb[b]);
             }
         }
+        assert_uvs_in_unit(&r.mesh);
+    }
+
+    #[test]
+    fn welding_recovers_adjacency() {
+        // The cube ships as split vertices; welding must reconnect each face's two
+        // triangles into one chart (6 charts, 2 tris each) — without welding it would
+        // fragment into 12.
+        let (_, chart_of) = unwrap_impl(&Mesh::cube(), &UnwrapOptions::default());
+        let charts: std::collections::HashSet<_> = chart_of.iter().copied().collect();
+        assert_eq!(charts.len(), 6, "expected 6 charts, got {}", charts.len());
+        for c in charts {
+            let n = chart_of.iter().filter(|&&x| x == c).count();
+            assert_eq!(n, 2, "chart {c} has {n} tris, expected 2");
+        }
+    }
+
+    #[test]
+    fn constant_density_within_cone_bound() {
+        let opts = UnwrapOptions::default();
+        let r = auto_unwrap(&Mesh::cube(), &opts);
+        let d2 = r.density_d * r.density_d;
+        let cos2 = opts.angle_cone_deg.to_radians().cos().powi(2);
+        for t in r.mesh.indices.chunks_exact(3) {
+            let p = [0, 1, 2].map(|k| Vec3::from(r.mesh.vertices[t[k] as usize].position));
+            let uv =
+                [0, 1, 2].map(|k| Vec2::from(r.mesh.vertices[t[k] as usize].uv) * r.atlas_size as f32);
+            let world_area = tri_area(p);
+            let uv_area = 0.5 * (uv[1] - uv[0]).perp_dot(uv[2] - uv[0]).abs();
+            let ratio = uv_area / world_area; // texels² per world unit²
+            // Each cube face is flat (θ=0), so the ratio should equal D² exactly;
+            // the cone bound is the general guarantee.
+            assert!(
+                ratio >= d2 * cos2 - 1.0 && ratio <= d2 + 1.0,
+                "density ratio {ratio} outside [{}, {}]",
+                d2 * cos2,
+                d2
+            );
+        }
+    }
+
+    #[test]
+    fn atlas_within_max() {
+        let opts = UnwrapOptions {
+            max_atlas: 64,
+            target_atlas_px: 128, // natural atlas would exceed 64 → must clamp
+            ..Default::default()
+        };
+        let r = auto_unwrap(&Mesh::cube(), &opts);
+        assert!(r.atlas_size <= 64, "atlas {} exceeded max", r.atlas_size);
+        assert!(r.clamped, "expected density to be clamped");
+        assert_uvs_in_unit(&r.mesh);
+    }
+
+    #[test]
+    fn single_triangle_and_empty() {
+        let tri = Mesh {
+            vertices: vec![
+                Vertex { position: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
+                Vertex { position: [1.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
+                Vertex { position: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
+            ],
+            indices: vec![0, 1, 2],
+            needs_normals: false,
+            needs_uvs: false,
+        };
+        let r = auto_unwrap(&tri, &UnwrapOptions::default());
+        assert_eq!(r.mesh.vertices.len(), 3);
+        assert_uvs_in_unit(&r.mesh);
+
+        let empty = Mesh {
+            vertices: vec![],
+            indices: vec![],
+            needs_normals: false,
+            needs_uvs: false,
+        };
+        let r = auto_unwrap(&empty, &UnwrapOptions::default());
+        assert_eq!(r.mesh.vertices.len(), 0);
+        assert!(r.atlas_size >= 8);
     }
 }

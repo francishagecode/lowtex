@@ -16,7 +16,21 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 /// Bump when the on-disk layout changes incompatibly.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v2 (G28) added per-layer `effects`; v1 files load unchanged because the field
+/// is `#[serde(default)]` (an empty stack) and the version is only rejected if it
+/// is *newer* than this build understands.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// One per-layer effect, mirroring `effects::Effect` so serde stays off the core
+/// type (same split as `BlendMode` ↔ the `blend` index). The renderer converts.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub enum EffectDoc {
+    HueSatLight { hue: f32, sat: f32, light: f32 },
+    BrightnessContrast { brightness: f32, contrast: f32 },
+    Blur { radius: f32 },
+    Warp { amount: f32, scale: f32 },
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct LayerDoc {
@@ -28,6 +42,9 @@ pub struct LayerDoc {
     /// Base64 RGBA8, `tex_size`².
     pub color: String,
     pub mask: String,
+    /// Non-destructive effect stack (G28). Absent in v1 files → empty.
+    #[serde(default)]
+    pub effects: Vec<EffectDoc>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -110,6 +127,7 @@ mod tests {
                 opacity: 0.8,
                 color: encode_pixels(&[1, 2, 3, 4]),
                 mask: encode_pixels(&[255, 255, 255, 255]),
+                effects: vec![EffectDoc::Blur { radius: 2.5 }],
             }],
         };
         let path = std::env::temp_dir().join("lowtex_proj_test.lowtex");
@@ -124,6 +142,10 @@ mod tests {
         assert_eq!(
             decode_pixels(&back.layers[0].color).unwrap(),
             vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            back.layers[0].effects,
+            vec![EffectDoc::Blur { radius: 2.5 }]
         );
         let _ = std::fs::remove_file(&path);
     }

@@ -90,6 +90,8 @@ impl App {
         self.handle_ui_actions();
 
         if let Some(renderer) = self.renderer.as_mut() {
+            // Coalesce this frame's accumulated paint into one region upload before drawing.
+            renderer.flush_paint();
             renderer.render(Some(UiPaint {
                 jobs: &jobs,
                 textures_delta: &full_output.textures_delta,
@@ -108,6 +110,25 @@ impl App {
         // Push the latest palette settings (cheap; re-quantizes the texture).
         renderer.set_palette_settings(self.ui.palette);
 
+        // Push viewport display settings (G29): background color + grid toggle.
+        // The compass is always shown (and its axes are clickable), so no toggle.
+        renderer.set_bg_color(self.ui.bg_color);
+        renderer.set_show_grid(self.ui.show_grid);
+
+        // Push the texture filter mode (G30); cheap — rebuilds the sampler only on change.
+        renderer.set_texture_filter(self.ui.texture_filter);
+
+        // Push the directional-light sun before the mesh-effect actions below, so a
+        // Light effect applied this frame bakes against the current sun (the Top-down
+        // button, e.g., aims the sun up this same frame).
+        renderer.set_sun(self.ui.sun_dir(), self.ui.sun_shadow);
+
+        // Reserve the panel's strip on the left so the scene renders (and picks) in
+        // the region beside it. The panel width is in egui points; scale to the
+        // physical pixels the renderer's viewport works in.
+        let offset_px = self.ui.panel_width * self.egui_ctx.pixels_per_point();
+        renderer.set_view_offset(offset_px);
+
         // Push the paint target (color vs mask) + mask polarity (G11).
         renderer.set_paint_target(if self.ui.paint_mask {
             crate::renderer::PaintTarget::Mask
@@ -115,6 +136,15 @@ impl App {
             crate::renderer::PaintTarget::Color
         });
         renderer.set_mask_reveal(self.ui.mask_reveal);
+
+        // Push brush-image state: how tightly the loaded image tiles (whether the
+        // brush paints an image at all is just whether one is loaded in the renderer).
+        renderer.set_brush_tile(self.ui.brush_tile);
+
+        // Push fluid-brush state: whether the active tool is the fluid brush, and its
+        // color/viscosity/amount settings.
+        renderer.set_fluid(self.ui.tool == crate::ui::Tool::Fluid);
+        renderer.set_fluid_spec(self.ui.fluid_spec());
 
         let actions = std::mem::take(&mut self.ui.actions);
 
@@ -152,36 +182,13 @@ impl App {
                 }
             }
         }
-        if let Some(mode) = actions.unwrap {
-            renderer.apply_unwrap(mode);
-        }
-        if let Some(name) = &actions.apply_builtin_preset {
-            if let Err(e) = renderer.apply_builtin_preset(name) {
-                log::error!("{e}");
-            }
-        }
-        if actions.save_preset {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_file_name(format!("untitled.{}", crate::preset::PRESET_EXT))
-                .add_filter("lowtex preset", &[crate::preset::PRESET_EXT])
-                .save_file()
-            {
-                match renderer.save_preset(&path.to_string_lossy(), "Custom") {
-                    Ok(()) => log::info!("saved preset {}", path.display()),
-                    Err(e) => log::error!("{e}"),
-                }
-            }
-        }
-        if actions.load_preset {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("lowtex preset", &[crate::preset::PRESET_EXT])
-                .pick_file()
-            {
-                match renderer.load_and_apply_preset(&path.to_string_lossy()) {
-                    Ok(()) => log::info!("loaded preset {}", path.display()),
-                    Err(e) => log::error!("{e}"),
-                }
-            }
+        if let Some(density) = actions.unwrap {
+            let (atlas, clamped) = renderer.apply_unwrap(density);
+            self.ui.last_atlas_clamped = clamped;
+            log::info!(
+                "unwrapped → {atlas}×{atlas}{}",
+                if clamped { " (density clamped to GPU max)" } else { "" }
+            );
         }
         if let Some(tile) = actions.fill_material {
             if let Some(path) = rfd::FileDialog::new()
@@ -193,6 +200,24 @@ impl App {
                     Err(e) => log::error!("{e}"),
                 }
             }
+        }
+        if actions.load_brush_image {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Image", &["png", "jpg", "jpeg"])
+                .pick_file()
+            {
+                match renderer.load_brush_material(&path.to_string_lossy()) {
+                    Ok(()) => {
+                        self.ui.brush_image_loaded = true;
+                        log::info!("loaded brush image {}", path.display());
+                    }
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
+        if actions.clear_brush_image {
+            renderer.clear_brush_material();
+            self.ui.brush_image_loaded = false;
         }
         if let Some(indexed) = actions.export_png {
             let preset = self.ui.export_preset;
@@ -226,9 +251,6 @@ impl App {
             }
         }
 
-        if let Some(size) = actions.set_resolution {
-            renderer.set_texture_resolution(size);
-        }
         if actions.save_png {
             if let Some(path) = rfd::FileDialog::new()
                 .set_file_name("texture.png")
@@ -291,31 +313,93 @@ impl App {
         if let Some((i, b)) = actions.set_layer_blend {
             renderer.set_layer_blend(i, b);
         }
+        if let Some((i, name)) = actions.set_layer_name {
+            renderer.rename_layer(i, name);
+        }
+
+        // Per-layer effects (G28) — all target the active layer.
+        if let Some(kind) = actions.add_effect {
+            renderer.add_effect(kind);
+        }
+        if let Some(idx) = actions.remove_effect {
+            renderer.remove_effect(idx);
+        }
+        if let Some(idx) = actions.move_effect_up {
+            renderer.move_effect(idx, true);
+        }
+        if let Some(idx) = actions.move_effect_down {
+            renderer.move_effect(idx, false);
+        }
+        if let Some((idx, fx)) = actions.set_effect {
+            renderer.set_effect(idx, fx);
+        }
 
         // Mesh effects — bake mesh maps (cached) then add a generated layer or fill
         // the active layer's mask from a baked map.
-        if let Some(lv) = actions.apply_ao {
-            renderer.apply_ao_layer(lv);
+        if let Some((lv, noise)) = actions.apply_ao {
+            renderer.apply_ao_layer(lv, noise);
         }
-        if let Some(lv) = actions.apply_highlight {
-            renderer.apply_highlight_layer(lv);
+        if let Some((lv, noise)) = actions.apply_highlight {
+            renderer.apply_highlight_layer(lv, noise);
         }
-        if let Some(lv) = actions.apply_dirt {
-            renderer.apply_dirt_layer(lv);
+        if let Some((lv, noise)) = actions.apply_dirt {
+            renderer.apply_dirt_layer(lv, noise);
         }
-        if let Some(lv) = actions.apply_edge_wear {
-            renderer.apply_edge_wear_layer(lv);
+        if let Some((lv, noise)) = actions.apply_edge_wear {
+            renderer.apply_edge_wear_layer(lv, noise);
         }
-        if let Some((src, lv, color)) = actions.apply_tint {
+        if let Some((src, lv, color, noise)) = actions.apply_tint {
             let rgb = [
                 (color[0] * 255.0).round() as u8,
                 (color[1] * 255.0).round() as u8,
                 (color[2] * 255.0).round() as u8,
             ];
-            renderer.add_map_layer("Tint", src, lv, rgb, crate::layers::BlendMode::Normal);
+            renderer.add_map_layer("Tint", src, lv, rgb, crate::layers::BlendMode::Normal, noise);
         }
-        if let Some((src, lv)) = actions.mask_from_map {
-            renderer.fill_active_mask_from_map(src, lv);
+        if let Some((src, lv, noise)) = actions.mask_from_map {
+            renderer.fill_active_mask_from_map(src, lv, noise);
+        }
+        // Directional-light effects: a warm highlight on the lit faces, and the
+        // top-down dust look (the UI has already aimed the sun straight up).
+        if let Some((lv, noise)) = actions.apply_sun {
+            renderer.add_map_layer(
+                "Sunlight",
+                crate::bake::MapSource::Light,
+                lv,
+                [255, 244, 214],
+                crate::layers::BlendMode::Screen,
+                noise,
+            );
+        }
+        if let Some((lv, noise)) = actions.apply_top_dust {
+            renderer.add_map_layer(
+                "Top dust",
+                crate::bake::MapSource::Light,
+                lv,
+                [188, 180, 160],
+                crate::layers::BlendMode::Normal,
+                noise,
+            );
+        }
+        if let Some((src, lv, low, high, noise)) = actions.apply_gradient {
+            let to_u8 = |c: [f32; 3]| {
+                [
+                    (c[0] * 255.0).round() as u8,
+                    (c[1] * 255.0).round() as u8,
+                    (c[2] * 255.0).round() as u8,
+                ]
+            };
+            renderer.add_gradient_layer(
+                "Gradient",
+                src,
+                lv,
+                crate::bake::Gradient {
+                    low: to_u8(low),
+                    high: to_u8(high),
+                },
+                crate::layers::BlendMode::Normal,
+                noise,
+            );
         }
 
         // Keep the UI mirrors in sync with the renderer.
@@ -333,6 +417,7 @@ impl App {
                 visible: l.visible,
                 opacity: l.opacity,
                 blend: l.blend,
+                effects: l.effects.clone(),
             })
             .collect();
     }
@@ -445,10 +530,16 @@ impl ApplicationHandler for App {
                 }
                 match (button, pressed) {
                     (MouseButton::Left, true) => {
+                        // A click on the orientation compass snaps the view down that
+                        // axis instead of painting the mesh behind the gizmo.
+                        if renderer.click_compass(self.mouse_pos) {
+                            window.request_redraw();
+                            return;
+                        }
                         // The brush starts a drag-stroke; the fills are one-shot
                         // bucket clicks that commit their own single undo step.
                         match self.ui.tool {
-                            crate::ui::Tool::Brush => {
+                            crate::ui::Tool::Brush | crate::ui::Tool::Fluid => {
                                 self.drag = Drag::Paint;
                                 renderer.begin_stroke();
                                 renderer.paint_at(self.mouse_pos, &self.ui.brush);

@@ -177,6 +177,37 @@ impl Palette {
             px[2] = q[2];
         }
     }
+
+    /// Quantize only the texels inside `rect` of a full-size `width`-wide RGBA8 image,
+    /// in place. Byte-identical to `quantize_rgba` on those texels: the Bayer dither
+    /// bias is a pure function of (x, y), so a sub-rect quantizes exactly as the whole
+    /// image would. The dirty-rectangle counterpart used by the per-stroke refresh.
+    pub fn quantize_region(
+        &self,
+        pixels: &mut [u8],
+        width: u32,
+        rect: crate::paint::TexRect,
+        dither: bool,
+        strength: f32,
+    ) {
+        if self.colors.is_empty() {
+            return;
+        }
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                let i = ((y * width + x) * 4) as usize;
+                let bias = if dither {
+                    (bayer4(x as usize, y as usize) - 0.5) * strength
+                } else {
+                    0.0
+                };
+                let q = self.nearest_u8([pixels[i], pixels[i + 1], pixels[i + 2]], bias);
+                pixels[i] = q[0];
+                pixels[i + 1] = q[1];
+                pixels[i + 2] = q[2];
+            }
+        }
+    }
 }
 
 /// 4×4 Bayer threshold (normalized 0..1), used for ordered dithering.
@@ -219,6 +250,36 @@ mod tests {
                 d < 0.01,
                 "no palette color near {target:?} (closest {near:?})"
             );
+        }
+    }
+
+    #[test]
+    fn quantize_region_matches_full() {
+        use crate::paint::TexRect;
+        let pal = Palette::builtins().remove(0); // PICO-8
+        let w = 8u32;
+        let mut full = vec![0u8; (w * w * 4) as usize];
+        for (t, px) in full.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[(t * 5) as u8, (t * 9) as u8, (t * 3) as u8, 255]);
+        }
+        let mut region = full.clone();
+        pal.quantize_rgba(&mut full, w, true, 0.06);
+        let rect = TexRect {
+            x0: 1,
+            y0: 2,
+            x1: 7,
+            y1: 6,
+        };
+        pal.quantize_region(&mut region, w, rect, true, 0.06);
+        // Inside the rect the region path must match the full quantize exactly (Bayer
+        // bias is positional); outside, region is left unquantized.
+        for y in 0..w {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                if rect.contains(x, y) {
+                    assert_eq!(region[i..i + 3], full[i..i + 3], "rect texel ({x},{y})");
+                }
+            }
         }
     }
 

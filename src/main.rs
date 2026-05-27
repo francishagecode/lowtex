@@ -16,6 +16,7 @@ mod bake;
 mod bleed;
 mod bvh;
 mod camera;
+mod effects;
 mod export;
 mod fill;
 mod history;
@@ -26,6 +27,7 @@ mod model;
 mod noise;
 mod paint;
 mod palette;
+mod particle;
 mod preset;
 mod project;
 mod renderer;
@@ -75,13 +77,18 @@ struct Args {
     fill_object: bool,
     fill_island: bool,
     fill_face: bool,
-    /// Headless verification: unwrap the mesh (box|smart|per-face) before capture.
-    unwrap: Option<String>,
+    /// Headless verification: auto-unwrap the mesh before capture, at the texel
+    /// density given by `--density` (low|medium|high; default medium).
+    unwrap: bool,
+    density: Option<String>,
     /// Headless verification: export an indexed PNG to this path (needs --quantize).
     export_indexed: Option<String>,
     /// Headless verification: fill the base layer with a material image (tiled).
     material: Option<String>,
     material_tile: f32,
+    /// Headless verification: paint one stroke with the texture brush, using this
+    /// image (UV-tiled by `material_tile`) — the brush counterpart to `--material`.
+    texture_brush: Option<String>,
     /// Headless verification: material on a NEW layer, masked by AO (Cavities) —
     /// the "moss in the crevices" workflow.
     material_crevice: bool,
@@ -121,10 +128,12 @@ fn parse_args() -> Args {
         fill_object: false,
         fill_island: false,
         fill_face: false,
-        unwrap: None,
+        unwrap: false,
+        density: None,
         export_indexed: None,
         material: None,
         material_tile: 4.0,
+        texture_brush: None,
         material_crevice: false,
         open_project: None,
         save_project: None,
@@ -164,7 +173,8 @@ fn parse_args() -> Args {
             "--fill-object" => args.fill_object = true,
             "--fill-island" => args.fill_island = true,
             "--fill-face" => args.fill_face = true,
-            "--unwrap" => args.unwrap = it.next(),
+            "--unwrap" => args.unwrap = true,
+            "--density" => args.density = it.next(),
             "--export-indexed" => args.export_indexed = it.next(),
             "--material" => args.material = it.next(),
             "--material-tile" => {
@@ -172,6 +182,7 @@ fn parse_args() -> Args {
                     args.material_tile = v;
                 }
             }
+            "--texture-brush" => args.texture_brush = it.next(),
             "--material-crevice" => args.material_crevice = true,
             "--open-project" => args.open_project = it.next(),
             "--save-project" => args.save_project = it.next(),
@@ -241,13 +252,13 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         }
     }
 
-    if let Some(m) = &args.unwrap {
-        let mode = match m.as_str() {
-            "smart" => unwrap::UnwrapMode::Smart,
-            "per-face" | "perface" => unwrap::UnwrapMode::PerFace,
-            _ => unwrap::UnwrapMode::Box,
+    if args.unwrap {
+        let density = match args.density.as_deref() {
+            Some("low") => unwrap::Density::Low,
+            Some("high") => unwrap::Density::High,
+            _ => unwrap::Density::Medium,
         };
-        renderer.apply_unwrap(mode);
+        renderer.apply_unwrap(density);
     }
 
     if let Some(path) = &args.material {
@@ -257,8 +268,11 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
             if let Err(e) = renderer.fill_active_with_material(path, args.material_tile) {
                 log::error!("{e}");
             }
-            renderer
-                .fill_active_mask_from_map(bake::MapSource::Cavities, bake::Levels::amount(1.0));
+            renderer.fill_active_mask_from_map(
+                bake::MapSource::Cavities,
+                bake::Levels::amount(1.0),
+                None,
+            );
         } else {
             match renderer.fill_active_with_material(path, args.material_tile) {
                 Ok(()) => log::info!("filled with material {path}"),
@@ -363,6 +377,24 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         renderer.paint_segment((cx - 80.0, cy - 50.0), (cx + 80.0, cy + 50.0), &brush);
         renderer.end_stroke();
     }
+    if let Some(path) = &args.texture_brush {
+        // Paint one wide diagonal stroke that reveals the tiled image only where it
+        // lands — the rest of the front face keeps the base checkerboard.
+        match renderer.load_brush_material(path) {
+            Ok(()) => {
+                renderer.set_brush_tile(args.material_tile);
+                let tb = Brush {
+                    radius: args.brush_size.unwrap_or(16.0),
+                    ..brush
+                };
+                renderer.begin_stroke();
+                renderer.paint_segment((cx - 90.0, cy - 55.0), (cx + 90.0, cy + 55.0), &tb);
+                renderer.end_stroke();
+                log::info!("painted texture-brush stroke with {path}");
+            }
+            Err(e) => log::error!("{e}"),
+        }
+    }
     if args.orbit_deg != 0.0 {
         renderer.orbit_view_radians(args.orbit_deg.to_radians(), 0.0);
         if args.paint {
@@ -371,10 +403,10 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
     }
 
     if let Some(s) = args.ao {
-        renderer.apply_ao_layer(crate::bake::Levels::amount(s));
+        renderer.apply_ao_layer(crate::bake::Levels::amount(s), None);
     }
     if let Some(s) = args.highlight {
-        renderer.apply_highlight_layer(crate::bake::Levels::amount(s));
+        renderer.apply_highlight_layer(crate::bake::Levels::amount(s), None);
     }
     if args.fill_face {
         renderer.fill_face_at((cx, cy), &brush);
@@ -424,14 +456,17 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         }
     }
 
-    // Optionally build one egui frame to draw the panel into the screenshot.
+    // Optionally build one egui frame to draw the panel into the screenshot. Offset
+    // the scene by the panel width so the headless capture matches the live app.
     let ui_paint = if args.ui {
-        Some(build_headless_ui(width, height))
+        let built = build_headless_ui(width, height);
+        renderer.set_view_offset(built.3 * built.2);
+        Some(built)
     } else {
         None
     };
     let (pixels, w, h) =
-        renderer.capture(ui_paint.as_ref().map(|(jobs, td, ppp)| renderer::UiPaint {
+        renderer.capture(ui_paint.as_ref().map(|(jobs, td, ppp, _)| renderer::UiPaint {
             jobs,
             textures_delta: td,
             pixels_per_point: *ppp,
@@ -446,7 +481,7 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
 fn build_headless_ui(
     width: u32,
     height: u32,
-) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32) {
+) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32, f32) {
     let ctx = egui::Context::default();
     ui::install_style(&ctx);
     let raw_input = egui::RawInput {
@@ -459,5 +494,5 @@ fn build_headless_ui(
     let mut state = ui::UiState::default();
     let out = ctx.run(raw_input, |ctx| ui::build(ctx, &mut state));
     let jobs = ctx.tessellate(out.shapes, out.pixels_per_point);
-    (jobs, out.textures_delta, out.pixels_per_point)
+    (jobs, out.textures_delta, out.pixels_per_point, state.panel_width)
 }

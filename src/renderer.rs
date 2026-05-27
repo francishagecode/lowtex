@@ -31,13 +31,13 @@ use glam::Vec2;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::bake::{Levels, MapSource};
+use crate::bake::{Gradient, Levels, MapSource, NoiseMod};
 use crate::bvh::Bvh;
 use crate::camera::Camera;
 use crate::history::History;
 use crate::layers::Layers;
 use crate::mesh::{Mesh, Vertex};
-use crate::paint::{Brush, Ray, Texture as PaintTexture};
+use crate::paint::{Brush, Ray, TexRect, Texture as PaintTexture};
 use crate::palette::Palette;
 
 const TEX_SIZE: u32 = 128; // PSX-scale. Bump to 256 if you want.
@@ -81,6 +81,35 @@ impl Default for PaletteSettings {
     }
 }
 
+/// How the painted texture is filtered when sampled onto the model (G30). The
+/// sampler does the work — the shader's `textureSample` respects whichever mode
+/// the sampler is built with, so switching is just a sampler + bind-group rebuild.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextureFilter {
+    /// Nearest-neighbor — crisp texels, the default PSX look.
+    #[default]
+    Nearest,
+    /// Bilinear — smooths the texture; some painters prefer the softened preview.
+    Linear,
+}
+
+impl TextureFilter {
+    fn wgpu(self) -> wgpu::FilterMode {
+        match self {
+            TextureFilter::Nearest => wgpu::FilterMode::Nearest,
+            TextureFilter::Linear => wgpu::FilterMode::Linear,
+        }
+    }
+
+    /// Short label for the picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            TextureFilter::Nearest => "Nearest (crisp)",
+            TextureFilter::Linear => "Linear (smooth)",
+        }
+    }
+}
+
 /// What the brush paints into (G11).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaintTarget {
@@ -88,6 +117,85 @@ pub enum PaintTarget {
     Color,
     /// The active layer's reveal mask.
     Mask,
+}
+
+/// A colored line-list vertex for the ground grid. Position is in the space the
+/// bound view-proj expects; color is linear RGB (see lines.wgsl).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LineVertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+impl LineVertex {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+            ],
+        }
+    }
+}
+
+/// The compass's on-screen footprint, in physical pixels: a square of this side
+/// (capped to the scene region) inset from the bottom-left corner by this margin.
+const COMPASS_SIZE_PX: f32 = 110.0;
+const COMPASS_MARGIN_PX: f32 = 12.0;
+
+/// A vertex of the thick-line compass. Each axis segment is a quad (6 of these),
+/// so a vertex carries the *whole* segment (`start`, `end`) plus its corner in
+/// `param` (`[t, side]`); compass.wgsl projects the endpoints and offsets the
+/// corner sideways to give the line width. Color is linear RGB.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CompassVertex {
+    start: [f32; 3],
+    end: [f32; 3],
+    color: [f32; 3],
+    param: [f32; 2], // x = t (0 at start, 1 at end); y = side (signed half-width)
+}
+
+impl CompassVertex {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 24,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 36,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
+        }
+    }
 }
 
 pub struct Renderer {
@@ -102,10 +210,31 @@ pub struct Renderer {
     index_buffer: wgpu::Buffer,
     index_count: u32,
 
+    // Viewport furniture (G29): the ground grid is unlit 1px lines (depth Less, so
+    // the mesh occludes lines behind it); the orientation compass is thick
+    // screen-space quads (depth Always) drawn last in its own corner viewport, so
+    // it's always on top. The compass is permanent and its axes are clickable.
+    line_pipeline: wgpu::RenderPipeline,    // grid: line list, depth Less, no write
+    compass_pipeline: wgpu::RenderPipeline, // compass: triangle quads, depth Always
+    grid_bind_group: wgpu::BindGroup,       // bound to the scene view-proj
+    grid_vertex_buffer: wgpu::Buffer,
+    grid_vertex_count: u32,
+    compass_uniform: wgpu::Buffer, // rotation-only view-proj, refreshed with the camera
+    compass_bind_group: wgpu::BindGroup,
+    compass_vertex_buffer: wgpu::Buffer,
+    compass_vertex_count: u32,
+    // Background clear color, in sRGB (what the picker shows); converted to linear
+    // at clear time. Grid visibility toggle.
+    bg_color: [f32; 3],
+    show_grid: bool,
+
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    // Which filter mode `sampler` was built with, so set_texture_filter can skip
+    // the rebuild when nothing changed (the App pushes it every frame).
+    texture_filter: TextureFilter,
 
     paint_texture_gpu: wgpu::Texture,
     // Layer stack (G10); painting targets the active layer, composited bottom-up
@@ -118,10 +247,34 @@ pub struct Renderer {
     stroke_base: Vec<u8>,
     stroke_coverage: Vec<f32>,
 
+    // Dirty-rectangle paint refresh: a CPU-side mirror of the GPU paint texture (the
+    // composited + quantized + gutter-bled display image) plus the texel rect touched
+    // since the last upload. Stamps only mark `dirty_rect`; `flush_paint` (once per
+    // frame) recomposites/quantizes/bleeds/uploads just that rect, so paint cost is
+    // proportional to brush area, not texture size. Non-stroke edits still go through
+    // the full `refresh_display_texture`, which keeps `display_buf` in sync.
+    display_buf: Vec<u8>,
+    dirty_rect: Option<TexRect>,
+
     // Whether the brush paints the active layer's color or its reveal mask (G11),
     // and (in mask mode) whether it reveals (white) or hides (black).
     paint_target: PaintTarget,
     mask_reveal: bool,
+
+    // Brush image: an optional image painted (UV-tiled) along the stroke instead of a
+    // solid color. When set, the color stamp samples `brush_material`; when `None` the
+    // brush paints its solid color. `brush_tile` is how tightly the image repeats.
+    brush_material: Option<crate::material::Material>,
+    brush_tile: f32,
+
+    // Fluid particle brush (oil/water/blood): the active-tool flag + settings synced
+    // from the UI, plus the cursor travel since the last burst — bursts are spaced
+    // along the drag (not emitted every sample) so a slow drag doesn't flood. The
+    // seed advances per burst so successive dabs lay down varied streaks.
+    fluid: bool,
+    fluid_spec: crate::particle::FluidSpec,
+    fluid_travel: f32,
+    fluid_seed: u32,
 
     // Undo/redo over the layer stack. A stroke records one entry on release (via
     // `pending` + `stroke_dirty`); discrete layer ops record one each.
@@ -146,6 +299,11 @@ pub struct Renderer {
     max_texture_dim: u32,
 
     camera: Camera,
+    // Physical pixels reserved on the left of the surface for the UI panel. The
+    // scene viewport (and the camera aspect + pick mapping) shift right by this, so
+    // the model sits centered in the region the panel doesn't cover, not the whole
+    // window. Pushed from the UI each frame; 0 in headless.
+    view_offset_x: f32,
     mesh: Mesh,
     bvh: Bvh,
     // Cached baked mesh maps (AO/edge) at the current resolution; invalidated on
@@ -163,6 +321,11 @@ pub struct Renderer {
     // as each generator runs so the current look can be saved as a reusable,
     // mesh-independent preset. Approximate: manual layer deletes aren't reflected.
     recipe: Vec<crate::preset::PresetLayer>,
+    // Sun for the directional-light map (G-light): the direction *toward* the light
+    // and whether it casts shadows. Pushed from the UI each frame; the light channel
+    // in `mesh_maps` is (re)baked lazily for these whenever a Light effect is applied.
+    sun_dir: glam::Vec3,
+    sun_shadow: bool,
 }
 
 impl Renderer {
@@ -286,20 +449,14 @@ impl Renderer {
         let tex_size = TEX_SIZE;
         let base = make_checkerboard(tex_size, tex_size);
         let paint_texture_gpu = make_paint_texture(&device, &base);
-        upload_texture(&queue, &paint_texture_gpu, &base);
+        // `display_buf` and the GPU texture are populated by the `refresh_display_texture`
+        // call at the end of `build` (which composites + uploads the base layer).
         let layers = Layers::new(base);
 
-        // Nearest-neighbor sampler — pure PSX, no filtering.
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("nearest sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
+        // Default to nearest-neighbor — pure PSX, no filtering. Switchable at runtime
+        // via set_texture_filter for painters who prefer a smoothed preview.
+        let texture_filter = TextureFilter::default();
+        let sampler = make_sampler(&device, texture_filter);
 
         // Uniform buffer: the view-projection matrix.
         let camera = Camera::new(width as f32 / height as f32);
@@ -402,6 +559,141 @@ impl Renderer {
 
         let depth_view = make_depth_view(&device, width, height);
 
+        // --- Viewport furniture: grid + compass line pipelines (G29) ---
+        // A minimal bind group layout: just the view-proj uniform (no texture).
+        let line_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("line bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("lines shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/lines.wgsl").into()),
+        });
+        let line_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("line pipeline layout"),
+            bind_group_layouts: &[&line_bgl],
+            push_constant_ranges: &[],
+        });
+        // The grid: 1px lines, occluded by the mesh (depth Less, no write).
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("line pipeline"),
+            layout: Some(&line_pl),
+            vertex: wgpu::VertexState {
+                module: &line_shader,
+                entry_point: "vs_main",
+                buffers: &[LineVertex::layout()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &line_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // The compass: thick quads expanded in screen space (its own shader),
+        // triangle list, always on top (depth Always, no write). Shares the line
+        // bind-group layout (just the rotation-only view-proj uniform).
+        let compass_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("compass shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/compass.wgsl").into()),
+        });
+        let compass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("compass pipeline"),
+            layout: Some(&line_pl),
+            vertex: wgpu::VertexState {
+                module: &compass_shader,
+                entry_point: "vs_main",
+                buffers: &[CompassVertex::layout()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &compass_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // the quads can wind either way as the camera orbits
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Grid shares the scene's view-proj; compass gets its own (rotation-only).
+        let grid_bind_group = make_line_bind_group(&device, &line_bgl, &uniform_buffer);
+        let grid_verts = build_grid();
+        let grid_vertex_count = grid_verts.len() as u32;
+        let grid_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("grid vertices"),
+            contents: bytemuck::cast_slice(&grid_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let compass_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("compass uniform"),
+            contents: bytemuck::cast_slice(&[camera.gizmo_view_proj().to_cols_array_2d()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let compass_bind_group = make_line_bind_group(&device, &line_bgl, &compass_uniform);
+        let compass_verts = build_compass();
+        let compass_vertex_count = compass_verts.len() as u32;
+        let compass_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("compass vertices"),
+            contents: bytemuck::cast_slice(&compass_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         // Palette quantize is applied to the texture on the CPU (G8).
         let palette = Palette::builtins().remove(0); // PICO-8 by default
         let palette_settings = PaletteSettings::default();
@@ -412,7 +704,7 @@ impl Renderer {
         let stroke_base = layers.active_tex().pixels.clone();
         let stroke_coverage = vec![0.0; (tex_size * tex_size) as usize];
 
-        Self {
+        let mut r = Self {
             window: None,
             surface: None,
             device,
@@ -422,17 +714,37 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             index_count,
+            line_pipeline,
+            compass_pipeline,
+            grid_bind_group,
+            grid_vertex_buffer,
+            grid_vertex_count,
+            compass_uniform,
+            compass_bind_group,
+            compass_vertex_buffer,
+            compass_vertex_count,
+            bg_color: [0.221, 0.272, 0.313], // sRGB of the old dark teal clear
+            show_grid: true,
             uniform_buffer,
             bind_group,
             bind_group_layout,
             sampler,
+            texture_filter,
             paint_texture_gpu,
             layers,
             tex_size,
             stroke_base,
             stroke_coverage,
+            display_buf: Vec::new(),
+            dirty_rect: None,
             paint_target: PaintTarget::Color,
             mask_reveal: false,
+            brush_material: None,
+            brush_tile: 4.0,
+            fluid: false,
+            fluid_spec: crate::particle::FluidSpec::default(),
+            fluid_travel: 0.0,
+            fluid_seed: 0,
             history: History::new(HISTORY_CAP),
             pending: None,
             stroke_dirty: false,
@@ -442,13 +754,20 @@ impl Renderer {
             egui_renderer: None,
             max_texture_dim,
             camera,
+            view_offset_x: 0.0,
             mesh,
             bvh,
             mesh_maps: None,
             fill_map: None,
             coverage: std::cell::RefCell::new(None),
             recipe: Vec::new(),
-        }
+            // Default sun matches the shader's fixed key light (warm, high, front-right).
+            sun_dir: glam::Vec3::new(0.4, 0.8, 0.5).normalize(),
+            sun_shadow: true,
+        };
+        // Composite the base layer into `display_buf` and upload it to the GPU texture.
+        r.refresh_display_texture();
+        r
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -466,11 +785,117 @@ impl Renderer {
         }
         self.depth_view = make_depth_view(&self.device, width, height);
 
-        self.camera.aspect = width as f32 / height as f32;
+        // Aspect follows the scene viewport (the panel-free region), not the window.
+        self.view_offset_x = self.view_offset_x.min(width as f32);
+        self.update_aspect();
         self.update_uniforms();
     }
 
-    /// Write the view-projection matrix to the GPU.
+    /// Reserve `offset_px` physical pixels on the left of the surface for the UI
+    /// panel. Shifts the scene viewport, camera aspect, and pick mapping right to
+    /// match, so the model stays centered in the visible region rather than the
+    /// whole window. Cheap and idempotent — pushed from the UI every frame.
+    pub fn set_view_offset(&mut self, offset_px: f32) {
+        let offset = offset_px.clamp(0.0, self.config.width as f32);
+        if (offset - self.view_offset_x).abs() > f32::EPSILON {
+            self.view_offset_x = offset;
+            self.update_aspect();
+            self.update_uniforms();
+        }
+    }
+
+    /// The scene viewport in physical pixels — `(x, y, w, h)`. The left strip of
+    /// width `view_offset_x` belongs to the UI panel; the 3D scene fills the rest.
+    fn scene_viewport(&self) -> (f32, f32, f32, f32) {
+        let w = (self.config.width as f32 - self.view_offset_x).max(1.0);
+        (self.view_offset_x, 0.0, w, self.config.height.max(1) as f32)
+    }
+
+    /// The compass's square viewport in physical pixels — `(x, y, size)`, top-left
+    /// origin (as wgpu viewports and the cursor both use). Tucked into the
+    /// bottom-left of the scene region so the panel never covers it. `None` when
+    /// the scene region is too small to fit the gizmo. Shared by the renderer (to
+    /// place the draw) and the click handler (to hit-test the axes), so the two
+    /// can't drift apart.
+    fn compass_rect(&self) -> Option<(f32, f32, f32)> {
+        let (vx, vy, vw, vh) = self.scene_viewport();
+        let size = COMPASS_SIZE_PX.min(vw).min(vh);
+        if vw < size + COMPASS_MARGIN_PX || vh < size + COMPASS_MARGIN_PX {
+            return None;
+        }
+        let x = vx + COMPASS_MARGIN_PX;
+        let y = vy + vh - size - COMPASS_MARGIN_PX;
+        Some((x, y, size))
+    }
+
+    /// Hit-test a click (physical pixels, top-left origin) against the compass and,
+    /// if it lands on an axis, snap the camera to look down that axis. Returns
+    /// whether the click was consumed (so the caller skips painting the mesh
+    /// behind the gizmo). The match is directional, not pixel-exact: we compare the
+    /// click's direction from the gizmo center against each projected axis, so the
+    /// whole arm — not just its tip — is a target.
+    pub fn click_compass(&mut self, mouse_px: (f32, f32)) -> bool {
+        let Some(dir) = self.compass_axis_at(Vec2::new(mouse_px.0, mouse_px.1)) else {
+            return false;
+        };
+        self.camera.look_from(dir);
+        self.update_uniforms();
+        true
+    }
+
+    /// Which world axis (a unit direction) a click selects on the compass, if any.
+    /// Projects each of the six axis directions through the gizmo's rotation-only
+    /// view-proj into the square viewport, then picks the one whose screen
+    /// direction the click best aligns with. A small dead zone at the center
+    /// (where the axes overlap) selects nothing.
+    fn compass_axis_at(&self, mouse_px: Vec2) -> Option<glam::Vec3> {
+        let (cx, cy, size) = self.compass_rect()?;
+        let lx = mouse_px.x - cx;
+        let ly = mouse_px.y - cy;
+        if lx < 0.0 || ly < 0.0 || lx > size || ly > size {
+            return None;
+        }
+        // Centered coordinates, y up (NDC convention) to match the projection.
+        let click = Vec2::new((lx / size) * 2.0 - 1.0, 1.0 - (ly / size) * 2.0);
+        if click.length() < 0.18 {
+            return None; // center dead zone
+        }
+        let click_dir = click.normalize();
+
+        let vp = self.camera.gizmo_view_proj();
+        let axes = [
+            glam::Vec3::X,
+            glam::Vec3::NEG_X,
+            glam::Vec3::Y,
+            glam::Vec3::NEG_Y,
+            glam::Vec3::Z,
+            glam::Vec3::NEG_Z,
+        ];
+        let mut best: Option<glam::Vec3> = None;
+        let mut best_dot = 0.5_f32; // require within ~60° of an axis to count
+        for axis in axes {
+            let tip = vp.project_point3(axis); // NDC, y up
+            let screen = Vec2::new(tip.x, tip.y);
+            if screen.length() < 1e-4 {
+                continue; // axis points (near) straight at the camera — ambiguous
+            }
+            let d = click_dir.dot(screen.normalize());
+            if d > best_dot {
+                best_dot = d;
+                best = Some(axis);
+            }
+        }
+        best
+    }
+
+    /// Match the camera's aspect ratio to the scene viewport (not the window).
+    fn update_aspect(&mut self) {
+        let (_, _, w, h) = self.scene_viewport();
+        self.camera.aspect = w / h;
+    }
+
+    /// Write the view-projection matrix to the GPU. Also refreshes the compass
+    /// gizmo's rotation-only matrix, so it tracks the camera as it orbits.
     fn update_uniforms(&self) {
         let view_proj = self.camera.view_proj();
         self.queue.write_buffer(
@@ -478,6 +903,42 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&[view_proj.to_cols_array_2d()]),
         );
+        self.queue.write_buffer(
+            &self.compass_uniform,
+            0,
+            bytemuck::cast_slice(&[self.camera.gizmo_view_proj().to_cols_array_2d()]),
+        );
+    }
+
+    /// Set the viewport background color (sRGB, as the picker shows it). Stored
+    /// and converted to linear at clear time.
+    pub fn set_bg_color(&mut self, srgb: [f32; 3]) {
+        self.bg_color = srgb;
+    }
+
+    /// Toggle the ground grid.
+    pub fn set_show_grid(&mut self, on: bool) {
+        self.show_grid = on;
+    }
+
+    /// How far to bleed island colors into the gutter. `LOWTEX_BLEED_PAD` overrides
+    /// the default (`BLEED_PAD`) for tuning/debugging.
+    fn bleed_pad(&self) -> u32 {
+        std::env::var("LOWTEX_BLEED_PAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(BLEED_PAD)
+    }
+
+    /// Lazily build (and cache) the UV-coverage mask for the current resolution.
+    fn ensure_coverage(&self) {
+        let mut slot = self.coverage.borrow_mut();
+        let need = slot
+            .as_ref()
+            .is_none_or(|c| c.len() != (self.tex_size * self.tex_size) as usize);
+        if need {
+            *slot = Some(crate::bleed::coverage(&self.mesh, self.tex_size));
+        }
     }
 
     /// Composite the layers, palette-quantize (if enabled), then bleed island
@@ -494,37 +955,92 @@ impl Renderer {
                 self.palette_settings.dither_strength,
             );
         }
-        // Lazily build (and cache) the UV-coverage mask, then dilate into the gutter.
-        {
-            let mut slot = self.coverage.borrow_mut();
-            let need = slot
-                .as_ref()
-                .is_none_or(|c| c.len() != (self.tex_size * self.tex_size) as usize);
-            if need {
-                *slot = Some(crate::bleed::coverage(&self.mesh, self.tex_size));
-            }
-            if let Some(cov) = slot.as_ref() {
-                // `LOWTEX_BLEED_PAD` overrides the default for tuning/debugging.
-                let pad = std::env::var("LOWTEX_BLEED_PAD")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(BLEED_PAD);
-                crate::bleed::dilate(&mut display, cov, self.tex_size, pad);
-            }
+        self.ensure_coverage();
+        if let Some(cov) = self.coverage.borrow().as_ref() {
+            crate::bleed::dilate(&mut display, cov, self.tex_size, self.bleed_pad());
         }
         display
     }
 
-    /// Composite and upload the display texture.
-    fn refresh_display_texture(&self) {
-        let display = self.composite_display();
+    /// Composite the whole image into `display_buf` and upload it. The path every
+    /// non-stroke edit (fills, layer/effect ops, undo, palette, load, resize) uses,
+    /// so `display_buf` stays a faithful mirror of the GPU texture for them too.
+    fn refresh_display_texture(&mut self) {
+        self.display_buf = self.composite_display();
         upload_pixels(
             &self.queue,
             &self.paint_texture_gpu,
-            &display,
+            &self.display_buf,
             self.tex_size,
             self.tex_size,
         );
+        // A full upload supersedes any pending region (and a resize would otherwise
+        // leave a stale, possibly out-of-bounds, rect).
+        self.dirty_rect = None;
+    }
+
+    /// Recompute just the texels a stroke touched (the dirty-rectangle path). Produces
+    /// a `display_buf` byte-identical to a full `composite_display`, but works only over
+    /// `rect` (+ bleed margin) so cost scales with brush area, not texture size.
+    ///
+    /// `rect` is the union of stamp footprints since the last upload. We process a
+    /// region padded by `2*pad` (so the kept texels' gutter-dilation rings stay inside
+    /// it), then upload the inner `rect + pad`. The outer `pad` ring of the processed
+    /// region is unaffected by the stroke but can be miscomputed by the region dilate
+    /// (rings exiting the region), so we snapshot and restore it — keeping `display_buf`
+    /// exact.
+    fn refresh_display_region(&mut self, rect: TexRect) {
+        let size = self.tex_size;
+        let pad = self.bleed_pad();
+        // A neighbourhood effect (blur, warp) spreads a stamp's change outward, so
+        // widen the affected region by the largest active spread. Zero in the common
+        // case (no effects), which is then a pure brush-sized region.
+        let max_spread = self
+            .layers
+            .layers
+            .iter()
+            .filter(|l| l.visible && l.opacity > 0.0)
+            .flat_map(|l| &l.effects)
+            .map(|fx| fx.display_spread())
+            .max()
+            .unwrap_or(0);
+        // `upload` = texels whose final display value the stamp can change (brush
+        // footprint + effect spread + gutter bleed). `proc` extends one more `pad` so
+        // the uploaded texels' dilation rings stay inside the processed region.
+        let upload = rect.expanded(pad + max_spread, size);
+        let proc = rect.expanded(2 * pad + max_spread, size);
+
+        // Snapshot the processed region so the outer margin can be restored after dilate.
+        let before = copy_region(&self.display_buf, size, proc);
+
+        self.layers.composite_into_region(&mut self.display_buf, proc);
+        if self.palette_settings.enabled && !self.palette.colors.is_empty() {
+            self.palette.quantize_region(
+                &mut self.display_buf,
+                size,
+                proc,
+                self.palette_settings.dither,
+                self.palette_settings.dither_strength,
+            );
+        }
+        self.ensure_coverage();
+        if let Some(cov) = self.coverage.borrow().as_ref() {
+            crate::bleed::dilate_region(&mut self.display_buf, cov, size, pad, proc);
+        }
+        // Restore the margin (processed but not uploaded): unchanged by the stroke, but
+        // possibly miscomputed by the region dilate.
+        restore_margin(&mut self.display_buf, &before, size, proc, upload);
+
+        upload_region(&self.queue, &self.paint_texture_gpu, &self.display_buf, size, upload);
+    }
+
+    /// Apply any pending stroke dirty-rect to the GPU, once per frame. Cheap no-op when
+    /// nothing was painted since the last call. Called from the app's redraw and before
+    /// headless `capture`.
+    pub fn flush_paint(&mut self) {
+        if let Some(rect) = self.dirty_rect.take() {
+            self.refresh_display_region(rect);
+        }
     }
 
     /// Replace the active palette (live swap) and refresh the display.
@@ -543,6 +1059,24 @@ impl Renderer {
         }
         self.palette_settings = settings;
         self.refresh_display_texture();
+    }
+
+    /// Switch how the painted texture is filtered onto the model (G30). Rebuilds the
+    /// sampler and the bind group it's bound into; no texture recomposite needed.
+    /// Skips the work when the mode is unchanged (the App pushes it every frame).
+    pub fn set_texture_filter(&mut self, filter: TextureFilter) {
+        if filter == self.texture_filter {
+            return;
+        }
+        self.texture_filter = filter;
+        self.sampler = make_sampler(&self.device, filter);
+        self.bind_group = make_paint_bind_group(
+            &self.device,
+            &self.bind_group_layout,
+            &self.uniform_buffer,
+            &self.paint_texture_gpu,
+            &self.sampler,
+        );
     }
 
     /// The composited (quantized + gutter-bled, if enabled) texture as currently
@@ -653,6 +1187,32 @@ impl Renderer {
         self.mask_reveal = reveal;
     }
 
+    /// How many times the brush image tiles across the 0–1 UV space.
+    pub fn set_brush_tile(&mut self, tile: f32) {
+        self.brush_tile = tile;
+    }
+
+    /// Whether the active tool is the fluid particle brush. Synced from the UI.
+    pub fn set_fluid(&mut self, on: bool) {
+        self.fluid = on;
+    }
+
+    /// The fluid brush's color/viscosity/amount settings. Synced from the UI.
+    pub fn set_fluid_spec(&mut self, spec: crate::particle::FluidSpec) {
+        self.fluid_spec = spec;
+    }
+
+    /// Load an image for the brush to paint (UV-tiled) instead of solid color.
+    pub fn load_brush_material(&mut self, path: &str) -> Result<(), String> {
+        self.brush_material = Some(crate::material::Material::load(path)?);
+        Ok(())
+    }
+
+    /// Drop the loaded brush image; the brush reverts to painting its solid color.
+    pub fn clear_brush_material(&mut self) {
+        self.brush_material = None;
+    }
+
     pub fn add_layer(&mut self) {
         self.checkpoint();
         self.layers.add_layer();
@@ -706,6 +1266,70 @@ impl Renderer {
         self.checkpoint();
         self.layers.layers[index].blend = blend;
         self.refresh_display_texture();
+    }
+
+    /// Rename a layer by hand, which locks its auto-name (later ops stop rewriting
+    /// it). Pixels are untouched, so no display refresh — the UI mirror picks up the
+    /// new name next frame.
+    pub fn rename_layer(&mut self, index: usize, name: String) {
+        self.checkpoint();
+        self.layers.rename(index, name);
+    }
+
+    // --- Per-layer effects (G28). All operate on the active layer, matching the
+    // UI panel, which only ever shows the active layer's effect stack. ---
+
+    /// Append a new effect (parameters at their identity values) to the active
+    /// layer's stack.
+    pub fn add_effect(&mut self, kind: crate::effects::EffectKind) {
+        self.checkpoint();
+        let active = self.layers.active;
+        self.layers.layers[active]
+            .effects
+            .push(kind.default_effect());
+        self.layers.layers[active].invalidate();
+        self.layers.record_active_op(kind.token()); // auto-name: "+ Blur" etc.
+        self.refresh_display_texture();
+    }
+
+    /// Remove the effect at `idx` from the active layer's stack.
+    pub fn remove_effect(&mut self, idx: usize) {
+        let active = self.layers.active;
+        if idx >= self.layers.layers[active].effects.len() {
+            return;
+        }
+        self.checkpoint();
+        self.layers.layers[active].effects.remove(idx);
+        self.layers.layers[active].invalidate();
+        self.refresh_display_texture();
+    }
+
+    /// Reorder the active layer's effect at `idx` (toward the end when `up`).
+    pub fn move_effect(&mut self, idx: usize, up: bool) {
+        let active = self.layers.active;
+        let fx = &mut self.layers.layers[active].effects;
+        if up && idx + 1 < fx.len() {
+            fx.swap(idx, idx + 1);
+        } else if !up && idx > 0 {
+            fx.swap(idx, idx - 1);
+        } else {
+            return;
+        }
+        self.layers.layers[active].invalidate();
+        self.checkpoint();
+        self.refresh_display_texture();
+    }
+
+    /// Replace the active layer's effect at `idx` (a parameter-slider edit). Like
+    /// `set_layer_opacity` this doesn't checkpoint per call — the UI emits one
+    /// checkpoint when the slider drag begins so the whole drag is a single undo.
+    pub fn set_effect(&mut self, idx: usize, fx: crate::effects::Effect) {
+        let active = self.layers.active;
+        if let Some(slot) = self.layers.layers[active].effects.get_mut(idx) {
+            *slot = fx;
+            self.layers.layers[active].invalidate();
+            self.refresh_display_texture();
+        }
     }
 
     /// Orbit the camera by drag deltas and refresh the uniform.
@@ -830,6 +1454,14 @@ impl Renderer {
 
     // --- Ambient-occlusion suite (mesh-aware, drives layers) ---
 
+    /// Set the directional-light sun (the direction *toward* the light) and whether
+    /// it casts shadows. Pushed from the UI each frame; the light channel rebakes
+    /// lazily on the next Light effect if these changed.
+    pub fn set_sun(&mut self, dir: [f32; 3], shadow: bool) {
+        self.sun_dir = glam::Vec3::from(dir).normalize_or_zero();
+        self.sun_shadow = shadow;
+    }
+
     /// Bake the mesh maps for the current resolution if not already cached.
     fn ensure_mesh_maps(&mut self) {
         let stale = self
@@ -842,9 +1474,29 @@ impl Renderer {
         }
     }
 
+    /// Ensure the baked `light` channel reflects the current sun. Cheap to call
+    /// before any Light-sourced effect: it bakes the maps if needed, then recomputes
+    /// the directional light only when the sun direction or shadow flag changed.
+    fn ensure_light(&mut self) {
+        self.ensure_mesh_maps();
+        let (dir, shadow) = (self.sun_dir, self.sun_shadow);
+        let need = self
+            .mesh_maps
+            .as_ref()
+            .is_none_or(|m| m.light_params != Some((dir, shadow)));
+        if need {
+            // Disjoint field borrows: &self.bvh while &mut self.mesh_maps.
+            let bvh = &self.bvh;
+            if let Some(m) = self.mesh_maps.as_mut() {
+                m.compute_light(bvh, dir, shadow);
+            }
+        }
+    }
+
     /// Add a generated tint layer: a flat `color` whose alpha is a baked map
-    /// (`src`) read through `levels`. This is the one path behind every AO/curvature
-    /// effect — the presets below are just fixed (source, color, blend) choices.
+    /// (`src`) read through `levels`, optionally broken up by procedural `noise`.
+    /// This is the one path behind every AO/curvature effect — the presets below are
+    /// just fixed (source, color, blend) choices.
     pub fn add_map_layer(
         &mut self,
         name: &str,
@@ -852,10 +1504,18 @@ impl Renderer {
         levels: Levels,
         color: [u8; 3],
         blend: crate::layers::BlendMode,
+        noise: Option<NoiseMod>,
     ) {
         self.checkpoint();
         self.ensure_mesh_maps();
-        let weights = self.mesh_maps.as_ref().unwrap().sample(src, &levels);
+        if src == MapSource::Light {
+            self.ensure_light();
+        }
+        let weights = self
+            .mesh_maps
+            .as_ref()
+            .unwrap()
+            .sample(src, &levels, noise.as_ref());
         let mut tex = PaintTexture::new(
             self.tex_size,
             self.tex_size,
@@ -868,8 +1528,48 @@ impl Renderer {
             .push_generated(name.to_string(), tex, blend, 1.0);
         // Record the recipe so this look can be saved as a reusable preset (G21).
         self.recipe.push(crate::preset::PresetLayer::from_op(
-            name, src, levels, color, blend,
+            name, src, levels, color, blend, noise,
         ));
+        self.resync_stroke_base();
+        self.refresh_display_texture();
+    }
+
+    /// Add a gradient-map layer: instead of one flat color, every covered texel is
+    /// colored by looking the baked map's value (read through `levels` + optional
+    /// `noise`) up in a low→high color ramp. One map then reads as a full material —
+    /// e.g. dark crevices → bright tops from Cavities, or a lit/shaded gradient from
+    /// the sun. Alpha is the coverage mask, so the ramp paints the whole surface.
+    ///
+    /// Not recorded in the preset recipe yet: the recipe stores a single flat color
+    /// per layer, not a ramp, so a gradient look must currently be re-applied by hand.
+    pub fn add_gradient_layer(
+        &mut self,
+        name: &str,
+        src: MapSource,
+        levels: Levels,
+        grad: Gradient,
+        blend: crate::layers::BlendMode,
+        noise: Option<NoiseMod>,
+    ) {
+        self.checkpoint();
+        self.ensure_mesh_maps();
+        if src == MapSource::Light {
+            self.ensure_light();
+        }
+        let maps = self.mesh_maps.as_ref().unwrap();
+        let weights = maps.sample(src, &levels, noise.as_ref());
+        let mut tex = PaintTexture::new(self.tex_size, self.tex_size, [0, 0, 0, 0]);
+        for (i, &w) in weights.iter().enumerate() {
+            if maps.mask[i] {
+                let c = grad.sample(w);
+                tex.pixels[i * 4] = c[0];
+                tex.pixels[i * 4 + 1] = c[1];
+                tex.pixels[i * 4 + 2] = c[2];
+                tex.pixels[i * 4 + 3] = 255;
+            }
+        }
+        self.layers
+            .push_generated(name.to_string(), tex, blend, 1.0);
         self.resync_stroke_base();
         self.refresh_display_texture();
     }
@@ -877,10 +1577,22 @@ impl Renderer {
     /// Fill the *active layer's* reveal mask from a baked map — the Substance-style
     /// move: route AO/curvature into a mask so whatever that layer paints only shows
     /// where the map is high (e.g. paint a flat color, then confine it to cavities).
-    pub fn fill_active_mask_from_map(&mut self, src: MapSource, levels: Levels) {
+    pub fn fill_active_mask_from_map(
+        &mut self,
+        src: MapSource,
+        levels: Levels,
+        noise: Option<NoiseMod>,
+    ) {
         self.checkpoint();
         self.ensure_mesh_maps();
-        let weights = self.mesh_maps.as_ref().unwrap().sample(src, &levels);
+        if src == MapSource::Light {
+            self.ensure_light();
+        }
+        let weights = self
+            .mesh_maps
+            .as_ref()
+            .unwrap()
+            .sample(src, &levels, noise.as_ref());
         let mask = self.layers.active_mask_mut();
         for (i, w) in weights.iter().enumerate() {
             let v = (w * 255.0).round() as u8;
@@ -894,47 +1606,51 @@ impl Renderer {
     }
 
     /// Preset: a black Multiply layer in the cavities — shadow sinks into crevices.
-    pub fn apply_ao_layer(&mut self, levels: Levels) {
+    pub fn apply_ao_layer(&mut self, levels: Levels, noise: Option<NoiseMod>) {
         self.add_map_layer(
             "AO",
             MapSource::Cavities,
             levels,
             [0, 0, 0],
             crate::layers::BlendMode::Multiply,
+            noise,
         );
     }
 
     /// Preset: a white layer on convex edges/corners — brightens exposed edges and,
     /// being curvature-driven, never lands on flat lit faces or in concave creases.
-    pub fn apply_highlight_layer(&mut self, levels: Levels) {
+    pub fn apply_highlight_layer(&mut self, levels: Levels, noise: Option<NoiseMod>) {
         self.add_map_layer(
             "Highlights",
             MapSource::Edges,
             levels,
             [255, 255, 255],
             crate::layers::BlendMode::Normal,
+            noise,
         );
     }
 
     /// Preset: a dark grime tint settling into the cavities (Substance "Dirt").
-    pub fn apply_dirt_layer(&mut self, levels: Levels) {
+    pub fn apply_dirt_layer(&mut self, levels: Levels, noise: Option<NoiseMod>) {
         self.add_map_layer(
             "Dirt",
             MapSource::Cavities,
             levels,
             [54, 42, 30],
             crate::layers::BlendMode::Normal,
+            noise,
         );
     }
 
     /// Preset: a worn, lightened tint on convex edges (Substance "Edge wear").
-    pub fn apply_edge_wear_layer(&mut self, levels: Levels) {
+    pub fn apply_edge_wear_layer(&mut self, levels: Levels, noise: Option<NoiseMod>) {
         self.add_map_layer(
             "Edge wear",
             MapSource::Edges,
             levels,
             [205, 200, 185],
             crate::layers::BlendMode::Normal,
+            noise,
         );
     }
 
@@ -945,8 +1661,8 @@ impl Renderer {
     /// new geometry. Layers are appended on top of the current stack.
     pub fn apply_preset(&mut self, preset: &crate::preset::Preset) {
         for pl in &preset.layers {
-            let (name, src, levels, color, blend) = pl.to_op();
-            self.add_map_layer(&name, src, levels, color, blend);
+            let (name, src, levels, color, blend, noise) = pl.to_op();
+            self.add_map_layer(&name, src, levels, color, blend, noise);
         }
         if let Some(pname) = &preset.palette {
             if let Some(p) = Palette::builtins()
@@ -1121,6 +1837,10 @@ impl Renderer {
         for t in frontier {
             tex.pixels[t * 4..t * 4 + 4].copy_from_slice(&rgba);
         }
+        // Auto-name: a color fill is content; a mask fill only shapes where.
+        if self.paint_target == PaintTarget::Color {
+            self.layers.record_active_op("Fill");
+        }
     }
 
     /// Load a new mesh from a file, rebuilding the GPU buffers and the pick BVH.
@@ -1150,12 +1870,36 @@ impl Renderer {
         Ok(())
     }
 
-    /// Re-unwrap the current mesh's UVs (G14–G17). Geometry is unchanged but
-    /// vertices are split and re-UV'd, so the GPU buffers, BVH, and cached maps are
-    /// rebuilt; the painted texture stays and re-maps onto the new UVs.
-    pub fn apply_unwrap(&mut self, mode: crate::unwrap::UnwrapMode) {
+    /// Re-unwrap the current mesh's UVs into connectivity-based charts at a constant
+    /// world-space texel density (the atlas size is *derived* from `density`).
+    /// Geometry is unchanged but vertices are split and re-UV'd, so the GPU buffers,
+    /// BVH, and cached maps are rebuilt; the paint texture is resampled to the new
+    /// atlas size and re-maps onto the new UVs. Returns `(atlas_size, clamped)` where
+    /// `clamped` means density was reduced to stay within the GPU texture limit.
+    pub fn apply_unwrap(&mut self, density: crate::unwrap::Density) -> (u32, bool) {
         self.checkpoint();
-        let mesh = crate::unwrap::unwrap(&self.mesh, mode);
+        let opts = crate::unwrap::UnwrapOptions {
+            density,
+            max_atlas: self.max_texture_dim,
+            ..Default::default()
+        };
+        let result = crate::unwrap::auto_unwrap(&self.mesh, &opts);
+        log::debug!(
+            "unwrap: {0} tris → {1}×{1} atlas at {2:.2} texels/unit{3}",
+            self.mesh.indices.len() / 3,
+            result.atlas_size,
+            result.density_d,
+            if result.clamped { " (clamped)" } else { "" },
+        );
+
+        // Resize layers first so the painted pixels resample into the new atlas size;
+        // inline rather than via set_texture_resolution (that takes its own checkpoint
+        // and early-returns when the size is unchanged).
+        if result.atlas_size != self.tex_size {
+            self.layers.resize(result.atlas_size);
+        }
+
+        let mesh = result.mesh;
         self.vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1173,9 +1917,13 @@ impl Renderer {
         self.index_count = mesh.indices.len() as u32;
         self.bvh = Bvh::build(&mesh);
         self.mesh = mesh;
+        // Pick up the new size and recreate the GPU texture / bind group / stroke
+        // buffers (the old fixed-resolution unwrap never needed this).
+        self.rebuild_paint_gpu();
         self.mesh_maps = None;
         self.fill_map = None;
         *self.coverage.get_mut() = None;
+        (result.atlas_size, result.clamped)
     }
 
     /// Save the entire editing state to a `.lowtex` file (G24).
@@ -1197,6 +1945,7 @@ impl Renderer {
                 opacity: l.opacity,
                 color: crate::project::encode_pixels(&l.tex.pixels),
                 mask: crate::project::encode_pixels(&l.mask.pixels),
+                effects: l.effects.iter().map(effect_to_doc).collect(),
             })
             .collect();
         let doc = crate::project::ProjectDoc {
@@ -1263,25 +2012,26 @@ impl Renderer {
             let mut mask = crate::project::decode_pixels(&d.mask)?;
             color.resize(n, 0);
             mask.resize(n, 255);
-            layers.push(crate::layers::Layer {
-                name: d.name.clone(),
-                tex: PaintTexture {
+            layers.push(crate::layers::Layer::from_parts(
+                d.name.clone(),
+                PaintTexture {
                     width: doc.tex_size,
                     height: doc.tex_size,
                     pixels: color,
                 },
-                mask: PaintTexture {
+                PaintTexture {
                     width: doc.tex_size,
                     height: doc.tex_size,
                     pixels: mask,
                 },
-                visible: d.visible,
-                opacity: d.opacity,
-                blend: crate::layers::BlendMode::ALL
+                d.visible,
+                d.opacity,
+                crate::layers::BlendMode::ALL
                     .get(d.blend as usize)
                     .copied()
                     .unwrap_or(crate::layers::BlendMode::Normal),
-            });
+                d.effects.iter().map(doc_to_effect).collect(),
+            ));
         }
         if layers.is_empty() {
             return Err("project has no layers".into());
@@ -1313,6 +2063,7 @@ impl Renderer {
         let material = crate::material::Material::load(path)?;
         self.checkpoint();
         material.fill(self.layers.active_tex_mut(), tile);
+        self.layers.record_active_op("Material"); // auto-name
         self.resync_stroke_base();
         self.refresh_display_texture();
         Ok(())
@@ -1323,6 +2074,7 @@ impl Renderer {
     pub fn begin_stroke(&mut self) {
         self.stroke_base = self.target_pixels().to_vec();
         self.stroke_coverage.fill(0.0);
+        self.fluid_travel = 0.0;
         // Snapshot the pre-stroke stack so the whole stroke is one undo step. Held
         // until release, then committed only if the stroke actually painted.
         self.pending = Some(self.layers.clone());
@@ -1336,27 +2088,32 @@ impl Renderer {
         if let Some(before) = self.pending.take() {
             if self.stroke_dirty {
                 self.history.record(before);
+                // Auto-name the layer from the stroke (color only — mask painting
+                // shapes *where* a layer shows, not its content, so it adds no token).
+                if self.paint_target == PaintTarget::Color {
+                    let token = if self.fluid {
+                        "Fluid"
+                    } else if self.brush_material.is_some() {
+                        "Stamp"
+                    } else {
+                        "Stroke"
+                    };
+                    self.layers.record_active_op(token);
+                }
             }
         }
         self.stroke_dirty = false;
     }
 
-    /// The current screen size (window physical size, or the headless config).
-    fn screen_size(&self) -> Vec2 {
-        match &self.window {
-            Some(window) => {
-                let s = window.inner_size();
-                Vec2::new(s.width as f32, s.height as f32)
-            }
-            None => Vec2::new(self.config.width as f32, self.config.height as f32),
-        }
-    }
-
-    /// Build a stable world-space pick ray for a screen pixel.
+    /// Build a stable world-space pick ray for a screen pixel. The pixel is in
+    /// full-window coordinates, so map it into the scene viewport (subtract the
+    /// panel offset and unproject against the viewport's size) to match what's drawn.
     fn pick_ray(&self, mouse_px: Vec2) -> Ray {
         let inv_view_proj = self.camera.view_proj().inverse();
         let ray_origin = self.camera.eye();
-        let ray = Ray::from_screen(mouse_px, self.screen_size(), inv_view_proj);
+        let (vx, vy, vw, vh) = self.scene_viewport();
+        let local = Vec2::new(mouse_px.x - vx, mouse_px.y - vy);
+        let ray = Ray::from_screen(local, Vec2::new(vw, vh), inv_view_proj);
         // Pin the origin to the camera eye for stability — unproject can wobble
         // for near==0 depending on driver.
         Ray {
@@ -1373,11 +2130,25 @@ impl Renderer {
             let base = &self.stroke_base;
             let coverage = &mut self.stroke_coverage;
             match self.paint_target {
-                PaintTarget::Color => {
-                    self.layers
-                        .active_tex_mut()
-                        .stamp_stroke(uv, brush, base, coverage);
-                }
+                PaintTarget::Color => match &self.brush_material {
+                    // A brush image is loaded: reveal it (UV-tiled) where the stroke lands.
+                    Some(mat) => {
+                        mat.stamp(
+                            self.layers.active_tex_mut(),
+                            uv,
+                            brush,
+                            self.brush_tile,
+                            base,
+                            coverage,
+                        );
+                    }
+                    // No image loaded: paint the brush's solid color.
+                    None => {
+                        self.layers
+                            .active_tex_mut()
+                            .stamp_stroke(uv, brush, base, coverage);
+                    }
+                },
                 PaintTarget::Mask => {
                     // Mask painting ignores the brush color: reveal=white, hide=black.
                     let v = if self.mask_reveal { 1.0 } else { 0.0 };
@@ -1390,6 +2161,16 @@ impl Renderer {
                         .stamp_stroke(uv, &mask_brush, base, coverage);
                 }
             }
+            // Mark the touched texels dirty for the next per-frame flush. The footprint
+            // matches the stamp loops (`center ± radius.ceil()`) for every brush type.
+            let cx = uv.x * self.tex_size as f32;
+            let cy = uv.y * self.tex_size as f32;
+            if let Some(r) = TexRect::from_stamp(cx, cy, brush.radius, self.tex_size) {
+                self.dirty_rect = Some(match self.dirty_rect {
+                    Some(prev) => prev.union(r),
+                    None => r,
+                });
+            }
             self.stroke_dirty = true;
             true
         } else {
@@ -1397,32 +2178,118 @@ impl Renderer {
         }
     }
 
-    /// Stamp a single dab at a screen pixel and upload. Used for the initial
-    /// click of a stroke and for headless verification.
+    /// Emit one fluid burst at a screen pixel: pick the surface point, flow a burst of
+    /// particles downhill across the mesh (`particle::simulate_burst`), and deposit the
+    /// streak into the active layer's color through the same per-stroke coverage
+    /// discipline as the brush. The dab's wet texels can stream far past the cursor, so
+    /// the dirty rect is their bounding box, not a fixed footprint. Returns whether the
+    /// cursor hit the mesh.
+    fn emit_fluid_screen(&mut self, mouse_px: Vec2, brush: &Brush) -> bool {
+        let ray = self.pick_ray(mouse_px);
+        let Some(hit) = self.bvh.pick(&ray) else {
+            return false;
+        };
+        let size = self.tex_size;
+        let (mn, mx) = self.mesh.bounds();
+        let scale = (mx - mn).length().max(1e-3);
+        // Brush Size (texels) → a world-space spawn radius: a bigger brush wets a wider
+        // band. radius/size is the fraction of the texture the brush spans.
+        let spawn_world = scale * (brush.radius / size as f32);
+        let seed = self.fluid_seed;
+        self.fluid_seed = self.fluid_seed.wrapping_add(0x9E37_79B1);
+        let emit = crate::particle::Emitter {
+            origin: hit.pos,
+            normal: hit.normal,
+            spawn: spawn_world,
+        };
+        let deposits =
+            crate::particle::simulate_burst(&self.bvh, emit, &self.fluid_spec, size, scale, seed);
+        if deposits.is_empty() {
+            return false;
+        }
+
+        let c = self.fluid_spec.color;
+        let color = [
+            (c[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (c[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (c[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        ];
+        let base = &self.stroke_base;
+        let coverage = &mut self.stroke_coverage;
+        let tex = self.layers.active_tex_mut();
+        let (mut x0, mut y0, mut x1, mut y1) = (size, size, 0u32, 0u32);
+        for (texel, density) in deposits {
+            let a = density;
+            if a <= coverage[texel] {
+                continue; // already at least this wet this stroke
+            }
+            coverage[texel] = a;
+            let i = texel * 4;
+            for ch in 0..3 {
+                let dst = base[i + ch] as f32;
+                tex.pixels[i + ch] = (dst * (1.0 - a) + color[ch] as f32 * a)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+            let ba = base[i + 3] as f32;
+            tex.pixels[i + 3] = (ba * (1.0 - a) + 255.0 * a).round() as u8;
+            let (tx, ty) = (texel as u32 % size, texel as u32 / size);
+            x0 = x0.min(tx);
+            y0 = y0.min(ty);
+            x1 = x1.max(tx + 1);
+            y1 = y1.max(ty + 1);
+        }
+        if x1 > x0 && y1 > y0 {
+            let r = TexRect { x0, y0, x1, y1 };
+            self.dirty_rect = Some(match self.dirty_rect {
+                Some(prev) => prev.union(r),
+                None => r,
+            });
+        }
+        self.stroke_dirty = true;
+        true
+    }
+
+    /// Stamp a single dab at a screen pixel. Used for the initial click of a stroke and
+    /// for headless verification. Only mutates the layer + marks the dirty rect; the
+    /// GPU upload is coalesced into the next `flush_paint` (per frame, or before capture).
     pub fn paint_at(&mut self, mouse_px: (f32, f32), brush: &Brush) {
-        if self.stamp_screen(Vec2::new(mouse_px.0, mouse_px.1), brush) {
-            self.refresh_display_texture();
+        let p = Vec2::new(mouse_px.0, mouse_px.1);
+        if self.fluid {
+            self.emit_fluid_screen(p, brush);
+        } else {
+            self.stamp_screen(p, brush);
         }
     }
 
     /// Paint a continuous stroke segment from `from` to `to` (screen pixels),
     /// interpolating stamps so a fast drag leaves a solid line, not gappy dots.
     /// Re-picks at each sub-sample so the stroke follows the surface across faces.
+    /// Accumulates the dirty rect; the upload happens in the next `flush_paint`.
     pub fn paint_segment(&mut self, from: (f32, f32), to: (f32, f32), brush: &Brush) {
         let from = Vec2::new(from.0, from.1);
         let to = Vec2::new(to.0, to.1);
+        if self.fluid {
+            // Space bursts along the drag so a slow drag doesn't flood the surface:
+            // emit at the segment end each time the cursor has travelled `SPACING_PX`.
+            const SPACING_PX: f32 = 10.0;
+            self.fluid_travel += (to - from).length();
+            let mut guard = 0;
+            while self.fluid_travel >= SPACING_PX && guard < 64 {
+                self.fluid_travel -= SPACING_PX;
+                self.emit_fluid_screen(to, brush);
+                guard += 1;
+            }
+            return;
+        }
         // ~2px steps guarantee overlap regardless of brush size. Cap the count so
         // a giant drag can't stall; coverage accumulation prevents double-darken.
         const STEP_PX: f32 = 2.0;
         let dist = (to - from).length();
         let steps = ((dist / STEP_PX).ceil() as u32).clamp(1, 1024);
-        let mut hit_any = false;
         for k in 1..=steps {
             let t = k as f32 / steps as f32;
-            hit_any |= self.stamp_screen(from.lerp(to, t), brush);
-        }
-        if hit_any {
-            self.refresh_display_texture();
+            self.stamp_screen(from.lerp(to, t), brush);
         }
     }
 
@@ -1434,11 +2301,12 @@ impl Renderer {
                 view: target_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    // PSX-ish dark teal background.
+                    // Adjustable background. The picker's color is sRGB; the clear
+                    // value is linear, so convert (default = the old dark teal).
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.04,
-                        g: 0.06,
-                        b: 0.08,
+                        r: srgb_to_linear(self.bg_color[0]) as f64,
+                        g: srgb_to_linear(self.bg_color[1]) as f64,
+                        b: srgb_to_linear(self.bg_color[2]) as f64,
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
@@ -1456,11 +2324,38 @@ impl Renderer {
             occlusion_query_set: None,
         });
 
+        // Confine the scene (mesh + grid) to the panel-free region. The clear above
+        // still covered the whole attachment, so the panel's strip shows the
+        // background until egui paints over it.
+        let (vx, vy, vw, vh) = self.scene_viewport();
+        rpass.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
+
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.bind_group, &[]);
         rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         rpass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         rpass.draw_indexed(0..self.index_count, 0, 0..1);
+
+        // Ground grid: drawn after the mesh so the depth test (Less) lets the
+        // mesh occlude the lines passing behind it.
+        if self.show_grid {
+            rpass.set_pipeline(&self.line_pipeline);
+            rpass.set_bind_group(0, &self.grid_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
+            rpass.draw(0..self.grid_vertex_count, 0..1);
+        }
+
+        // Orientation compass: always shown, in its own square viewport in the
+        // bottom-left of the scene region (so the panel never covers it), drawn last
+        // with depth-Always so it's never occluded. Skipped only when the region is
+        // too small to fit it. Its axes are clickable — see `click_compass`.
+        if let Some((x, y, size)) = self.compass_rect() {
+            rpass.set_viewport(x, y, size, size, 0.0, 1.0);
+            rpass.set_pipeline(&self.compass_pipeline);
+            rpass.set_bind_group(0, &self.compass_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.compass_vertex_buffer.slice(..));
+            rpass.draw(0..self.compass_vertex_count, 0..1);
+        }
     }
 
     pub fn render(&mut self, ui: Option<UiPaint>) {
@@ -1546,6 +2441,8 @@ impl Renderer {
     /// Returns (pixels, width, height). Used by the `--screenshot` path. With
     /// `ui`, the egui overlay is drawn too, so the panel can be verified headless.
     pub fn capture(&mut self, ui: Option<UiPaint>) -> (Vec<u8>, u32, u32) {
+        // Flush any pending stroke so a screenshot taken right after `paint_at` shows it.
+        self.flush_paint();
         let width = self.config.width;
         let height = self.config.height;
 
@@ -1631,6 +2528,42 @@ impl Renderer {
     }
 }
 
+/// Map a live effect to its serializable form (G28). Kept here, like the
+/// `BlendMode` ↔ index mapping, so serde stays off the core `effects::Effect`.
+fn effect_to_doc(fx: &crate::effects::Effect) -> crate::project::EffectDoc {
+    use crate::effects::Effect;
+    use crate::project::EffectDoc;
+    match *fx {
+        Effect::HueSatLight { hue, sat, light } => EffectDoc::HueSatLight { hue, sat, light },
+        Effect::BrightnessContrast {
+            brightness,
+            contrast,
+        } => EffectDoc::BrightnessContrast {
+            brightness,
+            contrast,
+        },
+        Effect::Blur { radius } => EffectDoc::Blur { radius },
+        Effect::Warp { amount, scale } => EffectDoc::Warp { amount, scale },
+    }
+}
+
+fn doc_to_effect(doc: &crate::project::EffectDoc) -> crate::effects::Effect {
+    use crate::effects::Effect;
+    use crate::project::EffectDoc;
+    match *doc {
+        EffectDoc::HueSatLight { hue, sat, light } => Effect::HueSatLight { hue, sat, light },
+        EffectDoc::BrightnessContrast {
+            brightness,
+            contrast,
+        } => Effect::BrightnessContrast {
+            brightness,
+            contrast,
+        },
+        EffectDoc::Blur { radius } => Effect::Blur { radius },
+        EffectDoc::Warp { amount, scale } => Effect::Warp { amount, scale },
+    }
+}
+
 async fn request_adapter(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'static>>,
@@ -1680,6 +2613,22 @@ fn make_paint_texture(device: &wgpu::Device, cpu: &PaintTexture) -> wgpu::Textur
     })
 }
 
+/// Build the paint-texture sampler for the given filter mode (G30). Address mode
+/// stays Repeat so UV-tiled materials wrap; only the min/mag/mipmap filters change.
+fn make_sampler(device: &wgpu::Device, filter: TextureFilter) -> wgpu::Sampler {
+    let mode = filter.wgpu();
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("paint sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: mode,
+        min_filter: mode,
+        mipmap_filter: mode,
+        ..Default::default()
+    })
+}
+
 /// Bind group for the scene: view-proj uniform + paint texture + sampler.
 fn make_paint_bind_group(
     device: &wgpu::Device,
@@ -1709,6 +2658,101 @@ fn make_paint_bind_group(
     })
 }
 
+/// Bind group for a line pipeline: just a view-proj uniform at binding 0.
+fn make_line_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("line bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform.as_entire_binding(),
+        }],
+    })
+}
+
+/// sRGB → linear for one channel. The background picker works in sRGB (what the
+/// user sees); a render-pass clear value is linear, so convert at clear time.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The ground grid: evenly spaced lines on the world XZ plane out to `EXTENT`,
+/// with the two lines through the origin (the X and Z axes) a touch brighter so
+/// the center reads. Colors are linear (see lines.wgsl).
+fn build_grid() -> Vec<LineVertex> {
+    const EXTENT: f32 = 4.0;
+    const STEP: f32 = 0.5;
+    let faint = [0.11, 0.11, 0.13];
+    let center = [0.24, 0.24, 0.28];
+    let n = (EXTENT / STEP) as i32;
+    let mut v = Vec::with_capacity(((2 * n + 1) * 4) as usize);
+    for i in -n..=n {
+        let t = i as f32 * STEP;
+        let c = if i == 0 { center } else { faint };
+        // Line parallel to X (fixed z = t).
+        v.push(LineVertex { position: [-EXTENT, 0.0, t], color: c });
+        v.push(LineVertex { position: [EXTENT, 0.0, t], color: c });
+        // Line parallel to Z (fixed x = t).
+        v.push(LineVertex { position: [t, 0.0, -EXTENT], color: c });
+        v.push(LineVertex { position: [t, 0.0, EXTENT], color: c });
+    }
+    v
+}
+
+/// Side (the screen-space half-width multiplier, see compass.wgsl) of the bold
+/// positive arms and the thinner negative stubs.
+const COMPASS_ARM_SIDE: f32 = 1.0;
+const COMPASS_STUB_SIDE: f32 = 0.55;
+
+/// Append one thick segment (`a` → `b`) as a quad: two triangles, 6 vertices,
+/// each carrying the whole segment plus its corner (`t`, `side`). compass.wgsl
+/// expands the corners perpendicular to the segment in screen space.
+fn push_compass_segment(v: &mut Vec<CompassVertex>, a: [f32; 3], b: [f32; 3], color: [f32; 3], half: f32) {
+    // Corners as (t, signed side): a-left, a-right, b-right / b-right, a-left, b-left.
+    let corners = [
+        (0.0, half),
+        (0.0, -half),
+        (1.0, -half),
+        (1.0, -half),
+        (0.0, half),
+        (1.0, half),
+    ];
+    for (t, side) in corners {
+        v.push(CompassVertex { start: a, end: b, color, param: [t, side] });
+    }
+}
+
+/// The orientation compass: three bold axis arms from the origin — +X red,
+/// +Y green, +Z blue at unit length — each with a thinner, dimmer negative stub
+/// so the sign reads. Built as thick screen-space quads (see compass.wgsl) and
+/// rendered through the camera's rotation-only `gizmo_view_proj`.
+fn build_compass() -> Vec<CompassVertex> {
+    let axes = [
+        ([1.0_f32, 0.0, 0.0], [0.90_f32, 0.20, 0.20]), // X red
+        ([0.0, 1.0, 0.0], [0.40, 0.85, 0.30]),         // Y green
+        ([0.0, 0.0, 1.0], [0.30, 0.55, 0.95]),         // Z blue
+    ];
+    let origin = [0.0, 0.0, 0.0];
+    let mut v = Vec::with_capacity(axes.len() * 2 * 6);
+    for (dir, color) in axes {
+        let dim = [color[0] * 0.35, color[1] * 0.35, color[2] * 0.35];
+        // Positive arm: origin → +1, bold.
+        push_compass_segment(&mut v, origin, dir, color, COMPASS_ARM_SIDE);
+        // Negative stub: origin → -0.4, thinner and dimmed.
+        let stub = [-dir[0] * 0.4, -dir[1] * 0.4, -dir[2] * 0.4];
+        push_compass_segment(&mut v, origin, stub, dim, COMPASS_STUB_SIDE);
+    }
+    v
+}
+
 fn make_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth texture"),
@@ -1727,8 +2771,75 @@ fn make_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Text
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn upload_texture(queue: &wgpu::Queue, gpu: &wgpu::Texture, cpu: &PaintTexture) {
-    upload_pixels(queue, gpu, &cpu.pixels, cpu.width, cpu.height);
+/// Copy `rect` out of a full-size `width`-wide RGBA8 buffer into a contiguous
+/// `rect.width()*rect.height()*4` buffer (row-major). Used to snapshot the
+/// processed region before a region refresh, and to pack a sub-rect for upload.
+fn copy_region(buf: &[u8], width: u32, rect: TexRect) -> Vec<u8> {
+    let (rw, rh) = (rect.width() as usize, rect.height() as usize);
+    let mut out = vec![0u8; rw * rh * 4];
+    let w = width as usize;
+    for ry in 0..rh {
+        let src = ((rect.y0 as usize + ry) * w + rect.x0 as usize) * 4;
+        let dst = ry * rw * 4;
+        out[dst..dst + rw * 4].copy_from_slice(&buf[src..src + rw * 4]);
+    }
+    out
+}
+
+/// Restore the texels of `proc` that are *not* in `upload` from `snapshot` (a
+/// `copy_region(.., proc)` taken before the region refresh). These margin texels are
+/// unchanged by the stroke but can be miscomputed by the region dilate, so we put
+/// their known-correct pre-refresh values back — keeping `display_buf` exact.
+fn restore_margin(buf: &mut [u8], snapshot: &[u8], width: u32, proc: TexRect, upload: TexRect) {
+    let (pw, ph) = (proc.width() as usize, proc.height() as usize);
+    let w = width as usize;
+    for py in 0..ph {
+        let y = proc.y0 as usize + py;
+        for px in 0..pw {
+            let x = proc.x0 as usize + px;
+            if upload.contains(x as u32, y as u32) {
+                continue;
+            }
+            let d = (y * w + x) * 4;
+            let s = (py * pw + px) * 4;
+            buf[d..d + 4].copy_from_slice(&snapshot[s..s + 4]);
+        }
+    }
+}
+
+/// Upload only `rect` of a full-size `width`-wide RGBA8 buffer into the GPU texture,
+/// at the matching origin. The sub-region counterpart to `upload_pixels`.
+fn upload_region(
+    queue: &wgpu::Queue,
+    gpu: &wgpu::Texture,
+    buf: &[u8],
+    width: u32,
+    rect: TexRect,
+) {
+    let packed = copy_region(buf, width, rect);
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: gpu,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: rect.x0,
+                y: rect.y0,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &packed,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(rect.width() * 4),
+            rows_per_image: Some(rect.height()),
+        },
+        wgpu::Extent3d {
+            width: rect.width(),
+            height: rect.height(),
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 /// Upload a raw RGBA8 pixel slice into a GPU texture.
@@ -1768,4 +2879,159 @@ fn make_checkerboard(w: u32, h: u32) -> PaintTexture {
         }
     }
     tex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::Mesh;
+
+    fn headless() -> Renderer {
+        pollster::block_on(Renderer::new_headless(64, 64, Mesh::cube()))
+    }
+
+    /// The dirty-rectangle invariant: after a brush-sized mutation + region refresh,
+    /// `display_buf` must be byte-identical to a full `composite_display()`. This is
+    /// what guarantees the live (region-uploaded) view never diverges from the
+    /// full-composite export path.
+    fn assert_region_matches_full(r: &mut Renderer) {
+        // Bake the current layer/palette setup into display_buf via a full refresh.
+        r.refresh_display_texture();
+        // Simulate a stamp: overwrite a small rect of the active layer, opaque.
+        let size = r.tex_size;
+        let rect = TexRect {
+            x0: 20,
+            y0: 22,
+            x1: 30,
+            y1: 31,
+        };
+        {
+            let tex = r.layers.active_tex_mut();
+            for y in rect.y0..rect.y1 {
+                for x in rect.x0..rect.x1 {
+                    let i = ((y * size + x) * 4) as usize;
+                    tex.pixels[i..i + 4].copy_from_slice(&[123, 45, 67, 255]);
+                }
+            }
+        }
+        r.refresh_display_region(rect);
+        let full = r.composite_display();
+        assert_eq!(
+            r.display_buf, full,
+            "region refresh diverged from full composite"
+        );
+    }
+
+    #[test]
+    fn region_matches_full_no_palette() {
+        let mut r = headless();
+        r.palette_settings.enabled = false;
+        assert_region_matches_full(&mut r);
+    }
+
+    #[test]
+    fn region_matches_full_with_palette_dither() {
+        let mut r = headless();
+        r.palette_settings = PaletteSettings {
+            enabled: true,
+            dither: true,
+            dither_strength: 0.06,
+        };
+        assert_region_matches_full(&mut r);
+    }
+
+    #[test]
+    fn region_matches_full_multiply_layer_and_mask() {
+        let mut r = headless();
+        r.layers.add_layer(); // active is now the top layer
+        r.layers.layers[1].blend = crate::layers::BlendMode::Multiply;
+        for (t, px) in r.layers.layers[1]
+            .mask
+            .pixels
+            .chunks_exact_mut(4)
+            .enumerate()
+        {
+            let v = ((t * 7) % 256) as u8;
+            px.copy_from_slice(&[v, v, v, 255]);
+        }
+        assert_region_matches_full(&mut r);
+    }
+
+    #[test]
+    fn real_stroke_flush_matches_full() {
+        // Exercise the true path: actual picking + many overlapping interpolated stamps
+        // accumulated into one dirty rect, flushed via `flush_paint` (the per-frame
+        // entry point). The resulting GPU mirror must still equal a full composite.
+        // A viewport that frames the cube at screen centre (same as the screenshot path).
+        let (w, h) = (256u32, 256u32);
+        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        r.palette_settings = PaletteSettings {
+            enabled: true,
+            dither: true,
+            dither_strength: 0.06,
+        };
+        r.refresh_display_texture(); // bake the palette into display_buf (as set_palette_settings does)
+        let brush = Brush {
+            color: [0.1, 0.7, 0.3],
+            radius: 6.0,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        r.begin_stroke();
+        r.paint_at((cx, cy), &brush);
+        r.paint_segment((cx - 20.0, cy - 14.0), (cx + 20.0, cy + 14.0), &brush);
+        r.end_stroke();
+        assert!(r.dirty_rect.is_some(), "stroke never hit the mesh");
+        r.flush_paint();
+        assert!(r.dirty_rect.is_none(), "flush_paint should consume the dirty rect");
+        let full = r.composite_display();
+        assert_eq!(r.display_buf, full, "flushed stroke diverged from full composite");
+    }
+
+    #[test]
+    fn fluid_stroke_deposits_and_flush_matches_full() {
+        // Exercise the fluid brush end-to-end: pick a surface point, flow a burst, and
+        // deposit onto the active layer. It must change pixels, mark a dirty rect, and
+        // (like the regular brush) leave the region-flushed mirror equal to a full
+        // composite.
+        let (w, h) = (256u32, 256u32);
+        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        r.refresh_display_texture();
+        r.set_fluid(true);
+        r.set_fluid_spec(crate::particle::FluidSpec::with([1.0, 0.0, 0.0], 0.15, 1.0));
+
+        let before = r.layers.active_tex().pixels.clone();
+        let brush = Brush {
+            radius: 6.0,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        r.begin_stroke();
+        r.paint_at((cx, cy), &brush);
+        r.end_stroke();
+
+        assert!(r.dirty_rect.is_some(), "fluid burst never hit the mesh");
+        let changed = before
+            .chunks_exact(4)
+            .zip(r.layers.active_tex().pixels.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(changed > 0, "fluid burst deposited nothing onto the layer");
+
+        r.flush_paint();
+        assert!(r.dirty_rect.is_none(), "flush_paint should consume the dirty rect");
+        let full = r.composite_display();
+        assert_eq!(r.display_buf, full, "flushed fluid stroke diverged from full composite");
+    }
+
+    #[test]
+    fn region_matches_full_with_blur_effect() {
+        let mut r = headless();
+        // A blur on the painted layer leaks the stamp beyond its footprint; the region
+        // path widens by the blur radius, so the invariant must still hold.
+        r.layers.layers[0]
+            .effects
+            .push(crate::effects::Effect::Blur { radius: 2.0 });
+        assert_region_matches_full(&mut r);
+    }
 }

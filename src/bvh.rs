@@ -39,12 +39,16 @@ pub struct Bvh {
     tris: Vec<Tri>,
 }
 
-/// The closest triangle a ray struck: the interpolated UV at the hit and the
-/// original mesh-triangle index (for keying per-triangle data like UV islands).
+/// The closest triangle a ray struck: the interpolated UV at the hit, the original
+/// mesh-triangle index (for keying per-triangle data like UV islands), and the
+/// world-space hit point + geometric face normal (used by the fluid brush to flow
+/// particles across the surface — see `particle::simulate_burst`).
 #[derive(Clone, Copy)]
 pub struct Hit {
     pub uv: Vec2,
     pub tri: u32,
+    pub pos: Vec3,
+    pub normal: Vec3,
 }
 
 impl Bvh {
@@ -248,7 +252,16 @@ impl Bvh {
                 sp += 1;
             }
         }
-        best.map(|(_, uv, tri)| Hit { uv, tri })
+        best.map(|(t, uv, tri)| {
+            let p = self.tris[tri as usize].p;
+            let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+            Hit {
+                uv,
+                tri,
+                pos: ray.origin + ray.direction * t,
+                normal,
+            }
+        })
     }
 
     /// Does anything block the ray within `max_dist`? Early-exits on the first

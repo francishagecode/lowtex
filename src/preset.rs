@@ -14,21 +14,20 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::bake::{Levels, MapSource};
+use crate::bake::{Levels, MapSource, NoiseMod};
 use crate::layers::BlendMode;
+use crate::noise::NoiseKind;
 
-/// Bumped on any breaking change to the on-disk schema.
-pub const PRESET_VERSION: u32 = 1;
-
-/// File extension for shared presets.
-pub const PRESET_EXT: &str = "lowpreset";
+/// Bumped on any breaking change to the on-disk schema. v2 adds the optional
+/// per-layer noise breakup; v1 files still load (the noise fields default off).
+pub const PRESET_VERSION: u32 = 2;
 
 /// One mesh-aware generator layer in a preset. Mirrors the arguments of
 /// `Renderer::add_map_layer`, flattened for a clean RON representation.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PresetLayer {
     pub name: String,
-    /// Map source name: "Cavities" | "Exposed" | "Edges" | "Creases".
+    /// Map source name: "Cavities" | "Exposed" | "Edges" | "Creases" | "Surface".
     pub source: String,
     pub invert: bool,
     pub contrast: f32,
@@ -36,6 +35,16 @@ pub struct PresetLayer {
     pub color: [u8; 3],
     /// Blend mode name: "Normal" | "Multiply" | "Add" | "Screen".
     pub blend: String,
+    /// Optional procedural-noise breakup (v2). `noise_kind` None = no noise; the
+    /// other fields are ignored then. `#[serde(default)]` lets v1 files load.
+    #[serde(default)]
+    pub noise_kind: Option<String>,
+    #[serde(default)]
+    pub noise_scale: f32,
+    #[serde(default)]
+    pub noise_contrast: f32,
+    #[serde(default)]
+    pub noise_amount: f32,
 }
 
 impl PresetLayer {
@@ -46,7 +55,12 @@ impl PresetLayer {
         levels: Levels,
         color: [u8; 3],
         blend: BlendMode,
+        noise: Option<NoiseMod>,
     ) -> Self {
+        let (noise_kind, noise_scale, noise_contrast, noise_amount) = match noise {
+            Some(n) => (Some(n.kind.name().to_string()), n.scale, n.contrast, n.amount),
+            None => (None, 0.0, 0.0, 0.0),
+        };
         Self {
             name: name.to_string(),
             source: src.name().to_string(),
@@ -55,13 +69,17 @@ impl PresetLayer {
             strength: levels.strength,
             color,
             blend: blend.name().to_string(),
+            noise_kind,
+            noise_scale,
+            noise_contrast,
+            noise_amount,
         }
     }
 
     /// Resolve back into the concrete generator arguments. Unknown names fall back
     /// to sensible defaults so a partially-understood file still does something
     /// reasonable rather than failing.
-    pub fn to_op(&self) -> (String, MapSource, Levels, [u8; 3], BlendMode) {
+    pub fn to_op(&self) -> (String, MapSource, Levels, [u8; 3], BlendMode, Option<NoiseMod>) {
         let src = map_source_from_name(&self.source).unwrap_or(MapSource::Cavities);
         let blend = blend_from_name(&self.blend).unwrap_or(BlendMode::Normal);
         let levels = Levels {
@@ -69,7 +87,17 @@ impl PresetLayer {
             contrast: self.contrast,
             strength: self.strength,
         };
-        (self.name.clone(), src, levels, self.color, blend)
+        let noise = self
+            .noise_kind
+            .as_deref()
+            .and_then(noise_kind_from_name)
+            .map(|kind| NoiseMod {
+                kind,
+                scale: self.noise_scale,
+                contrast: self.noise_contrast,
+                amount: self.noise_amount,
+            });
+        (self.name.clone(), src, levels, self.color, blend, noise)
     }
 }
 
@@ -131,10 +159,14 @@ fn blend_from_name(s: &str) -> Option<BlendMode> {
     BlendMode::ALL.iter().copied().find(|b| b.name() == s)
 }
 
+fn noise_kind_from_name(s: &str) -> Option<NoiseKind> {
+    NoiseKind::ALL.iter().copied().find(|k| k.name() == s)
+}
+
 /// The built-in shareable looks shipped with lowtex. Each is a pure recipe, so it
 /// re-evaluates against whatever mesh is loaded.
 pub fn builtins() -> Vec<Preset> {
-    // Helper to keep the recipes terse.
+    // Helper to keep the recipes terse — a plain generator layer, no noise.
     let layer =
         |name: &str, source: &str, color: [u8; 3], blend: &str, strength, contrast| PresetLayer {
             name: name.to_string(),
@@ -144,7 +176,36 @@ pub fn builtins() -> Vec<Preset> {
             strength,
             color,
             blend: blend.to_string(),
+            noise_kind: None,
+            noise_scale: 0.0,
+            noise_contrast: 0.0,
+            noise_amount: 0.0,
         };
+
+    // Same, but broken up by procedural noise (Surface × noise = grunge).
+    #[allow(clippy::too_many_arguments)]
+    let noisy = |name: &str,
+                 source: &str,
+                 color: [u8; 3],
+                 blend: &str,
+                 strength,
+                 contrast,
+                 kind: &str,
+                 scale,
+                 noise_contrast,
+                 amount| PresetLayer {
+        name: name.to_string(),
+        source: source.to_string(),
+        invert: false,
+        contrast,
+        strength,
+        color,
+        blend: blend.to_string(),
+        noise_kind: Some(kind.to_string()),
+        noise_scale: scale,
+        noise_contrast,
+        noise_amount: amount,
+    };
 
     vec![
         // Stone with moss settling into the crevices and lightly worn edges.
@@ -171,6 +232,19 @@ pub fn builtins() -> Vec<Preset> {
             vec![
                 layer("AO", "Cavities", [0, 0, 0], "Multiply", 0.6, 0.3),
                 layer("Dust", "Exposed", [178, 168, 146], "Normal", 0.45, 0.15),
+            ],
+        ),
+        // Iron eaten by rust: cellular Worley blotches of oxide across the whole
+        // surface, darkened cavities, and bare metal still catching the edges.
+        Preset::new(
+            "Rusty Iron",
+            vec![
+                layer("AO", "Cavities", [0, 0, 0], "Multiply", 0.65, 0.35),
+                noisy(
+                    "Rust", "Surface", [120, 64, 38], "Normal", 0.8, 0.0, "Worley", 9.0, 0.45,
+                    0.9,
+                ),
+                layer("Bare metal", "Edges", [188, 188, 198], "Normal", 0.55, 0.25),
             ],
         ),
     ]
@@ -209,13 +283,46 @@ mod tests {
             },
             [10, 20, 30],
             BlendMode::Multiply,
+            None,
         );
-        let (name, src, lv, col, bl) = pl.to_op();
+        let (name, src, lv, col, bl, noise) = pl.to_op();
         assert_eq!(name, "Edge");
         assert!(matches!(src, MapSource::Edges));
         assert!(matches!(bl, BlendMode::Multiply));
         assert!(lv.invert && (lv.strength - 0.6).abs() < 1e-6);
         assert_eq!(col, [10, 20, 30]);
+        assert!(noise.is_none());
+    }
+
+    #[test]
+    fn op_conversion_round_trips_noise() {
+        let pl = PresetLayer::from_op(
+            "Rust",
+            MapSource::Surface,
+            Levels::amount(0.8),
+            [120, 64, 38],
+            BlendMode::Normal,
+            Some(NoiseMod {
+                kind: NoiseKind::Worley,
+                scale: 9.0,
+                contrast: 0.45,
+                amount: 0.9,
+            }),
+        );
+        let (_, src, _, _, _, noise) = pl.to_op();
+        assert!(matches!(src, MapSource::Surface));
+        let n = noise.expect("noise should round-trip");
+        assert!(matches!(n.kind, NoiseKind::Worley));
+        assert!((n.scale - 9.0).abs() < 1e-6 && (n.amount - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn v1_preset_without_noise_fields_still_loads() {
+        // A v1 file predates the noise fields; serde(default) must fill them.
+        let v1 = r#"(version:1,name:"Old",palette:None,layers:[(name:"AO",source:"Cavities",invert:false,contrast:0.3,strength:0.7,color:(0,0,0),blend:"Multiply")])"#;
+        let p = Preset::from_ron(v1).expect("v1 preset should load under v2 reader");
+        let (_, _, _, _, _, noise) = p.layers[0].to_op();
+        assert!(noise.is_none());
     }
 
     #[test]
@@ -236,9 +343,14 @@ mod tests {
             strength: 1.0,
             color: [1, 2, 3],
             blend: "Nope".into(),
+            noise_kind: Some("AlsoBogus".into()),
+            noise_scale: 4.0,
+            noise_contrast: 0.0,
+            noise_amount: 1.0,
         };
-        let (_, src, _, _, bl) = pl.to_op();
+        let (_, src, _, _, bl, noise) = pl.to_op();
         assert!(matches!(src, MapSource::Cavities));
         assert!(matches!(bl, BlendMode::Normal));
+        assert!(noise.is_none(), "an unknown noise kind drops to no noise");
     }
 }

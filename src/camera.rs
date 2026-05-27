@@ -51,6 +51,36 @@ impl Camera {
         proj * view
     }
 
+    /// View-projection for the orientation compass: the scene camera's rotation
+    /// only — looking at the origin from the same direction, but at a fixed
+    /// distance through an orthographic projection. So the little XYZ gizmo shows
+    /// which way is up/forward without inheriting the scene's zoom, pan, or
+    /// perspective. Drawn into its own square corner viewport, so the box is
+    /// symmetric (aspect 1).
+    pub fn gizmo_view_proj(&self) -> Mat4 {
+        let (sa, ca) = self.azimuth.sin_cos();
+        let (se, ce) = self.elevation.sin_cos();
+        let dir = Vec3::new(ce * sa, se, ce * ca);
+        let view = Mat4::look_at_rh(dir * 3.0, Vec3::ZERO, self.up);
+        // Half-extent 1.4 fits the unit-length axes with a margin.
+        let proj = Mat4::orthographic_rh(-1.4, 1.4, -1.4, 1.4, 0.1, 10.0);
+        proj * view
+    }
+
+    /// Snap the view so the eye sits along `dir` from the target — i.e. look down
+    /// the given world axis at the origin. Used by the clickable compass: clicking
+    /// the +X arm calls `look_from(Vec3::X)`, etc. Distance and target are kept;
+    /// only the orbit angles change. Inverts `eye()`'s spherical mapping
+    /// (`dir = (ce·sa, se, ce·ca)`), so elevation = asin(y), azimuth = atan2(x, z).
+    pub fn look_from(&mut self, dir: Vec3) {
+        let d = dir.normalize_or_zero();
+        if d == Vec3::ZERO {
+            return;
+        }
+        self.elevation = d.y.clamp(-1.0, 1.0).asin().clamp(-ELEV_LIMIT, ELEV_LIMIT);
+        self.azimuth = d.x.atan2(d.z);
+    }
+
     /// Orbit by mouse-drag deltas (pixels). Positive dx swings right, dy looks down.
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         const SPEED: f32 = 0.006;

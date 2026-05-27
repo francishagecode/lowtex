@@ -24,6 +24,7 @@ use glam::{Vec2, Vec3};
 
 use crate::bvh::Bvh;
 use crate::mesh::Mesh;
+use crate::noise::{self, NoiseKind, NoiseParams};
 
 /// Per-texel baked maps, all `size`×`size`, row-major (V down, matching paint).
 pub struct MeshMaps {
@@ -32,6 +33,22 @@ pub struct MeshMaps {
     /// Signed convexity, ≈[-1, 1]: > 0 on convex edges, < 0 in concave creases.
     pub curvature: Vec<f32>,
     pub mask: Vec<bool>, // true where a triangle covered the texel
+    /// World position per texel — the sampling point for procedural noise (so it
+    /// reads the same across UV seams). `ZERO` where no triangle covered the texel.
+    pub pos: Vec<Vec3>,
+    /// Smooth surface normal per texel (face normal where smoothing collapses).
+    /// Kept from the bake so a directional light can be (re)computed cheaply without
+    /// re-rasterizing. `Y` where no triangle covered the texel.
+    pub nrm: Vec<Vec3>,
+    /// Directional ("sun") light per texel: N·L clamped, optionally shadowed. Filled
+    /// lazily by `compute_light` for the chosen direction — zero until then.
+    pub light: Vec<f32>,
+    /// The (direction, shadow) the `light` channel was last baked for, so callers can
+    /// skip recomputing when the sun hasn't moved. `None` = never computed.
+    pub light_params: Option<(Vec3, bool)>,
+    /// The mesh's bounding-box diagonal. Noise positions are divided by this so a
+    /// given `NoiseMod::scale` means the same feature size regardless of model size.
+    pub diag: f32,
 }
 
 /// Hemisphere ray count per texel for AO. Modest — bakes stay sub-second.
@@ -52,14 +69,23 @@ pub enum MapSource {
     Edges,
     /// Concave creases (negative `curvature`) — deep seams dirt sinks into.
     Creases,
+    /// The whole painted surface (weight 1 everywhere covered). On its own a flat
+    /// object tint; paired with a noise breakup it becomes procedural grunge.
+    Surface,
+    /// Directional ("sun") light: high on faces turned toward the light, dark in its
+    /// shadow. Unlike the others this depends on a chosen sun direction (and optional
+    /// cast shadows), baked into `MeshMaps::light` by `compute_light` before sampling.
+    Light,
 }
 
 impl MapSource {
-    pub const ALL: [MapSource; 4] = [
+    pub const ALL: [MapSource; 6] = [
         MapSource::Cavities,
         MapSource::Exposed,
         MapSource::Edges,
         MapSource::Creases,
+        MapSource::Surface,
+        MapSource::Light,
     ];
 
     pub fn name(self) -> &'static str {
@@ -68,8 +94,26 @@ impl MapSource {
             MapSource::Exposed => "Exposed",
             MapSource::Edges => "Edges",
             MapSource::Creases => "Creases",
+            MapSource::Surface => "Surface",
+            MapSource::Light => "Light",
         }
     }
+}
+
+/// Procedural-noise breakup layered on top of a map source — the documented
+/// "edge wear = curvature × noise". The source weight (after its `Levels` remap)
+/// is multiplied by a noise factor, so the effect lands in patches instead of a
+/// perfect curvature ring. With `MapSource::Surface` the source is uniform, so
+/// the noise itself becomes the pattern (grunge, splotches, weathering).
+#[derive(Clone, Copy)]
+pub struct NoiseMod {
+    pub kind: NoiseKind,
+    /// Feature frequency across the model's span (higher = finer detail).
+    pub scale: f32,
+    /// Sharpens the noise toward hard patches (0 = soft/cloudy, 1 = blotchy).
+    pub contrast: f32,
+    /// 0 = noise off (source unchanged); 1 = source fully multiplied by noise.
+    pub amount: f32,
 }
 
 /// A Substance-style "Levels" remap of a 0..1 map value: optionally invert, push
@@ -109,9 +153,24 @@ impl Levels {
 
 impl MeshMaps {
     /// The per-texel weight (0..1) an effect should use, reading `src` through the
-    /// `levels` remap. Texels no triangle covers stay 0.
-    pub fn sample(&self, src: MapSource, levels: &Levels) -> Vec<f32> {
+    /// `levels` remap and, when `noise` is given, multiplied by a procedural-noise
+    /// breakup. Texels no triangle covers stay 0.
+    pub fn sample(&self, src: MapSource, levels: &Levels, noise: Option<&NoiseMod>) -> Vec<f32> {
         let mut out = vec![0.0f32; self.ao.len()];
+        // Only set up noise when it would actually change anything.
+        let noise = noise.filter(|n| n.amount > 0.0);
+        let nparams = noise.map(|n| NoiseParams {
+            scale: n.scale,
+            ..Default::default()
+        });
+        // The noise field gets its own contrast remap to turn mushy fBm into patches.
+        let ncontrast = noise.map(|n| Levels {
+            invert: false,
+            contrast: n.contrast,
+            strength: 1.0,
+        });
+        let inv_diag = 1.0 / self.diag.max(1e-6);
+
         for (i, o) in out.iter_mut().enumerate() {
             if !self.mask[i] {
                 continue;
@@ -121,10 +180,73 @@ impl MeshMaps {
                 MapSource::Exposed => 1.0 - self.ao[i],
                 MapSource::Edges => (self.curvature[i].max(0.0) * EDGE_SCALE).min(1.0),
                 MapSource::Creases => ((-self.curvature[i]).max(0.0) * EDGE_SCALE).min(1.0),
+                MapSource::Surface => 1.0,
+                MapSource::Light => self.light[i],
             };
-            *o = levels.apply(raw);
+            let mut w = levels.apply(raw);
+            if let (Some(n), Some(params), Some(c)) = (noise, &nparams, &ncontrast) {
+                let nv = c.apply(noise::sample(n.kind, self.pos[i] * inv_diag, params));
+                // Lerp the factor 1→noise by `amount`: amount 0 leaves `w` untouched,
+                // amount 1 multiplies fully. Staying ≤ 1 keeps the result in range.
+                w *= 1.0 - n.amount + n.amount * nv;
+            }
+            *o = w;
         }
         out
+    }
+
+    /// Bake a directional ("sun") light into the `light` channel: per covered texel,
+    /// `max(N·L, 0)` (Lambert), and — when `shadow` — zeroed if a ray cast toward the
+    /// light hits other geometry first (cast shadows). `dir` points *toward* the
+    /// light. Records `light_params` so the renderer can skip recomputing when the
+    /// sun hasn't moved. Like AO, this raycasts against the BVH, so it's the one map
+    /// that needs the mesh's acceleration structure rather than just baked channels.
+    pub fn compute_light(&mut self, bvh: &Bvh, dir: Vec3, shadow: bool) {
+        let dir = dir.normalize_or_zero();
+        let bias = self.diag * 1e-3;
+        // A directional light is infinitely far; cast the shadow ray across the
+        // whole model so anything between the texel and the sun counts as occluder.
+        let reach = self.diag;
+        for i in 0..self.light.len() {
+            if !self.mask[i] {
+                self.light[i] = 0.0;
+                continue;
+            }
+            let ndotl = self.nrm[i].dot(dir).max(0.0);
+            self.light[i] = if shadow
+                && ndotl > 0.0
+                && bvh.occludes(self.pos[i] + self.nrm[i] * bias, dir, reach)
+            {
+                0.0
+            } else {
+                ndotl
+            };
+        }
+        self.light_params = Some((dir, shadow));
+    }
+}
+
+/// A low→high color ramp applied to a 0..1 weight — the "gradient map". Where the
+/// per-texel tint layers paint one flat color masked by a map, a gradient map paints
+/// the surface *by value*, so a single channel (height, AO, light…) reads as a full
+/// material: deep crevices through to bright tops in one pass. sRGB lerp — fine at
+/// PSX color depth and consistent with how paint colors are stored.
+#[derive(Clone, Copy)]
+pub struct Gradient {
+    pub low: [u8; 3],
+    pub high: [u8; 3],
+}
+
+impl Gradient {
+    /// The color at weight `t` (clamped to 0..1), linearly between `low` and `high`.
+    pub fn sample(&self, t: f32) -> [u8; 3] {
+        let t = t.clamp(0.0, 1.0);
+        let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+        [
+            lerp(self.low[0], self.high[0]),
+            lerp(self.low[1], self.high[1]),
+            lerp(self.low[2], self.high[2]),
+        ]
     }
 }
 
@@ -237,6 +359,12 @@ pub fn bake(mesh: &Mesh, bvh: &Bvh, size: u32) -> MeshMaps {
         ao,
         curvature,
         mask,
+        pos: pos_map,
+        nrm: nrm_map,
+        // The directional light is baked lazily once a sun direction is chosen.
+        light: vec![0.0f32; n],
+        light_params: None,
+        diag,
     }
 }
 
@@ -388,22 +516,27 @@ mod tests {
             ao: vec![0.9, 0.1],
             curvature: vec![-0.5, 0.5], // crease, then convex edge
             mask: vec![true, true],
+            pos: vec![Vec3::ZERO, Vec3::ZERO],
+            nrm: vec![Vec3::Y, Vec3::Y],
+            light: vec![0.0, 0.0],
+            light_params: None,
+            diag: 1.0,
         };
         let full = Levels::amount(1.0);
 
-        let cav = maps.sample(MapSource::Cavities, &full);
+        let cav = maps.sample(MapSource::Cavities, &full, None);
         assert!(cav[0] > cav[1], "cavities favor the occluded texel");
 
-        let exp = maps.sample(MapSource::Exposed, &full);
+        let exp = maps.sample(MapSource::Exposed, &full, None);
         assert!(exp[1] > exp[0], "exposed favors the open texel");
 
-        let edges = maps.sample(MapSource::Edges, &full);
+        let edges = maps.sample(MapSource::Edges, &full, None);
         assert!(
             edges[1] > 0.0 && close(edges[0], 0.0),
             "edges only on convex"
         );
 
-        let creases = maps.sample(MapSource::Creases, &full);
+        let creases = maps.sample(MapSource::Creases, &full, None);
         assert!(
             creases[0] > 0.0 && close(creases[1], 0.0),
             "creases only on concave"
@@ -417,10 +550,150 @@ mod tests {
             ao: vec![1.0],
             curvature: vec![0.0],
             mask: vec![false], // no triangle covered it
+            pos: vec![Vec3::ZERO],
+            nrm: vec![Vec3::Y],
+            light: vec![0.0],
+            light_params: None,
+            diag: 1.0,
         };
         assert!(close(
-            maps.sample(MapSource::Cavities, &Levels::amount(1.0))[0],
+            maps.sample(MapSource::Cavities, &Levels::amount(1.0), None)[0],
             0.0
         ));
+    }
+
+    fn one_texel(ao: f32, pos: Vec3) -> MeshMaps {
+        MeshMaps {
+            size: 1,
+            ao: vec![ao],
+            curvature: vec![0.0],
+            mask: vec![true],
+            pos: vec![pos],
+            nrm: vec![Vec3::Y],
+            light: vec![0.0],
+            light_params: None,
+            diag: 1.0,
+        }
+    }
+
+    #[test]
+    fn surface_source_is_full_before_noise() {
+        let maps = one_texel(0.5, Vec3::ZERO);
+        let w = maps.sample(MapSource::Surface, &Levels::amount(1.0), None);
+        assert!(close(w[0], 1.0), "Surface ignores AO/curvature — flat 1.0");
+    }
+
+    #[test]
+    fn compute_light_is_lambert_against_the_sun() {
+        // Bake a cube and shine the sun down (+Y). With shadows off the contract is
+        // exactly Lambert per texel — `max(N·L, 0)` — which we can check directly
+        // (robust to the cube's corner-bent welded normals).
+        let mesh = crate::mesh::Mesh::cube();
+        let bvh = Bvh::build(&mesh);
+        let mut maps = bake(&mesh, &bvh, 32);
+
+        maps.compute_light(&bvh, Vec3::Y, false);
+        assert_eq!(maps.light_params, Some((Vec3::Y, false)));
+
+        let (mut lit, mut dark) = (0u32, 0u32);
+        for i in 0..maps.light.len() {
+            if !maps.mask[i] {
+                assert!(close(maps.light[i], 0.0), "uncovered texels stay dark");
+                continue;
+            }
+            let expect = maps.nrm[i].dot(Vec3::Y).max(0.0);
+            assert!(close(maps.light[i], expect), "light is clamped N·L");
+            if maps.light[i] > 0.5 {
+                lit += 1;
+            } else if maps.light[i] == 0.0 {
+                dark += 1;
+            }
+        }
+        // The cube has faces toward the sun (lit) and away from it (the down-clamped
+        // dark side), so neither bucket is empty — the light actually varies.
+        assert!(lit > 0 && dark > 0, "sun lights some faces and not others");
+
+        // A convex cube can't shadow itself, so casting shadows changes nothing.
+        let no_shadow = maps.light.clone();
+        maps.compute_light(&bvh, Vec3::Y, true);
+        assert!(
+            maps.light.iter().zip(&no_shadow).all(|(a, b)| close(*a, *b)),
+            "a convex mesh casts no self-shadow"
+        );
+    }
+
+    #[test]
+    fn light_source_reads_the_light_channel() {
+        // Two covered texels: one fully lit, one in shadow. The Light source should
+        // pass the channel straight through the (full) Levels remap.
+        let maps = MeshMaps {
+            size: 1,
+            ao: vec![0.0, 0.0],
+            curvature: vec![0.0, 0.0],
+            mask: vec![true, true],
+            pos: vec![Vec3::ZERO, Vec3::ZERO],
+            nrm: vec![Vec3::Y, Vec3::Y],
+            light: vec![0.9, 0.1],
+            light_params: Some((Vec3::Y, false)),
+            diag: 1.0,
+        };
+        let w = maps.sample(MapSource::Light, &Levels::amount(1.0), None);
+        assert!(close(w[0], 0.9) && close(w[1], 0.1), "Light reads its channel");
+        // Inverting turns the lit map into a shadow mask (dark side high).
+        let inv = maps.sample(
+            MapSource::Light,
+            &Levels {
+                invert: true,
+                contrast: 0.0,
+                strength: 1.0,
+            },
+            None,
+        );
+        assert!(inv[1] > inv[0], "inverted Light favors the shadowed texel");
+    }
+
+    #[test]
+    fn gradient_interpolates_low_to_high() {
+        let g = Gradient {
+            low: [0, 0, 0],
+            high: [255, 100, 50],
+        };
+        assert_eq!(g.sample(0.0), [0, 0, 0]);
+        assert_eq!(g.sample(1.0), [255, 100, 50]);
+        // Midpoint is the channel-wise average (clamped input).
+        assert_eq!(g.sample(0.5), [128, 50, 25]);
+        assert_eq!(g.sample(2.0), [255, 100, 50], "weights clamp to 1");
+    }
+
+    #[test]
+    fn noise_amount_zero_is_identity() {
+        let maps = one_texel(0.2, Vec3::new(1.0, 2.0, 3.0));
+        let lv = Levels::amount(1.0);
+        let nm = NoiseMod {
+            kind: NoiseKind::Perlin,
+            scale: 4.0,
+            contrast: 0.5,
+            amount: 0.0,
+        };
+        let with = maps.sample(MapSource::Cavities, &lv, Some(&nm));
+        let without = maps.sample(MapSource::Cavities, &lv, None);
+        assert!(close(with[0], without[0]), "amount 0 must not change the weight");
+    }
+
+    #[test]
+    fn noise_full_amount_multiplies_and_stays_in_range() {
+        // Surface (raw 1.0) fully multiplied by noise → the weight *is* the noise.
+        let maps = one_texel(1.0, Vec3::new(0.3, 0.7, 0.1));
+        let nm = NoiseMod {
+            kind: NoiseKind::Value,
+            scale: 5.0,
+            contrast: 0.0,
+            amount: 1.0,
+        };
+        let w = maps.sample(MapSource::Surface, &Levels::amount(1.0), Some(&nm))[0];
+        assert!((0.0..=1.0).contains(&w), "noise-multiplied weight out of range: {w}");
+        // A second call is deterministic (noise is hash-based).
+        let w2 = maps.sample(MapSource::Surface, &Levels::amount(1.0), Some(&nm))[0];
+        assert!(close(w, w2));
     }
 }

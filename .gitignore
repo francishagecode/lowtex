@@ -10,6 +10,9 @@
 /shots
 *.shot.png
 
+# Default texture export written next to the binary during dev
+/texture.png
+
 # OS junk
 .DS_Store
 Thumbs.db

@@ -3,22 +3,37 @@
 // The egui side panel and the live editor state it drives. Per design principle
 // #1 ("speak plain language, not PBR") the controls use painter words — Color,
 // Size, Opacity, Hardness — not material vocabulary.
+//
+// Layout philosophy (the "dead simple" pass): the panel opens showing only the
+// painting essentials — Tool, Color, brush settings, and the Layers stack. Every
+// occasional or advanced area (mesh effects, material fill, export, palette,
+// viewport) lives behind a collapsed `CollapsingHeader`, so a newcomer sees a
+// short, calm panel instead of a wall of buttons. Layers are large, full-width
+// clickable rows; the active layer's blend + opacity sit inline directly beneath
+// it. Controls that don't apply to the current tool are hidden, not greyed out.
 
 use egui::Context;
 
-use crate::bake::{Levels, MapSource};
+use crate::bake::{Levels, MapSource, NoiseMod};
+use crate::effects::{Effect, EffectKind};
 use crate::export::ExportPreset;
 use crate::layers::BlendMode;
+use crate::noise::NoiseKind;
 use crate::paint::Brush;
-use crate::renderer::PaletteSettings;
+use crate::particle::{FluidKind, FluidSpec};
+use crate::renderer::{PaletteSettings, TextureFilter};
 
 /// The active editing tool. The brush drags a stroke; the fills are one-shot
 /// "paint bucket" clicks (solid color, ignoring what's already there), scoped from
 /// smallest to largest region: a flat face, a UV island, the whole object.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
-    /// Freehand brush — drag to paint a stroke.
+    /// Freehand brush — drag to paint a stroke. Paints the current color, or, if a
+    /// brush image is loaded, the UV-tiled image (revealing the same content a material
+    /// fill would, only where you drag). Clear the image to go back to solid color.
     Brush,
+    /// Fluid brush — drag to flow oil/water/blood down the surface under gravity.
+    Fluid,
     /// Fill the flat face (coplanar facet) of the model under the cursor.
     FillFace,
     /// Fill the UV island under the cursor.
@@ -34,6 +49,8 @@ pub struct LayerInfo {
     pub visible: bool,
     pub opacity: f32,
     pub blend: BlendMode,
+    /// The layer's non-destructive effect stack (G28), bottom-to-top in apply order.
+    pub effects: Vec<Effect>,
 }
 
 /// One-shot requests the UI raises this frame, drained by the App after the egui
@@ -52,7 +69,6 @@ pub struct UiActions {
     /// Snapshot the layer stack before a continuous edit (an opacity-slider drag),
     /// so the whole drag collapses to one undo step.
     pub checkpoint: bool,
-    pub set_resolution: Option<u32>,
     /// Index into `Palette::builtins()` to make active.
     pub select_builtin_palette: Option<usize>,
     /// Generate a palette from a chosen image with this many colors.
@@ -66,26 +82,44 @@ pub struct UiActions {
     pub set_layer_visible: Option<(usize, bool)>,
     pub set_layer_opacity: Option<(usize, f32)>,
     pub set_layer_blend: Option<(usize, BlendMode)>,
+    /// Rename a layer by hand (locks its auto-name). Carries (index, new name).
+    pub set_layer_name: Option<(usize, String)>,
+    // Per-layer effects (G28), all targeting the active layer. `set_effect` carries
+    // the effect's index plus its new value (a parameter-slider edit).
+    pub add_effect: Option<EffectKind>,
+    pub remove_effect: Option<usize>,
+    pub move_effect_up: Option<usize>,
+    pub move_effect_down: Option<usize>,
+    pub set_effect: Option<(usize, Effect)>,
     // Mesh effects (AO + curvature → layers and masks), all sharing the Levels
-    // remap from the controls. Presets fix the source/color/blend; the two generic
-    // actions route the chosen `effect_source` into a brush-colored tint layer or
-    // into the active layer's reveal mask.
-    pub apply_ao: Option<Levels>,
-    pub apply_highlight: Option<Levels>,
-    pub apply_dirt: Option<Levels>,
-    pub apply_edge_wear: Option<Levels>,
-    pub apply_tint: Option<(MapSource, Levels, [f32; 3])>,
-    pub mask_from_map: Option<(MapSource, Levels)>,
+    // remap and the optional noise breakup from the controls. Presets fix the
+    // source/color/blend; the two generic actions route the chosen `effect_source`
+    // into a brush-colored tint layer or into the active layer's reveal mask.
+    pub apply_ao: Option<(Levels, Option<NoiseMod>)>,
+    pub apply_highlight: Option<(Levels, Option<NoiseMod>)>,
+    pub apply_dirt: Option<(Levels, Option<NoiseMod>)>,
+    pub apply_edge_wear: Option<(Levels, Option<NoiseMod>)>,
+    pub apply_tint: Option<(MapSource, Levels, [f32; 3], Option<NoiseMod>)>,
+    pub mask_from_map: Option<(MapSource, Levels, Option<NoiseMod>)>,
+    /// Directional-light ("sun") effects, sharing the same Levels/noise controls.
+    /// `apply_sun` is a warm highlight on the lit faces; `apply_top_dust` is the
+    /// top-down dust look (the UI aims the sun straight up before requesting it).
+    pub apply_sun: Option<(Levels, Option<NoiseMod>)>,
+    pub apply_top_dust: Option<(Levels, Option<NoiseMod>)>,
+    /// Gradient map: color the chosen source's value through a low→high ramp.
+    /// Carries (source, levels, low_rgb, high_rgb, noise) — colors are 0..1 sRGB.
+    pub apply_gradient: Option<(MapSource, Levels, [f32; 3], [f32; 3], Option<NoiseMod>)>,
     /// Export the texture (G23): `true` = true indexed PNG, `false` = RGBA8.
     pub export_png: Option<bool>,
     /// Fill the active layer with a chosen material image, tiled this many times.
     pub fill_material: Option<f32>,
-    /// Re-unwrap the mesh's UVs (G14–G17).
-    pub unwrap: Option<crate::unwrap::UnwrapMode>,
-    /// Preset looks (G21): apply a built-in by name, or save/load a `.lowpreset`.
-    pub apply_builtin_preset: Option<String>,
-    pub save_preset: bool,
-    pub load_preset: bool,
+    /// Load an image for the brush to paint with (UV-tiled) instead of solid color.
+    pub load_brush_image: bool,
+    /// Drop the loaded brush image, reverting the brush to painting solid color.
+    pub clear_brush_image: bool,
+    /// Re-unwrap the mesh's UVs at the chosen texel density (the atlas size is
+    /// derived from it). Carries the density the user picked.
+    pub unwrap: Option<crate::unwrap::Density>,
 }
 
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
@@ -109,6 +143,17 @@ pub struct UiState {
     pub export_preset: ExportPreset,
     /// How many times a material image tiles across UV when filling a layer.
     pub material_tile: f32,
+    /// How many times the texture-brush image tiles across UV (independent of fill).
+    pub brush_tile: f32,
+    /// Whether an image has been loaded for the texture brush (mirrors the renderer),
+    /// so the panel can hint when the brush has nothing to paint with yet.
+    pub brush_image_loaded: bool,
+    /// Fluid brush (oil/water/blood): the chosen fluid sets the starting viscosity
+    /// (then tweakable); it's laid down in the current brush color. `fluid_amount` is
+    /// the overall deposit strength.
+    pub fluid_kind: FluidKind,
+    pub fluid_viscosity: f32,
+    pub fluid_amount: f32,
     /// Levels controls shared by every mesh effect: overall strength, mid-tone
     /// contrast, and invert. `effect_source` is which baked channel the generic
     /// "Tint layer" / "Mask layer" actions read from.
@@ -116,11 +161,48 @@ pub struct UiState {
     pub effect_contrast: f32,
     pub effect_invert: bool,
     pub effect_source: MapSource,
-    /// Mirror of the renderer's current texture resolution, shown in the picker.
+    /// "Break up" controls: a procedural-noise modifier multiplied into any mesh
+    /// effect. `noise_amount` 0 = off; the rest pick the noise's character.
+    pub noise_kind: NoiseKind,
+    pub noise_scale: f32,
+    pub noise_contrast: f32,
+    pub noise_amount: f32,
+    /// Directional-light ("sun") controls for the Light map source: elevation above
+    /// the horizon and azimuth around the model (both degrees), and whether the sun
+    /// casts shadows. `sun_dir` turns these into a direction *toward* the light.
+    pub sun_elevation: f32,
+    pub sun_azimuth: f32,
+    pub sun_shadow: bool,
+    /// Gradient-map endpoints (0..1 sRGB): the color at the map's low and high ends.
+    pub grad_low: [f32; 3],
+    pub grad_high: [f32; 3],
+    /// Viewport display (G29): background color (sRGB) and the grid toggle. Pushed
+    /// to the renderer every frame (cheap — they just set fields). The compass is
+    /// always shown (its axes are clickable), so it has no toggle.
+    pub bg_color: [f32; 3],
+    pub show_grid: bool,
+    /// How the painted texture is filtered onto the model (G30): nearest (crisp,
+    /// the PSX default) or linear (smoothed). Pushed to the renderer every frame.
+    pub texture_filter: TextureFilter,
+    /// Mirror of the renderer's current texture resolution (now *derived* by the
+    /// unwrap, shown read-only).
     pub resolution: u32,
+    /// Texel density requested for the next "Unwrap UVs" (remembers the last choice).
+    pub unwrap_density: crate::unwrap::Density,
+    /// Whether the last unwrap had to reduce density to fit the GPU texture limit,
+    /// so the resolution readout can flag it.
+    pub last_atlas_clamped: bool,
     /// Mirrors of the history state, to enable/disable the Undo/Redo buttons.
     pub can_undo: bool,
     pub can_redo: bool,
+    /// The panel's current width in logical points, written each frame after the
+    /// panel lays out (it's user-draggable). The App scales this by the DPI factor
+    /// and hands it to the renderer so the viewport object clears the panel.
+    pub panel_width: f32,
+    /// Edit buffer for the active layer's name field. Mirrors the synced (derived or
+    /// hand-set) name whenever the field isn't focused, so it tracks auto-renames and
+    /// layer switches; while focused it holds the user's in-progress typing.
+    pub layer_name_edit: String,
     pub actions: UiActions,
 }
 
@@ -138,351 +220,756 @@ impl Default for UiState {
             mask_reveal: false,
             export_preset: ExportPreset::Plain,
             material_tile: 4.0,
+            brush_tile: 4.0,
+            brush_image_loaded: false,
+            fluid_kind: FluidKind::Water,
+            fluid_viscosity: FluidKind::Water.defaults().1,
+            fluid_amount: 0.85,
             ao_strength: 0.75,
             effect_contrast: 0.0,
             effect_invert: false,
             effect_source: MapSource::Cavities,
+            noise_kind: NoiseKind::Perlin,
+            noise_scale: 6.0,
+            noise_contrast: 0.3,
+            noise_amount: 0.0,
+            sun_elevation: 50.0, // high, warm key — matches the shader's fixed light
+            sun_azimuth: 45.0,
+            sun_shadow: true,
+            grad_low: [0.10, 0.09, 0.12], // deep shadow → ...
+            grad_high: [0.85, 0.82, 0.74], // ... pale highlight
+            bg_color: [0.221, 0.272, 0.313], // sRGB of the default dark teal
+            show_grid: true,
+            texture_filter: TextureFilter::default(),
             resolution: 128,
+            unwrap_density: crate::unwrap::Density::default(),
+            last_atlas_clamped: false,
             can_undo: false,
             can_redo: false,
+            panel_width: 248.0,
+            layer_name_edit: String::new(),
             actions: UiActions::default(),
         }
     }
 }
 
-/// Apply a chunky, dark theme that suits the retro vibe. Called once on startup.
-pub fn install_style(ctx: &Context) {
-    let mut style = (*ctx.style()).clone();
-    style.spacing.slider_width = 160.0;
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    ctx.set_style(style);
-    ctx.set_visuals(egui::Visuals::dark());
+impl UiState {
+    /// The procedural-noise breakup the controls currently describe, or `None` when
+    /// the amount is zero (so callers cheaply skip noise entirely).
+    fn noise_mod(&self) -> Option<NoiseMod> {
+        (self.noise_amount > 0.0).then_some(NoiseMod {
+            kind: self.noise_kind,
+            scale: self.noise_scale,
+            contrast: self.noise_contrast,
+            amount: self.noise_amount,
+        })
+    }
+
+    /// The Levels remap the mesh-effect controls currently describe. Computed from
+    /// stored fields so the one-click effects work even while the "Fine-tune"
+    /// sliders are collapsed out of view.
+    fn levels(&self) -> Levels {
+        Levels {
+            invert: self.effect_invert,
+            contrast: self.effect_contrast,
+            strength: self.ao_strength,
+        }
+    }
+
+    /// The sun direction (pointing *toward* the light) the elevation/azimuth sliders
+    /// describe. Elevation 90° is straight up (the top-down look); azimuth orbits it
+    /// around the model. Returned as a plain `[f32; 3]` so the renderer owns glam.
+    pub fn sun_dir(&self) -> [f32; 3] {
+        let el = self.sun_elevation.to_radians();
+        let az = self.sun_azimuth.to_radians();
+        [el.cos() * az.cos(), el.sin(), el.cos() * az.sin()]
+    }
+
+    /// The fluid-brush settings the controls currently describe.
+    pub fn fluid_spec(&self) -> FluidSpec {
+        FluidSpec::with(self.brush.color, self.fluid_viscosity, self.fluid_amount)
+    }
 }
 
-/// Build the controls panel for this frame. Mutates `state` in place and records
-/// one-shot requests in `state.actions` (reset each call).
-pub fn build(ctx: &Context, state: &mut UiState) {
-    state.actions = UiActions::default();
+/// Apply the Catppuccin Mocha theme. Called once on startup (and in the headless
+/// `--ui` screenshot path so captures match). This sets colors/visuals only; egui's
+/// stock spacing, proportional fonts, and rounding are left at their defaults.
+pub fn install_style(ctx: &Context) {
+    catppuccin_egui::set_theme(ctx, catppuccin_egui::MOCHA);
+}
 
-    egui::SidePanel::right("controls")
-        .resizable(false)
-        .default_width(220.0)
-        .show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("lowtex");
-            ui.label(egui::RichText::new("low-poly texture painter").weak());
-            ui.separator();
+/// A small, quiet section heading for the always-visible primary zones. Title-case
+/// and strong (not the old shouty ALL-CAPS), so the eye can scan the panel.
+fn heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(text).strong());
+}
 
-            ui.horizontal(|ui| {
+/// A segmented control: equal-width toggle buttons spanning the full panel width,
+/// one per `(value, label, hover)`. The button matching `*current` reads selected;
+/// clicking one writes it back and returns its index, so callers that need a side
+/// effect on selection (e.g. resetting a dependent field) can react.
+fn segmented<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    options: &[(T, &str, &str)],
+) -> Option<usize> {
+    let mut clicked = None;
+    ui.columns(options.len(), |cols| {
+        for (i, (value, label, hover)) in options.iter().enumerate() {
+            let size = egui::vec2(cols[i].available_width(), cols[i].spacing().interact_size.y);
+            let mut resp =
+                cols[i].add_sized(size, egui::SelectableLabel::new(*current == *value, *label));
+            if !hover.is_empty() {
+                resp = resp.on_hover_text(*hover);
+            }
+            if resp.clicked() {
+                *current = *value;
+                clicked = Some(i);
+            }
+        }
+    });
+    clicked
+}
+
+/// A row of equal-width action buttons spanning the full panel width, one per
+/// `(label, hover)`. Returns the index of the button clicked this frame, if any.
+fn button_group(ui: &mut egui::Ui, buttons: &[(&str, &str)]) -> Option<usize> {
+    let mut clicked = None;
+    ui.columns(buttons.len(), |cols| {
+        for (i, (label, hover)) in buttons.iter().enumerate() {
+            let size = egui::vec2(cols[i].available_width(), cols[i].spacing().interact_size.y);
+            let mut resp = cols[i].add_sized(size, egui::Button::new(*label));
+            if !hover.is_empty() {
+                resp = resp.on_hover_text(*hover);
+            }
+            if resp.clicked() {
+                clicked = Some(i);
+            }
+        }
+    });
+    clicked
+}
+
+/// The top menu-bar header. The common document operations (open/save/export) and
+/// undo/redo are lifted out of the side panel into a conventional File/Edit/Mesh
+/// menu strip, so the panel itself holds only painting controls. Drawn full-width
+/// above the side panel and viewport; egui claims clicks on it, so the scene
+/// (which still renders full-height behind this thin strip) never mis-picks.
+fn menu_bar(ctx: &Context, state: &mut UiState) {
+    egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("File", |ui| {
                 if ui.button("Open model…").clicked() {
                     state.actions.open_model = true;
+                    ui.close_menu();
                 }
-                if ui.button("Save .lowtex").on_hover_text("Save the project").clicked() {
-                    state.actions.save_project = true;
-                }
-                if ui.button("Open .lowtex").clicked() {
-                    state.actions.open_project = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Unwrap:")
-                    .on_hover_text("Reassign the model's UVs");
-                for mode in crate::unwrap::UnwrapMode::ALL {
-                    if ui.small_button(mode.name()).clicked() {
-                        state.actions.unwrap = Some(mode);
-                    }
-                }
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(state.can_undo, egui::Button::new("↶ Undo"))
-                    .on_hover_text("Ctrl/⌘+Z")
-                    .clicked()
-                {
-                    state.actions.undo = true;
-                }
-                if ui
-                    .add_enabled(state.can_redo, egui::Button::new("↷ Redo"))
-                    .on_hover_text("Ctrl/⌘+Shift+Z")
-                    .clicked()
-                {
-                    state.actions.redo = true;
-                }
-            });
-            ui.separator();
-
-            // Tool picker. The fills are one-shot bucket clicks; size/hardness only
-            // affect the brush, so they're disabled while a fill tool is active.
-            ui.label("Tool");
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut state.tool, Tool::Brush, "🖌 Brush");
-                ui.selectable_value(&mut state.tool, Tool::FillFace, "🪣 Face")
-                    .on_hover_text("Fill the flat face you click");
-                ui.selectable_value(&mut state.tool, Tool::FillIsland, "🪣 Island")
-                    .on_hover_text("Fill the UV island you click");
-                ui.selectable_value(&mut state.tool, Tool::FillObject, "🪣 All")
-                    .on_hover_text("Fill the whole object");
-            });
-            ui.add_space(6.0);
-
-            ui.label("Color");
-            ui.color_edit_button_rgb(&mut state.brush.color);
-            ui.add_space(6.0);
-            let brush_active = state.tool == Tool::Brush;
-            ui.add_enabled_ui(brush_active, |ui| {
-                ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
-                ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
-                ui.add(egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"));
-            });
-
-            ui.add_space(10.0);
-            ui.separator();
-            layers_section(ui, state);
-
-            ui.add_space(10.0);
-            ui.separator();
-            mesh_effects_section(ui, state);
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("Material");
-            ui.label(
-                egui::RichText::new("Fill the active layer with an image (brick, moss…). Mask it for crevice/edge detail.")
-                    .weak()
-                    .small(),
-            );
-            ui.add(egui::Slider::new(&mut state.material_tile, 1.0..=16.0).text("Tile"));
-            if ui.button("Fill with image…").clicked() {
-                state.actions.fill_material = Some(state.material_tile);
-            }
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("Texture");
-
-            // Resolution picker. A change requests a resample at that size.
-            let mut res = state.resolution;
-            egui::ComboBox::from_label("Resolution")
-                .selected_text(format!("{res}×{res}"))
-                .show_ui(ui, |ui| {
-                    for size in [64u32, 128, 256] {
-                        ui.selectable_value(&mut res, size, format!("{size}×{size}"));
-                    }
-                });
-            if res != state.resolution {
-                state.resolution = res;
-                state.actions.set_resolution = Some(res);
-            }
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("Open…").clicked() {
+                ui.separator();
+                if ui.button("Open image…").clicked() {
                     state.actions.open_texture = true;
+                    ui.close_menu();
                 }
                 if ui.button("Save PNG…").clicked() {
                     state.actions.save_png = true;
+                    ui.close_menu();
                 }
-            });
-            egui::ComboBox::from_label("Engine")
-                .selected_text(state.export_preset.name())
-                .show_ui(ui, |ui| {
-                    for p in ExportPreset::ALL {
-                        ui.selectable_value(&mut state.export_preset, p, p.name());
-                    }
-                });
-            ui.label(
-                egui::RichText::new(state.export_preset.import_hint())
-                    .weak()
-                    .small(),
-            );
-            ui.horizontal(|ui| {
+                ui.separator();
                 if ui
-                    .button("Export indexed…")
+                    .button("Export indexed PNG…")
                     .on_hover_text("True paletted PNG for retro pipelines (needs Quantize on)")
                     .clicked()
                 {
                     state.actions.export_png = Some(true);
+                    ui.close_menu();
                 }
-                if ui.button("Export RGBA…").clicked() {
+                if ui.button("Export RGBA PNG…").clicked() {
                     state.actions.export_png = Some(false);
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Save project (.lowtex)…").clicked() {
+                    state.actions.save_project = true;
+                    ui.close_menu();
+                }
+                if ui.button("Open project (.lowtex)…").clicked() {
+                    state.actions.open_project = true;
+                    ui.close_menu();
                 }
             });
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("Palette");
-            ui.checkbox(&mut state.palette.enabled, "Quantize");
-            ui.add_enabled_ui(state.palette.enabled, |ui| {
-                ui.checkbox(&mut state.palette.dither, "Dither");
-                ui.add(
-                    egui::Slider::new(&mut state.palette.dither_strength, 0.0..=0.3)
-                        .text("Dither amt"),
-                );
+            ui.menu_button("Edit", |ui| {
+                if ui
+                    .add_enabled(state.can_undo, egui::Button::new("Undo"))
+                    .on_hover_text("Ctrl/⌘+Z")
+                    .clicked()
+                {
+                    state.actions.undo = true;
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(state.can_redo, egui::Button::new("Redo"))
+                    .on_hover_text("Ctrl/⌘+Shift+Z")
+                    .clicked()
+                {
+                    state.actions.redo = true;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Mesh", |ui| {
+                ui.menu_button("Unwrap UVs", |ui| {
+                    ui.label(
+                        egui::RichText::new("Connectivity charts, constant texel size")
+                            .weak()
+                            .small(),
+                    );
+                    // Density only scales the texels-per-world-unit (and the derived
+                    // texture size); the constant-density invariant holds either way.
+                    for d in crate::unwrap::Density::ALL {
+                        ui.radio_value(&mut state.unwrap_density, d, d.name());
+                    }
+                    if ui.button("Unwrap").clicked() {
+                        state.actions.unwrap = Some(state.unwrap_density);
+                        ui.close_menu();
+                    }
+                });
             });
 
-            // Swatch row of the active palette.
-            swatches(ui, &state.palette_swatches);
+            // Viewport display controls (G29/G30) live inline in the top bar so the
+            // common view toggles stay one click away instead of behind a collapsed
+            // side-panel header. They only set fields; the App pushes them each frame.
+            ui.separator();
+            ui.color_edit_button_rgb(&mut state.bg_color)
+                .on_hover_text("Background color");
+            ui.checkbox(&mut state.show_grid, "Grid");
+            ui.separator();
+            ui.label("Filter").on_hover_text(
+                "How the painted texture samples onto the model: nearest is crisp \
+                 (PSX), linear smooths it",
+            );
+            egui::ComboBox::from_id_salt("texture_filter")
+                .selected_text(state.texture_filter.label())
+                .show_ui(ui, |ui| {
+                    for mode in [TextureFilter::Nearest, TextureFilter::Linear] {
+                        ui.selectable_value(&mut state.texture_filter, mode, mode.label());
+                    }
+                });
+        });
+    });
+}
 
-            ui.horizontal_wrapped(|ui| {
-                for (i, p) in crate::palette::Palette::builtins().iter().enumerate() {
-                    if ui.button(&p.name).clicked() {
-                        state.actions.select_builtin_palette = Some(i);
+/// Build the controls for this frame: the top menu bar, the left controls panel,
+/// and the floating Layers palette. Mutates `state` in place and records one-shot
+/// requests in `state.actions` (reset each call).
+pub fn build(ctx: &Context, state: &mut UiState) {
+    state.actions = UiActions::default();
+
+    menu_bar(ctx, state);
+
+    let panel = egui::SidePanel::left("controls")
+        .resizable(true)
+        .default_width(248.0)
+        .width_range(200.0..=480.0)
+        .show(ctx, |ui| {
+            // Wrap the whole panel so controls stay reachable when the content is
+            // taller than the window — otherwise the bottom sections get clipped.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // ---- Brand ----
+                ui.add_space(2.0);
+                ui.heading("LOWTEX");
+                ui.label(
+                    egui::RichText::new("low-poly texture painter")
+                        .weak()
+                        .small(),
+                );
+
+                ui.separator();
+
+                // ---- Tool: paint tools on top, the three fills grouped below ----
+                heading(ui, "Tool");
+                segmented(
+                    ui,
+                    &mut state.tool,
+                    &[
+                        (Tool::Brush, "Brush", "Drag to paint color, or a loaded image"),
+                        (Tool::Fluid, "Fluid", "Drag to flow oil/water/blood down the surface"),
+                    ],
+                );
+                ui.label(egui::RichText::new("Fill").weak());
+                segmented(
+                    ui,
+                    &mut state.tool,
+                    &[
+                        (Tool::FillFace, "Face", "Fill the flat face you click"),
+                        (Tool::FillIsland, "Island", "Fill the UV island you click"),
+                        (Tool::FillObject, "All", "Fill the whole object"),
+                    ],
+                );
+
+                // ---- Color (used by both the brush and the fills) ----
+                heading(ui, "Color");
+                ui.color_edit_button_rgb(&mut state.brush.color);
+
+                // Brush shape sliders apply only to the tools that drag a brush; for
+                // the one-shot fills they're irrelevant, so we hide them entirely
+                // rather than show a row of dead, greyed-out controls.
+                let brush_active = matches!(state.tool, Tool::Brush | Tool::Fluid);
+                if brush_active {
+                    ui.add_space(2.0);
+                    ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
+                    ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
+                    ui.add(egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"));
+                }
+
+                // Brush image: load one to paint it (UV-tiled) instead of solid color;
+                // clear it to go back to color. The Tile slider only matters once an
+                // image is loaded, so it's hidden until then.
+                if state.tool == Tool::Brush {
+                    ui.add_space(2.0);
+                    if state.brush_image_loaded {
+                        ui.horizontal(|ui| {
+                            if ui.button("Brush image…").clicked() {
+                                state.actions.load_brush_image = true;
+                            }
+                            if ui.button("Clear").clicked() {
+                                state.actions.clear_brush_image = true;
+                            }
+                        });
+                        ui.add(egui::Slider::new(&mut state.brush_tile, 1.0..=16.0).text("Tile"));
+                    } else {
+                        if ui.button("Brush image…").clicked() {
+                            state.actions.load_brush_image = true;
+                        }
+                        ui.label(
+                            egui::RichText::new("Load an image to paint it instead of color.")
+                                .weak()
+                                .small(),
+                        );
                     }
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.add(egui::Slider::new(&mut state.palette_size, 2..=64).text("colors"));
-                if ui.button("From image…").clicked() {
-                    state.actions.generate_palette = Some(state.palette_size as usize);
-                }
-            });
 
-            ui.add_space(10.0);
+                // Fluid-brush specifics: pick a fluid (sets a starting viscosity), then
+                // tweak. It paints in the current brush color above. Drag on the model to
+                // flow it downhill; pooling on flat/upward faces and in creases is automatic.
+                if state.tool == Tool::Fluid {
+                    ui.add_space(2.0);
+                    egui::ComboBox::from_label("Fluid")
+                        .selected_text(state.fluid_kind.name())
+                        .show_ui(ui, |ui| {
+                            for k in FluidKind::ALL {
+                                if ui
+                                    .selectable_value(&mut state.fluid_kind, k, k.name())
+                                    .clicked()
+                                {
+                                    // Reset viscosity to the chosen fluid's default; the
+                                    // fluid is laid down in the current brush color.
+                                    state.fluid_viscosity = k.defaults().1;
+                                }
+                            }
+                        });
+                    ui.add(egui::Slider::new(&mut state.fluid_viscosity, 0.0..=1.0).text("Viscosity"))
+                        .on_hover_text("Low = thin, runs far; high = thick, pools");
+                    ui.add(egui::Slider::new(&mut state.fluid_amount, 0.0..=1.0).text("Amount"));
+                }
+
+                ui.add_space(6.0);
+
+                // ---- Everything occasional/advanced collapses away by default ----
+                // The active layer's non-destructive effect stack (lives here on the
+                // left, not in the Layers palette).
+                egui::CollapsingHeader::new("Layer effects")
+                    .default_open(false)
+                    .show(ui, |ui| effects_section(ui, state));
+                egui::CollapsingHeader::new("Mesh effects")
+                    .default_open(false)
+                    .show(ui, |ui| mesh_effects_section(ui, state));
+                egui::CollapsingHeader::new("Material")
+                    .default_open(false)
+                    .show(ui, |ui| material_section(ui, state));
+                egui::CollapsingHeader::new("Canvas")
+                    .default_open(false)
+                    .show(ui, |ui| export_section(ui, state));
+                egui::CollapsingHeader::new("Palette")
+                    .default_open(false)
+                    .show(ui, |ui| palette_section(ui, state));
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("LMB paint · RMB orbit · MMB pan · wheel zoom")
+                        .weak()
+                        .small(),
+                );
+                ui.label(
+                    egui::RichText::new("Undo Ctrl/⌘+Z · Redo Ctrl/⌘+Shift+Z")
+                        .weak()
+                        .small(),
+                );
+            });
+        });
+
+    // Report the laid-out width (the user may have dragged the edge) so the App can
+    // offset the viewport object by the panel.
+    state.panel_width = panel.response.rect.width();
+
+    // ---- Layers: a separate paint.net-style palette, floating bottom-right ----
+    layers_window(ctx, state);
+}
+
+/// Layers as a separate, paint.net-style palette floating in the bottom-right
+/// corner over the viewport. The layer list is a column of large single-click
+/// rows; the active layer's options (blend, opacity, mask) live in a fixed footer
+/// pinned to the bottom of the palette — never inline with the rows, so the
+/// controls don't jump around as you click between layers.
+fn layers_window(ctx: &Context, state: &mut UiState) {
+    egui::Window::new("Layers")
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
+        .resizable(false)
+        .collapsible(true)
+        .show(ctx, |ui| {
+            // Fixed width so the palette stays a tidy box; the height grows to fit.
+            // (Panels-inside-a-Window don't lay out, so this is a plain top-down
+            // flow: header, then a scroll-capped list, then the options footer.)
+            ui.set_width(216.0);
+            layers_header(ui, state);
             ui.separator();
-            ui.label(
-                egui::RichText::new("LMB paint · RMB orbit · MMB pan · wheel zoom")
-                    .weak()
-                    .small(),
-            );
-            ui.label(
-                egui::RichText::new("Undo Ctrl/⌘+Z · Redo Ctrl/⌘+Shift+Z")
-                    .weak()
-                    .small(),
-            );
+            // Shrink to the rows when there are few; cap + scroll when there are many.
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| layers_list(ui, state));
+            ui.separator();
+            layer_options(ui, state);
         });
 }
 
-/// The layer stack panel: add/remove/reorder, per-layer visibility, the active
-/// layer's blend mode + opacity. Emits actions on interaction (no per-frame push).
-fn layers_section(ui: &mut egui::Ui, state: &mut UiState) {
-    ui.horizontal(|ui| {
-        ui.label("Layers");
-        if ui.small_button("+").on_hover_text("Add layer").clicked() {
-            state.actions.add_layer = true;
-        }
-        if ui.small_button("−").on_hover_text("Delete layer").clicked() {
-            state.actions.remove_layer = true;
-        }
-        if ui.small_button("↑").on_hover_text("Move up").clicked() {
-            state.actions.move_layer_up = true;
-        }
-        if ui.small_button("↓").on_hover_text("Move down").clicked() {
-            state.actions.move_layer_down = true;
-        }
-    });
+/// The palette header: the add / delete / reorder buttons. The "Layers" title is
+/// the window's own title bar, so it isn't repeated here.
+fn layers_header(ui: &mut egui::Ui, state: &mut UiState) {
+    match button_group(
+        ui,
+        &[
+            ("+", "Add layer"),
+            ("−", "Delete layer"),
+            ("↑", "Move up"),
+            ("↓", "Move down"),
+        ],
+    ) {
+        Some(0) => state.actions.add_layer = true,
+        Some(1) => state.actions.remove_layer = true,
+        Some(2) => state.actions.move_layer_up = true,
+        Some(3) => state.actions.move_layer_down = true,
+        _ => {}
+    }
+}
 
-    // Top layer first in the list (reverse of the bottom-up storage order).
+/// The layer rows: top layer first, each a tall full-width clickable row with a
+/// visibility checkbox. No per-layer controls live here — they're in the footer.
+fn layers_list(ui: &mut egui::Ui, state: &mut UiState) {
     let count = state.layers.len();
+    if count == 0 {
+        ui.label(
+            egui::RichText::new("No layers yet — press + to add one.")
+                .weak()
+                .small(),
+        );
+        return;
+    }
+    // Reverse of the bottom-up storage order. The active row paints amber (the theme
+    // selection colour) so it's unmistakable.
     for ui_idx in (0..count).rev() {
         let layer = state.layers[ui_idx].clone();
+        let selected = ui_idx == state.active_layer;
         ui.horizontal(|ui| {
             let mut vis = layer.visible;
-            if ui.checkbox(&mut vis, "").changed() {
+            if ui
+                .checkbox(&mut vis, "")
+                .on_hover_text("Show / hide layer")
+                .changed()
+            {
                 state.actions.set_layer_visible = Some((ui_idx, vis));
             }
-            let selected = ui_idx == state.active_layer;
-            if ui.selectable_label(selected, &layer.name).clicked() {
+            // Dim the name of a hidden layer so visibility reads at a glance.
+            let name = egui::RichText::new(&layer.name);
+            let name = if layer.visible { name } else { name.weak() };
+            let w = ui.available_width();
+            let h = ui.spacing().interact_size.y;
+            if ui
+                .add_sized([w, h], egui::SelectableLabel::new(selected, name))
+                .clicked()
+            {
                 state.actions.select_layer = Some(ui_idx);
             }
         });
     }
-
-    // Active layer's blend + opacity.
-    if let Some(active) = state.layers.get(state.active_layer).cloned() {
-        let i = state.active_layer;
-        egui::ComboBox::from_label("Blend")
-            .selected_text(active.blend.name())
-            .show_ui(ui, |ui| {
-                for mode in BlendMode::ALL {
-                    let mut sel = active.blend;
-                    if ui.selectable_value(&mut sel, mode, mode.name()).clicked() {
-                        state.actions.set_layer_blend = Some((i, mode));
-                    }
-                }
-            });
-        let mut op = active.opacity;
-        let resp = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).text("Layer opacity"));
-        // Snapshot once when the drag begins so the whole adjustment is one undo
-        // step, not one per frame.
-        if resp.drag_started() {
-            state.actions.checkpoint = true;
-        }
-        if resp.changed() {
-            state.actions.set_layer_opacity = Some((i, op));
-        }
-    }
-
-    // Mask painting (G11): paint into the active layer's reveal mask.
-    ui.add_space(4.0);
-    ui.checkbox(&mut state.paint_mask, "Paint mask");
-    ui.add_enabled_ui(state.paint_mask, |ui| {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut state.mask_reveal, false, "Hide");
-            ui.selectable_value(&mut state.mask_reveal, true, "Reveal");
-        });
-    });
 }
 
-/// Mesh effects: the baked AO + curvature maps driving layers and masks, all
-/// through one shared Levels remap (Strength / Contrast / Invert). Presets are
-/// one-click; the Source combo plus Tint/Mask buttons are the generic route.
+/// The active layer's options, pinned to the bottom of the palette: blend mode,
+/// opacity, and mask painting. (The effect stack lives in the left panel.)
+fn layer_options(ui: &mut egui::Ui, state: &mut UiState) {
+    let Some(active) = state.layers.get(state.active_layer).cloned() else {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Select a layer to edit its options.")
+                .weak()
+                .small(),
+        );
+        return;
+    };
+    let i = state.active_layer;
+
+    ui.add_space(2.0);
+    // Editable name. Layers auto-name from the ops applied to them; typing here sets
+    // a name by hand and locks the auto-naming. The buffer mirrors the synced name
+    // while unfocused (so it tracks auto-renames and layer switches) and commits on
+    // blur/Enter — committing per keystroke would fight the live re-sync.
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut state.layer_name_edit)
+            .hint_text("Layer name")
+            .desired_width(f32::INFINITY),
+    );
+    if resp.lost_focus() {
+        let new = state.layer_name_edit.trim();
+        if !new.is_empty() && new != active.name {
+            state.actions.set_layer_name = Some((i, new.to_string()));
+        }
+    }
+    if !resp.has_focus() {
+        state.layer_name_edit = active.name.clone();
+    }
+    egui::ComboBox::from_label("Blend")
+        .selected_text(active.blend.name())
+        .show_ui(ui, |ui| {
+            for mode in BlendMode::ALL {
+                let mut sel = active.blend;
+                if ui.selectable_value(&mut sel, mode, mode.name()).clicked() {
+                    state.actions.set_layer_blend = Some((i, mode));
+                }
+            }
+        });
+    let mut op = active.opacity;
+    let resp = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).text("Opacity"));
+    // Snapshot once when the drag begins so the whole adjustment is one undo step.
+    if resp.drag_started() {
+        state.actions.checkpoint = true;
+    }
+    if resp.changed() {
+        state.actions.set_layer_opacity = Some((i, op));
+    }
+
+    // Mask painting (G11): the Hide/Reveal choice only matters while masking.
+    ui.checkbox(&mut state.paint_mask, "Paint mask")
+        .on_hover_text("Brush into the active layer's reveal mask instead of its color");
+    if state.paint_mask {
+        segmented(
+            ui,
+            &mut state.mask_reveal,
+            &[(false, "Hide", ""), (true, "Reveal", "")],
+        );
+    }
+}
+
+/// The active layer's non-destructive effect stack: an "Add effect" menu plus a
+/// row per effect (reorder, remove, and its parameter sliders). Edits emit actions
+/// targeting the active layer; the renderer re-runs the stack each composite, so
+/// the painted pixels are never touched.
+fn effects_section(ui: &mut egui::Ui, state: &mut UiState) {
+    ui.menu_button("Add effect +", |ui| {
+        for kind in EffectKind::ALL {
+            if ui.button(kind.name()).clicked() {
+                state.actions.add_effect = Some(kind);
+                ui.close_menu();
+            }
+        }
+    });
+
+    // Clone the active layer's stack so we can read it while writing into
+    // `state.actions` (only one slider/button changes per frame).
+    let effects = state
+        .layers
+        .get(state.active_layer)
+        .map(|l| l.effects.clone())
+        .unwrap_or_default();
+    if effects.is_empty() {
+        ui.label(
+            egui::RichText::new("No effects — adjustments are live and re-orderable")
+                .weak()
+                .small(),
+        );
+        return;
+    }
+
+    let count = effects.len();
+    // Top of the stack (last to apply) shown first.
+    for i in (0..count).rev() {
+        let mut fx = effects[i];
+        ui.group(|ui| {
+            ui.label(egui::RichText::new(fx.name()).strong());
+            match button_group(
+                ui,
+                &[("↑", "Move up"), ("↓", "Move down"), ("X", "Remove")],
+            ) {
+                Some(0) => state.actions.move_effect_up = Some(i),
+                Some(1) => state.actions.move_effect_down = Some(i),
+                Some(2) => state.actions.remove_effect = Some(i),
+                _ => {}
+            }
+
+            let mut changed = false;
+            let mut drag_started = false;
+            let mut slider = |ui: &mut egui::Ui, v: &mut f32, range, text| {
+                let resp = ui.add(egui::Slider::new(v, range).text(text));
+                changed |= resp.changed();
+                drag_started |= resp.drag_started();
+            };
+            match &mut fx {
+                Effect::HueSatLight { hue, sat, light } => {
+                    slider(ui, hue, -180.0..=180.0, "Hue");
+                    slider(ui, sat, -1.0..=1.0, "Saturation");
+                    slider(ui, light, -1.0..=1.0, "Lightness");
+                }
+                Effect::BrightnessContrast {
+                    brightness,
+                    contrast,
+                } => {
+                    slider(ui, brightness, -1.0..=1.0, "Brightness");
+                    slider(ui, contrast, -1.0..=1.0, "Contrast");
+                }
+                Effect::Blur { radius } => {
+                    slider(ui, radius, 0.0..=16.0, "Radius");
+                }
+                Effect::Warp { amount, scale } => {
+                    slider(ui, amount, 0.0..=16.0, "Amount");
+                    slider(ui, scale, 1.0..=24.0, "Scale");
+                }
+            }
+            // One checkpoint at drag start collapses the whole drag into a single
+            // undo step (same pattern as layer opacity).
+            if drag_started {
+                state.actions.checkpoint = true;
+            }
+            if changed {
+                state.actions.set_effect = Some((i, fx));
+            }
+        });
+    }
+}
+
+/// Mesh effects: baked AO + curvature + sun light driving layers and masks. Grouped
+/// into three subsections — Looks (one-click presets), Tune (the shared Levels/noise
+/// that shape every result), and Custom (route a Source channel into a tint, mask, or
+/// gradient). The occasional controls — sun direction, noise character, the gradient
+/// ramp — sit behind nested disclosures so the column stays scannable.
 fn mesh_effects_section(ui: &mut egui::Ui, state: &mut UiState) {
-    ui.label("Mesh effects");
     ui.label(
-        egui::RichText::new("Drive layers & masks from baked AO and edges")
+        egui::RichText::new("Wear, dirt & shadow from the mesh's own geometry.")
             .weak()
             .small(),
     );
 
-    // Shared Levels controls.
+    // ---- Looks: one-click effects that each drop a new layer, honoring the Tune
+    // controls below. Levels/noise are captured here (start-of-frame state) so the
+    // presets fire correctly even while Tune is mid-edit or collapsed.
+    let levels = state.levels();
+    let noise = state.noise_mod();
+    heading(ui, "Looks");
+    match button_group(
+        ui,
+        &[
+            ("Darken (AO)", "Shadow in crevices"),
+            ("Highlights", "Brighten convex edges"),
+        ],
+    ) {
+        Some(0) => state.actions.apply_ao = Some((levels, noise)),
+        Some(1) => state.actions.apply_highlight = Some((levels, noise)),
+        _ => {}
+    }
+    match button_group(
+        ui,
+        &[
+            ("Dirt", "Dark grime settling into cavities"),
+            ("Edge wear", "Worn, lightened convex edges"),
+        ],
+    ) {
+        Some(0) => state.actions.apply_dirt = Some((levels, noise)),
+        Some(1) => state.actions.apply_edge_wear = Some((levels, noise)),
+        _ => {}
+    }
+    // Directional light ("sun"): "Sunlight" lights the faces turned toward the sun;
+    // "Top-down" aims it straight up and drops pale dust on the upward faces.
+    match button_group(
+        ui,
+        &[
+            ("Sunlight", "Warm highlight on the lit faces"),
+            ("Top-down", "Pale dust on upward-facing surfaces"),
+        ],
+    ) {
+        Some(0) => state.actions.apply_sun = Some((levels, noise)),
+        Some(1) => {
+            // Aim the sun straight up; app.rs pushes this before applying the dust.
+            state.sun_elevation = 90.0;
+            state.actions.apply_top_dust = Some((levels, noise));
+        }
+        _ => {}
+    }
+    // Sun direction shapes the two light looks above (and the Light source in Custom);
+    // tucked behind a disclosure since it's irrelevant to the wear/dirt presets.
+    egui::CollapsingHeader::new("Sun direction")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.add(
+                egui::Slider::new(&mut state.sun_elevation, 0.0..=90.0)
+                    .text("Sun height")
+                    .suffix("°"),
+            );
+            ui.add(
+                egui::Slider::new(&mut state.sun_azimuth, 0.0..=360.0)
+                    .text("Sun angle")
+                    .suffix("°"),
+            );
+            ui.checkbox(&mut state.sun_shadow, "Cast shadows");
+        });
+
+    // ---- Tune: the shared Levels remap and noise "break up" multiplied into every
+    // Look above and every Custom route below. Strength/Contrast/Invert/Break up stay
+    // inline (the most-touched knobs); the noise character sits behind a disclosure.
+    heading(ui, "Tune");
     ui.add(egui::Slider::new(&mut state.ao_strength, 0.0..=1.0).text("Strength"));
     ui.add(egui::Slider::new(&mut state.effect_contrast, 0.0..=1.0).text("Contrast"));
     ui.checkbox(&mut state.effect_invert, "Invert");
-    let levels = Levels {
-        invert: state.effect_invert,
-        contrast: state.effect_contrast,
-        strength: state.ao_strength,
-    };
+    // Break up (noise): a procedural modifier multiplied into whatever effect you
+    // apply, so wear/dirt lands in patches instead of a perfect ring — and, with the
+    // "Surface" source, becomes pure grunge. Amount 0 leaves it clean.
+    ui.add(
+        egui::Slider::new(&mut state.noise_amount, 0.0..=1.0)
+            .text("Break up")
+            .custom_formatter(|v, _| {
+                if v <= 0.0 {
+                    "off".to_string()
+                } else {
+                    format!("{v:.2}")
+                }
+            }),
+    );
+    // Noise character (only bites when Break up > 0): which pattern, how big, how hard.
+    egui::CollapsingHeader::new("Noise detail")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::ComboBox::from_label("Pattern")
+                .selected_text(state.noise_kind.name())
+                .show_ui(ui, |ui| {
+                    for kind in NoiseKind::ALL {
+                        ui.selectable_value(&mut state.noise_kind, kind, kind.name());
+                    }
+                });
+            ui.add(egui::Slider::new(&mut state.noise_scale, 1.0..=24.0).text("Noise scale"));
+            ui.add(egui::Slider::new(&mut state.noise_contrast, 0.0..=1.0).text("Noise contrast"));
+        });
 
-    // Presets — fixed source + color + blend, honoring the Levels above.
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        if ui
-            .button("Darken (AO)")
-            .on_hover_text("Shadow in crevices")
-            .clicked()
-        {
-            state.actions.apply_ao = Some(levels);
-        }
-        if ui
-            .button("Highlights")
-            .on_hover_text("Brighten convex edges")
-            .clicked()
-        {
-            state.actions.apply_highlight = Some(levels);
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui
-            .button("Dirt")
-            .on_hover_text("Dark grime settling into cavities")
-            .clicked()
-        {
-            state.actions.apply_dirt = Some(levels);
-        }
-        if ui
-            .button("Edge wear")
-            .on_hover_text("Worn, lightened convex edges")
-            .clicked()
-        {
-            state.actions.apply_edge_wear = Some(levels);
-        }
-    });
-
-    // Generic route: pick a source, then drive a brush-colored tint layer or the
-    // active layer's reveal mask from it (the Substance-style mask workflow).
-    ui.add_space(6.0);
+    // ---- Custom: route any baked Source channel into a tint layer, the active
+    // layer's mask, or a gradient ramp. Recompute levels/noise here so these honor
+    // edits made in Tune this same frame.
+    let levels = state.levels();
+    let noise = state.noise_mod();
+    heading(ui, "Custom");
     egui::ComboBox::from_label("Source")
         .selected_text(state.effect_source.name())
         .show_ui(ui, |ui| {
@@ -490,60 +977,127 @@ fn mesh_effects_section(ui: &mut egui::Ui, state: &mut UiState) {
                 ui.selectable_value(&mut state.effect_source, src, src.name());
             }
         });
-    ui.horizontal(|ui| {
-        if ui
-            .button("Tint layer")
-            .on_hover_text("New layer: the Color above, masked to the source")
-            .clicked()
-        {
-            state.actions.apply_tint = Some((state.effect_source, levels, state.brush.color));
+    match button_group(
+        ui,
+        &[
+            ("Tint layer", "New layer: the Color above, masked to the source"),
+            ("Mask layer", "Set the active layer's mask from the source"),
+        ],
+    ) {
+        Some(0) => {
+            state.actions.apply_tint =
+                Some((state.effect_source, levels, state.brush.color, noise))
         }
-        if ui
-            .button("Mask layer")
-            .on_hover_text("Set the active layer's mask from the source")
-            .clicked()
-        {
-            state.actions.mask_from_map = Some((state.effect_source, levels));
-        }
-    });
-
-    // Preset looks (G21): one-click recipes that re-evaluate against this mesh, plus
-    // save/load so a look you build travels to any other model.
-    ui.add_space(8.0);
-    ui.separator();
-    ui.label("Looks");
-    ui.horizontal_wrapped(|ui| {
-        for preset in crate::preset::builtins() {
+        Some(1) => state.actions.mask_from_map = Some((state.effect_source, levels, noise)),
+        _ => {}
+    }
+    // Gradient map: color the source's value through a low→high ramp, so one channel
+    // reads as a full material across the surface — dark crevices → bright tops, or a
+    // lit→shaded ramp from the sun.
+    egui::CollapsingHeader::new("Gradient")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Colors");
+                ui.color_edit_button_rgb(&mut state.grad_low);
+                ui.label("→");
+                ui.color_edit_button_rgb(&mut state.grad_high);
+            });
             if ui
-                .button(&preset.name)
-                .on_hover_text("Apply this look — follows the loaded mesh's geometry")
+                .button("Gradient layer")
+                .on_hover_text("New layer: the source's value mapped through the ramp")
                 .clicked()
             {
-                state.actions.apply_builtin_preset = Some(preset.name.clone());
+                state.actions.apply_gradient = Some((
+                    state.effect_source,
+                    levels,
+                    state.grad_low,
+                    state.grad_high,
+                    noise,
+                ));
+            }
+        });
+}
+
+/// Fill the active layer with a tiled material image (brick, moss…).
+fn material_section(ui: &mut egui::Ui, state: &mut UiState) {
+    ui.label(
+        egui::RichText::new(
+            "Fill the active layer with an image (brick, moss…). Mask it for crevice/edge detail.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.add(egui::Slider::new(&mut state.material_tile, 1.0..=16.0).text("Tile"));
+    if ui.button("Fill with image…").clicked() {
+        state.actions.fill_material = Some(state.material_tile);
+    }
+}
+
+/// Canvas resolution and the engine-target hint that shapes PNG export naming. The
+/// open/save/export *actions* themselves live in the File menu; this section holds
+/// only the persistent settings they read.
+fn export_section(ui: &mut egui::Ui, state: &mut UiState) {
+    // Resolution is derived by the unwrap (Mesh → Unwrap UVs) to hold a constant
+    // world-space texel size, so it's shown read-only here rather than picked.
+    ui.label(format!("Texture: {0}×{0}", state.resolution));
+    let hint = if state.last_atlas_clamped {
+        "Set by Unwrap density (clamped to GPU max)"
+    } else {
+        "Set by Unwrap density"
+    };
+    ui.label(egui::RichText::new(hint).weak().small());
+
+    egui::ComboBox::from_label("Engine")
+        .selected_text(state.export_preset.name())
+        .show_ui(ui, |ui| {
+            for p in ExportPreset::ALL {
+                ui.selectable_value(&mut state.export_preset, p, p.name());
+            }
+        });
+    ui.label(
+        egui::RichText::new(state.export_preset.import_hint())
+            .weak()
+            .small(),
+    );
+    ui.label(
+        egui::RichText::new("Open / Save PNG / Export live in the File menu.")
+            .weak()
+            .small(),
+    );
+}
+
+/// Palette quantization (the PSX look) plus built-in / from-image palettes.
+fn palette_section(ui: &mut egui::Ui, state: &mut UiState) {
+    ui.checkbox(&mut state.palette.enabled, "Quantize");
+    // Dither only does anything while quantizing, so it appears only then. Shown
+    // inline (not indented) to keep the section flat — no nested layout.
+    if state.palette.enabled {
+        ui.checkbox(&mut state.palette.dither, "Dither");
+        ui.add(egui::Slider::new(&mut state.palette.dither_strength, 0.0..=0.3).text("Dither amt"));
+    }
+
+    // Swatch row of the active palette.
+    swatches(ui, &state.palette_swatches);
+
+    ui.horizontal_wrapped(|ui| {
+        for (i, p) in crate::palette::Palette::builtins().iter().enumerate() {
+            if ui.button(&p.name).clicked() {
+                state.actions.select_builtin_palette = Some(i);
             }
         }
     });
     ui.horizontal(|ui| {
-        if ui
-            .button("Save look…")
-            .on_hover_text("Save the applied generators as a reusable preset")
-            .clicked()
-        {
-            state.actions.save_preset = true;
-        }
-        if ui
-            .button("Load look…")
-            .on_hover_text("Apply a saved .lowpreset to the current mesh")
-            .clicked()
-        {
-            state.actions.load_preset = true;
+        ui.add(egui::Slider::new(&mut state.palette_size, 2..=64).text("colors"));
+        if ui.button("From image…").clicked() {
+            state.actions.generate_palette = Some(state.palette_size as usize);
         }
     });
 }
 
 /// Draw a wrapping row of small color swatches.
 fn swatches(ui: &mut egui::Ui, colors: &[[f32; 3]]) {
-    let size = egui::vec2(16.0, 16.0);
+    let size = egui::vec2(12.0, 12.0);
     ui.horizontal_wrapped(|ui| {
         for c in colors {
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -552,7 +1106,7 @@ fn swatches(ui: &mut egui::Ui, colors: &[[f32; 3]]) {
                 (c[1] * 255.0) as u8,
                 (c[2] * 255.0) as u8,
             );
-            ui.painter().rect_filled(rect, 2.0, color);
+            ui.painter().rect_filled(rect, 0.0, color);
         }
     });
 }

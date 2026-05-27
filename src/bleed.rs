@@ -89,6 +89,73 @@ pub fn dilate(pixels: &mut [u8], covered: &[bool], size: u32, pad: u32) {
     }
 }
 
+/// Like `dilate`, but only fills (and only iterates) texels inside `region`. The
+/// dirty-rectangle counterpart used by the per-stroke refresh. Validity/colors for
+/// neighbours *outside* `region` are read from `covered`/`pixels` directly (covered
+/// texels there already hold their correct composited color), so as long as the
+/// caller pads `region` by `pad` beyond the texels it intends to keep, those kept
+/// texels are filled byte-identically to a full `dilate`. Region-sized scratch only —
+/// no full-image allocation.
+pub fn dilate_region(
+    pixels: &mut [u8],
+    covered: &[bool],
+    size: u32,
+    pad: u32,
+    region: crate::paint::TexRect,
+) {
+    if pad == 0 {
+        return;
+    }
+    let w = size as i32;
+    let (rw, rh) = (region.width() as usize, region.height() as usize);
+
+    // Region-local validity. Outside the region, only `covered` texels are valid
+    // sources (never the previously-dilated gutter), matching full `dilate`.
+    let mut valid = vec![false; rw * rh];
+    for ry in 0..rh {
+        for rx in 0..rw {
+            let gx = region.x0 as usize + rx;
+            let gy = region.y0 as usize + ry;
+            valid[ry * rw + rx] = covered[gy * size as usize + gx];
+        }
+    }
+    let valid_at = |valid: &[bool], gx: i32, gy: i32| -> bool {
+        if region.contains(gx as u32, gy as u32) {
+            let rx = (gx - region.x0 as i32) as usize;
+            let ry = (gy - region.y0 as i32) as usize;
+            valid[ry * rw + rx]
+        } else {
+            covered[(gy * w + gx) as usize]
+        }
+    };
+
+    for _ in 0..pad {
+        let frozen = valid.clone();
+        for ry in 0..rh {
+            for rx in 0..rw {
+                let li = ry * rw + rx;
+                if frozen[li] {
+                    continue;
+                }
+                let gx = (region.x0 as usize + rx) as i32;
+                let gy = (region.y0 as usize + ry) as i32;
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let (nx, ny) = (gx + dx, gy + dy);
+                    if nx < 0 || ny < 0 || nx >= w || ny >= w {
+                        continue;
+                    }
+                    if valid_at(&frozen, nx, ny) {
+                        let (s, d) = ((ny * w + nx) as usize * 4, (gy * w + gx) as usize * 4);
+                        pixels.copy_within(s..s + 4, d);
+                        valid[li] = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +180,46 @@ mod tests {
                 &[255, 0, 0, 255],
                 "neighbour ({nx},{ny}) not bled"
             );
+        }
+    }
+
+    #[test]
+    fn dilate_region_matches_full_inside_kept_region() {
+        use crate::paint::TexRect;
+        // A covered block in the middle of a 16² field; both full and region dilate
+        // grow it outward. Within the kept region (`rect + pad`) the two must agree.
+        let size = 16u32;
+        let mut covered = vec![false; (size * size) as usize];
+        for y in 6..10 {
+            for x in 6..10 {
+                covered[(y * size + x) as usize] = true;
+            }
+        }
+        let mut full = vec![0u8; (size * size * 4) as usize];
+        for i in 0..(size * size) as usize {
+            if covered[i] {
+                full[i * 4..i * 4 + 4].copy_from_slice(&[200, 30, 40, 255]);
+            }
+        }
+        let mut region = full.clone();
+        let pad = 3u32;
+        dilate(&mut full, &covered, size, pad);
+
+        let rect = TexRect {
+            x0: 6,
+            y0: 6,
+            x1: 10,
+            y1: 10,
+        };
+        let proc = rect.expanded(2 * pad, size);
+        dilate_region(&mut region, &covered, size, pad, proc);
+
+        let keep = rect.expanded(pad, size);
+        for y in keep.y0..keep.y1 {
+            for x in keep.x0..keep.x1 {
+                let i = ((y * size + x) * 4) as usize;
+                assert_eq!(region[i..i + 4], full[i..i + 4], "kept texel ({x},{y})");
+            }
         }
     }
 

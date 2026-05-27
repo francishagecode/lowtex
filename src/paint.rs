@@ -136,9 +136,79 @@ impl Texture {
     }
 }
 
+/// A rectangular region of texels, `[x0, x1) × [y0, y1)` (exclusive upper bound),
+/// in texture space. Used to bound a stroke's display refresh to the texels a brush
+/// actually touched, so paint cost is proportional to brush area, not the whole
+/// texture (the dirty-rectangle optimization).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TexRect {
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+}
+
+impl TexRect {
+    /// The texels a brush of `radius` centered at texel-space `(cx, cy)` can touch:
+    /// `cx as i32 ± radius.ceil()`, matching the stamp loops in `Texture::stamp_stroke`
+    /// and `Material::stamp` exactly. Clamped to `[0, size)`; `None` if it falls
+    /// entirely outside the texture.
+    pub fn from_stamp(cx: f32, cy: f32, radius: f32, size: u32) -> Option<TexRect> {
+        let r = radius.max(0.5).ceil() as i32;
+        let (cxi, cyi) = (cx as i32, cy as i32);
+        let x0 = (cxi - r).max(0);
+        let y0 = (cyi - r).max(0);
+        let x1 = (cxi + r + 1).min(size as i32); // +1: inclusive `+r` → exclusive bound
+        let y1 = (cyi + r + 1).min(size as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        Some(TexRect {
+            x0: x0 as u32,
+            y0: y0 as u32,
+            x1: x1 as u32,
+            y1: y1 as u32,
+        })
+    }
+
+    /// Smallest rect covering both.
+    pub fn union(self, other: TexRect) -> TexRect {
+        TexRect {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
+    /// Grow by `pad` texels on every side, clamped to `[0, size)`.
+    pub fn expanded(self, pad: u32, size: u32) -> TexRect {
+        TexRect {
+            x0: self.x0.saturating_sub(pad),
+            y0: self.y0.saturating_sub(pad),
+            x1: (self.x1 + pad).min(size),
+            y1: (self.y1 + pad).min(size),
+        }
+    }
+
+    pub fn width(self) -> u32 {
+        self.x1 - self.x0
+    }
+
+    pub fn height(self) -> u32 {
+        self.y1 - self.y0
+    }
+
+    /// True if `(x, y)` lies inside the rect.
+    pub fn contains(self, x: u32, y: u32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
+}
+
 /// Radial brush coverage at normalized distance `d` (0 at center, 1 at the rim)
 /// for a given `hardness` (1 = hard edge, 0 = fully soft). Returns 0..1.
-fn falloff(d: f32, hardness: f32) -> f32 {
+/// Shared by the solid-color stamp here and the texture-brush stamp in `material`.
+pub(crate) fn falloff(d: f32, hardness: f32) -> f32 {
     if d >= 1.0 {
         return 0.0;
     }

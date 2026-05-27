@@ -10,7 +10,9 @@
 // wrapped, indexes the material. So the material repeats `tile` times across the
 // 0–1 UV space and rides along with whatever unwrap the mesh has.
 
-use crate::paint::Texture;
+use glam::Vec2;
+
+use crate::paint::{falloff, Brush, Texture};
 
 /// A loaded source texture used as paint.
 #[derive(Clone)]
@@ -49,6 +51,66 @@ impl Material {
             self.pixels[i + 2],
             self.pixels[i + 3],
         ]
+    }
+
+    /// Stamp this material into `dst` at UV `uv`, gated by the brush's radius and
+    /// falloff with per-stroke coverage accumulation — the texture-brush counterpart
+    /// to `Texture::stamp_stroke`. The source color for each painted texel is the
+    /// material sampled at *that texel's own* UV (tiled), so a stroke reveals exactly
+    /// what a full `fill` would put there: brushing is "fill, but only where you drag".
+    ///
+    /// `base` is the layer as it was when the stroke began and `coverage` the stroke's
+    /// per-texel coverage, both shared with the solid-color path so overlap within one
+    /// stroke takes the max coverage (no double-application). UV has V=0 at the top.
+    pub fn stamp(
+        &self,
+        dst: &mut Texture,
+        uv: Vec2,
+        brush: &Brush,
+        tile: f32,
+        base: &[u8],
+        coverage: &mut [f32],
+    ) {
+        let cx = uv.x * dst.width as f32;
+        let cy = uv.y * dst.height as f32;
+        let radius = brush.radius.max(0.5);
+        let r = radius.ceil() as i32;
+
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let dist = ((dx * dx + dy * dy) as f32).sqrt();
+                let a = brush.opacity * falloff(dist / radius, brush.hardness);
+                if a <= 0.0 {
+                    continue;
+                }
+                let x = cx as i32 + dx;
+                let y = cy as i32 + dy;
+                if x < 0 || y < 0 || x >= dst.width as i32 || y >= dst.height as i32 {
+                    continue;
+                }
+                let texel = (y as u32 * dst.width + x as u32) as usize;
+                if a <= coverage[texel] {
+                    continue; // already covered at least this much this stroke
+                }
+                coverage[texel] = a;
+                let cov = a;
+                let src = self.sample(
+                    x as f32 / dst.width as f32,
+                    y as f32 / dst.height as f32,
+                    tile,
+                );
+                let i = texel * 4;
+                for c in 0..3 {
+                    let under = base[i + c] as f32;
+                    dst.pixels[i + c] = (under * (1.0 - cov) + src[c] as f32 * cov)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+                // Raise alpha toward opaque by coverage, like the color stamp.
+                let base_a = base[i + 3] as f32;
+                dst.pixels[i + 3] = (base_a * (1.0 - cov) + 255.0 * cov).round() as u8;
+            }
+        }
     }
 
     /// Fill `dst` (a `size`×`size` layer texture) with this material, UV-tiled. Each
@@ -92,6 +154,58 @@ mod tests {
         assert_eq!(m.sample(0.9, 0.1, 1.0), [0, 255, 0, 255]); // x→col1
                                                                // Wrapping: u=1.1 ≡ 0.1.
         assert_eq!(m.sample(1.1, 0.1, 1.0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn stamp_reveals_what_fill_would_put_there() {
+        // A full-coverage stamp over a texel must equal the fill result there: the
+        // texture brush is "fill, but only where you drag".
+        let m = checker_material();
+        let size = 8u32;
+        let mut filled = Texture::new(size, size, [0, 0, 0, 0]);
+        m.fill(&mut filled, 2.0);
+
+        let mut painted = Texture::new(size, size, [0, 0, 0, 255]);
+        let base = painted.pixels.clone();
+        let mut coverage = vec![0.0; (size * size) as usize];
+        // Hard, opaque brush centered so its full-coverage core covers texel (4,4).
+        let brush = Brush {
+            color: [0.0, 0.0, 0.0],
+            radius: 3.0,
+            opacity: 1.0,
+            hardness: 1.0,
+        };
+        let center = Vec2::new(4.5 / size as f32, 4.5 / size as f32);
+        m.stamp(&mut painted, center, &brush, 2.0, &base, &mut coverage);
+
+        let i = ((4 * size + 4) * 4) as usize;
+        assert_eq!(painted.pixels[i..i + 4], filled.pixels[i..i + 4]);
+    }
+
+    #[test]
+    fn stamp_leaves_outside_the_footprint_untouched() {
+        let m = checker_material();
+        let size = 16u32;
+        let mut painted = Texture::new(size, size, [9, 9, 9, 255]);
+        let base = painted.pixels.clone();
+        let mut coverage = vec![0.0; (size * size) as usize];
+        let brush = Brush {
+            color: [0.0, 0.0, 0.0],
+            radius: 2.0,
+            opacity: 1.0,
+            hardness: 1.0,
+        };
+        // Stamp near one corner; the opposite corner is well outside the radius.
+        m.stamp(
+            &mut painted,
+            Vec2::new(0.1, 0.1),
+            &brush,
+            2.0,
+            &base,
+            &mut coverage,
+        );
+        let far = (((size - 1) * size + (size - 1)) * 4) as usize;
+        assert_eq!(painted.pixels[far..far + 4], [9, 9, 9, 255]);
     }
 
     #[test]
