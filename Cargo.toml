@@ -1,6 +1,6 @@
 [package]
 name = "lowtex"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "PSX-style 3D texture painter — v0.1 proof of paint"
 
@@ -50,6 +50,14 @@ png = "0.17"
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
 base64 = "0.22"
+
+# macOS pen pressure: winit 0.30 drops the pen fields, so we tap NSEvent
+# directly with a local event monitor (see src/tablet.rs). Other platforms use a
+# 1.0 stub and pull none of this.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSEvent", "block2"] }
+block2 = "0.6"
 
 # Lean, fast shipping builds (G27): LTO + one codegen unit + stripped symbols.
 [profile.release]

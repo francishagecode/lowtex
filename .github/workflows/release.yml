@@ -1,7 +1,10 @@
 name: Release
 
-# Tag a commit `vX.Y.Z` to build downloadable binaries for macOS / Windows /
-# Linux and attach them to a GitHub Release.
+# Tag a commit `vX.Y.Z` to build native installers and attach them to a GitHub
+# Release:
+#   * macOS   → universal .dmg (Apple Silicon + Intel, ad-hoc signed)
+#   * Windows → standalone .exe
+#   * Linux   → portable .AppImage
 on:
   push:
     tags: ["v*"]
@@ -14,26 +17,111 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: ${{ matrix.target }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-    runs-on: ${{ matrix.os }}
+  # ---------------------------------------------------------------- macOS .dmg
+  macos:
+    name: macOS .dmg
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build (Apple Silicon + Intel)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Bundle Lowtex.app and .dmg
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          app="Lowtex.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+          # Fuse both arches into one universal binary.
+          lipo -create -output "$app/Contents/MacOS/lowtex" \
+            target/aarch64-apple-darwin/release/lowtex \
+            target/x86_64-apple-darwin/release/lowtex
+          chmod +x "$app/Contents/MacOS/lowtex"
+
+          # Icon: PNG -> .iconset -> .icns using built-in macOS tools.
+          mkdir icon.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s        assets/icon.png --out "icon.iconset/icon_${s}x${s}.png"
+            sips -z $((s*2)) $((s*2)) assets/icon.png --out "icon.iconset/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns icon.iconset -o "$app/Contents/Resources/AppIcon.icns"
+
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Lowtex</string>
+            <key>CFBundleDisplayName</key><string>Lowtex</string>
+            <key>CFBundleIdentifier</key><string>dev.lowtex.app</string>
+            <key>CFBundleExecutable</key><string>lowtex</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>CFBundleVersion</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Ad-hoc signature so the universal binary launches on Apple Silicon
+          # (arm64 refuses to run an unsigned binary). Not notarized — users
+          # still right-click > Open on first launch.
+          codesign --force --deep --sign - "$app"
+
+          # Stage with an /Applications shortcut for the classic drag-to-install.
+          mkdir dmgroot
+          cp -R "$app" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "Lowtex" -srcfolder dmgroot -ov -format UDZO \
+            "lowtex-${GITHUB_REF_NAME}-macos-universal.dmg"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: lowtex-*.dmg
+
+  # ------------------------------------------------------------- Windows .exe
+  windows:
+    name: Windows .exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Name the artifact
+        shell: bash
+        run: |
+          cp target/x86_64-pc-windows-msvc/release/lowtex.exe \
+            "lowtex-${GITHUB_REF_NAME}-windows-x86_64.exe"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: lowtex-*.exe
+
+  # ----------------------------------------------------------- Linux AppImage
+  linux:
+    name: Linux .AppImage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # winit/wgpu need X11 + Wayland + xkbcommon headers to link.
       - name: Linux deps
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev \
@@ -41,29 +129,52 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target x86_64-unknown-linux-gnu
 
-      - name: Package
-        shell: bash
+      - name: Assemble AppDir and AppImage
         run: |
-          name="lowtex-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir "$name"
-          bin="target/${{ matrix.target }}/release/lowtex"
-          [ -f "$bin.exe" ] && cp "$bin.exe" "$name/" || cp "$bin" "$name/"
-          cp README.md "$name/"
-          cp -r assets "$name/" 2>/dev/null || true
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "$name.zip" "$name"
-          else
-            tar czf "$name.tar.gz" "$name"
-          fi
+          set -euo pipefail
+          app=AppDir
+          mkdir -p "$app/usr/bin" "$app/usr/share/applications" \
+                   "$app/usr/share/icons/hicolor/256x256/apps"
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+          cp target/x86_64-unknown-linux-gnu/release/lowtex "$app/usr/bin/lowtex"
+          chmod +x "$app/usr/bin/lowtex"
+
+          # appimagetool wants the icon + .desktop at the AppDir root, mirrored
+          # under the usual share/ paths so installed launchers find them too.
+          cp assets/icon.png "$app/lowtex.png"
+          cp assets/icon.png "$app/usr/share/icons/hicolor/256x256/apps/lowtex.png"
+
+          cat > "$app/lowtex.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=Lowtex
+          Comment=PSX-style low-poly 3D texture painter
+          Exec=lowtex
+          Icon=lowtex
+          Categories=Graphics;3DGraphics;
+          Terminal=false
+          DESKTOP
+          cp "$app/lowtex.desktop" "$app/usr/share/applications/lowtex.desktop"
+
+          cat > "$app/AppRun" <<'APPRUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/lowtex" "$@"
+          APPRUN
+          chmod +x "$app/AppRun"
+
+          # Build the AppImage. The GitHub runner has no FUSE, so run the tool
+          # in extract-and-run mode.
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run \
+            "$app" "lowtex-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
+
+      - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            lowtex-*.tar.gz
-            lowtex-*.zip
+          files: lowtex-*.AppImage
