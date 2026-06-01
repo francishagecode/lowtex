@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# action-gh-release needs write access to create the release and upload assets.
+permissions:
+  contents: write
+
 jobs:
   build:
     name: ${{ matrix.target }}
