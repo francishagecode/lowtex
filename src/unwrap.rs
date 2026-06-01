@@ -332,9 +332,20 @@ fn grow_charts(
     (chart_of, chart_normal)
 }
 
-/// Tallest-first shelf packing of chart *pixel* footprints (chart size · `d`, plus a
-/// gutter on every side). Returns each chart's pixel offset and the used extent.
-fn shelf_pack(csize: &[Vec2], d: f32, gutter_px: u32) -> (Vec<Vec2>, f32, f32) {
+/// Bottom-left **skyline** packing of chart *pixel* footprints (chart size · `d`, plus
+/// a gutter on every side). Returns each chart's pixel offset and the used extent.
+///
+/// This replaces a tallest-first shelf packer. A shelf is as tall as its tallest box,
+/// so every shorter box on the shelf wastes the gap above it; the skyline instead lets
+/// the next box drop into that gap, packing heterogeneous charts noticeably tighter.
+/// Because `pack_pixels` rescales density to *fill* the derived atlas, that tighter
+/// layout doesn't shrink the texture — it buys a higher texels-per-world-unit `d` at
+/// the same atlas size (sharper paint at PSX resolutions).
+///
+/// Footprints are whole pixels and offsets land on integer skyline edges, so texel
+/// snapping still puts every vertex on a texel corner. Charts never overlap: each box
+/// is placed strictly above the current skyline over its span.
+fn skyline_pack(csize: &[Vec2], d: f32, gutter_px: u32) -> (Vec<Vec2>, f32, f32) {
     let n = csize.len();
     let g = gutter_px as f32;
     let psize: Vec<Vec2> = csize
@@ -342,6 +353,8 @@ fn shelf_pack(csize: &[Vec2], d: f32, gutter_px: u32) -> (Vec<Vec2>, f32, f32) {
         .map(|s| Vec2::new((s.x * d).ceil() + 2.0 * g, (s.y * d).ceil() + 2.0 * g))
         .collect();
 
+    // Tallest-first placement (the classic skyline heuristic: tall boxes first leave a
+    // flatter skyline for the short ones to nestle into).
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| psize[b].y.total_cmp(&psize[a].y));
 
@@ -349,23 +362,102 @@ fn shelf_pack(csize: &[Vec2], d: f32, gutter_px: u32) -> (Vec<Vec2>, f32, f32) {
     let widest = psize.iter().map(|s| s.x).fold(0.0_f32, f32::max);
     // Aim for a *square* layout (width ≈ √area) so the square power-of-two atlas
     // wastes little — never narrower than the widest chart.
-    let shelf_w = total_area.sqrt().max(widest);
+    let bound_w = total_area.sqrt().max(widest);
+
+    // Skyline: a contiguous, left-to-right list of segments `(x, width, top_y)`,
+    // starting flat at y = 0 across the whole bound.
+    let mut sky: Vec<(f32, f32, f32)> = vec![(0.0, bound_w.max(1.0), 0.0)];
 
     let mut offsets = vec![Vec2::ZERO; n];
-    let (mut x, mut y, mut shelf_h, mut max_x) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let (mut max_x, mut max_y) = (0.0f32, 0.0f32);
     for &i in &order {
         let s = psize[i];
-        if x > 0.0 && x + s.x > shelf_w {
-            y += shelf_h;
-            x = 0.0;
-            shelf_h = 0.0;
-        }
-        offsets[i] = Vec2::new(x, y);
-        x += s.x;
-        max_x = max_x.max(x);
-        shelf_h = shelf_h.max(s.y);
+        let (px, py) = skyline_fit(&sky, s.x, bound_w);
+        offsets[i] = Vec2::new(px, py);
+        skyline_add(&mut sky, px, s.x, py + s.y);
+        max_x = max_x.max(px + s.x);
+        max_y = max_y.max(py + s.y);
     }
-    (offsets, max_x, y + shelf_h)
+    (offsets, max_x, max_y)
+}
+
+/// The highest skyline top over the span `[x, x+w]` — the y a box of width `w` placed
+/// at `x` would rest on.
+fn skyline_top(sky: &[(f32, f32, f32)], x: f32, w: f32) -> f32 {
+    let (l, r) = (x, x + w);
+    let mut top = 0.0f32;
+    for &(sx, sw, sy) in sky {
+        if sx < r - 1e-3 && sx + sw > l + 1e-3 {
+            top = top.max(sy);
+        }
+    }
+    top
+}
+
+/// Lowest resting position for a `w`-wide box, trying each skyline segment's left edge
+/// as a candidate x and preferring smaller y, then smaller x. Candidates that fit
+/// within `bound_w` win over any that would overflow it.
+fn skyline_fit(sky: &[(f32, f32, f32)], w: f32, bound_w: f32) -> (f32, f32) {
+    // Lexicographic (y, then x) compare for f32 tuples.
+    let better = |a: (f32, f32), b: (f32, f32)| match a.0.total_cmp(&b.0) {
+        std::cmp::Ordering::Equal => a.1 < b.1,
+        o => o.is_lt(),
+    };
+    let mut best: Option<(f32, f32)> = None; // (y, x) within bound
+    let mut overflow: Option<(f32, f32)> = None; // (y, x) needing overflow
+    for seg in sky {
+        let x = seg.0;
+        let y = skyline_top(sky, x, w);
+        if x + w <= bound_w + 1e-3 {
+            if best.is_none_or(|b| better((y, x), b)) {
+                best = Some((y, x));
+            }
+        } else if overflow.is_none_or(|b| better((y, x), b)) {
+            overflow = Some((y, x));
+        }
+    }
+    let (y, x) = best.or(overflow).unwrap_or((0.0, 0.0));
+    (x, y)
+}
+
+/// Raise the skyline over `[x, x+w]` to `ny`, splitting boundary segments at the box
+/// edges and merging neighbours that end up level. Keeps `sky` a contiguous list.
+fn skyline_add(sky: &mut Vec<(f32, f32, f32)>, x: f32, w: f32, ny: f32) {
+    let (l, r) = (x, x + w);
+    // Extend coverage rightward if the box overflowed the current skyline.
+    if let Some(&(lx, lw, _)) = sky.last() {
+        let end = lx + lw;
+        if r > end + 1e-3 {
+            sky.push((end, r - end, 0.0));
+        }
+    }
+    let mut out: Vec<(f32, f32, f32)> = Vec::with_capacity(sky.len() + 2);
+    for &(sx, sw, sy) in sky.iter() {
+        let send = sx + sw;
+        // Keep the portions of each segment outside [l, r] at their old height; the
+        // covered middle is dropped and replaced by one flat segment below.
+        if sx < l - 1e-3 {
+            out.push((sx, send.min(l) - sx, sy));
+        }
+        if send > r + 1e-3 {
+            let cut = sx.max(r);
+            out.push((cut, send - cut, sy));
+        }
+    }
+    out.push((l, w, ny));
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Merge adjacent same-height segments so the skyline doesn't fragment unboundedly.
+    let mut merged: Vec<(f32, f32, f32)> = Vec::with_capacity(out.len());
+    for seg in out {
+        if let Some(last) = merged.last_mut() {
+            if (last.2 - seg.2).abs() < 1e-3 && (last.0 + last.1 - seg.0).abs() < 1e-3 {
+                last.1 += seg.1;
+                continue;
+            }
+        }
+        merged.push(seg);
+    }
+    *sky = merged;
 }
 
 /// Smallest power of two ≥ `x`, floored at 8.
@@ -399,7 +491,7 @@ fn pack_pixels(
 
     // Pack once at the requested density to discover the natural footprint, then pick
     // the power-of-two atlas that holds it (clamped to the GPU limit).
-    let (mut offsets, mut w, mut h) = shelf_pack(csize, d, gutter_px);
+    let (mut offsets, mut w, mut h) = skyline_pack(csize, d, gutter_px);
     let natural = next_pow2(w.max(h).ceil() as u32);
     let clamped = natural > max_pow2;
     let atlas = natural.min(max_pow2);
@@ -416,7 +508,7 @@ fn pack_pixels(
             break;
         }
         d *= atlas as f32 / cur;
-        let r = shelf_pack(csize, d, gutter_px);
+        let r = skyline_pack(csize, d, gutter_px);
         offsets = r.0;
         w = r.1;
         h = r.2;
@@ -425,7 +517,7 @@ fn pack_pixels(
     let mut guard = 0;
     while w.max(h) > atlas as f32 && guard < 6 {
         d *= atlas as f32 / w.max(h);
-        let r = shelf_pack(csize, d, gutter_px);
+        let r = skyline_pack(csize, d, gutter_px);
         offsets = r.0;
         w = r.1;
         h = r.2;
@@ -499,7 +591,9 @@ fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) 
         .collect();
 
     // Choose density D so a `Medium` mesh lands near `target_atlas_px`. Total chart
-    // bbox area is the natural scale; √η accounts for shelf-packing slack.
+    // bbox area is the natural scale; √η accounts for packing slack (gutters + the gaps
+    // the skyline can't fill). `pack_pixels` then rescales D to fill the real atlas, so
+    // this only needs to be the right ballpark.
     const ETA: f32 = 0.65;
     let a_world: f32 = csize.iter().map(|s| s.x * s.y).sum::<f32>().max(1e-6);
     let d_base = ETA.sqrt() * opts.target_atlas_px as f32 / a_world.sqrt();
@@ -547,8 +641,7 @@ mod tests {
     fn assert_uvs_in_unit(mesh: &Mesh) {
         for v in &mesh.vertices {
             assert!(
-                (-1e-4..=1.0 + 1e-4).contains(&v.uv[0])
-                    && (-1e-4..=1.0 + 1e-4).contains(&v.uv[1]),
+                (-1e-4..=1.0 + 1e-4).contains(&v.uv[0]) && (-1e-4..=1.0 + 1e-4).contains(&v.uv[1]),
                 "uv out of range: {:?}",
                 v.uv
             );
@@ -592,7 +685,10 @@ mod tests {
             .map(|t| {
                 let uvs =
                     [0, 1, 2].map(|k| Vec2::from(mesh.vertices[t[k] as usize].uv) * atlas as f32);
-                let mn = uvs.iter().copied().fold(Vec2::splat(f32::INFINITY), Vec2::min);
+                let mn = uvs
+                    .iter()
+                    .copied()
+                    .fold(Vec2::splat(f32::INFINITY), Vec2::min);
                 let mx = uvs
                     .iter()
                     .copied()
@@ -603,7 +699,10 @@ mod tests {
     }
 
     fn disjoint(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> bool {
-        a.1.x <= b.0.x + 1e-3 || b.1.x <= a.0.x + 1e-3 || a.1.y <= b.0.y + 1e-3 || b.1.y <= a.0.y + 1e-3
+        a.1.x <= b.0.x + 1e-3
+            || b.1.x <= a.0.x + 1e-3
+            || a.1.y <= b.0.y + 1e-3
+            || b.1.y <= a.0.y + 1e-3
     }
 
     #[test]
@@ -652,7 +751,12 @@ mod tests {
         let bb = pixel_bboxes(&r.mesh, r.atlas_size);
         for a in [0usize, 1] {
             for b in [2usize, 3] {
-                assert!(disjoint(bb[a], bb[b]), "charts overlap: {:?} {:?}", bb[a], bb[b]);
+                assert!(
+                    disjoint(bb[a], bb[b]),
+                    "charts overlap: {:?} {:?}",
+                    bb[a],
+                    bb[b]
+                );
             }
         }
         assert_uvs_in_unit(&r.mesh);
@@ -686,13 +790,13 @@ mod tests {
         let cos2 = opts.angle_cone_deg.to_radians().cos().powi(2);
         for t in r.mesh.indices.chunks_exact(3) {
             let p = [0, 1, 2].map(|k| Vec3::from(r.mesh.vertices[t[k] as usize].position));
-            let uv =
-                [0, 1, 2].map(|k| Vec2::from(r.mesh.vertices[t[k] as usize].uv) * r.atlas_size as f32);
+            let uv = [0, 1, 2]
+                .map(|k| Vec2::from(r.mesh.vertices[t[k] as usize].uv) * r.atlas_size as f32);
             let world_area = tri_area(p);
             let uv_area = 0.5 * (uv[1] - uv[0]).perp_dot(uv[2] - uv[0]).abs();
             let ratio = uv_area / world_area; // texels² per world unit²
-            // Each cube face is flat (θ=0), so the ratio should equal D² exactly;
-            // the cone bound is the general guarantee.
+                                              // Each cube face is flat (θ=0), so the ratio should equal D² exactly;
+                                              // the cone bound is the general guarantee.
             assert!(
                 ratio >= d2 * cos2 - 1.0 && ratio <= d2 + 1.0,
                 "density ratio {ratio} outside [{}, {}]",
@@ -719,9 +823,21 @@ mod tests {
     fn single_triangle_and_empty() {
         let tri = Mesh {
             vertices: vec![
-                Vertex { position: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
-                Vertex { position: [1.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
-                Vertex { position: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
+                Vertex {
+                    position: [0.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                },
+                Vertex {
+                    position: [1.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                },
+                Vertex {
+                    position: [0.0, 1.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                },
             ],
             indices: vec![0, 1, 2],
             needs_normals: false,
@@ -779,6 +895,40 @@ mod tests {
                 "face triangle is not axis-aligned (diamond regression): {uv:?}"
             );
         }
+    }
+
+    #[test]
+    fn skyline_packs_tightly_without_overlap() {
+        // A heterogeneous box set — exactly where shelf packing wasted the gaps above
+        // shorter boxes. The skyline must (a) never overlap two boxes and (b) fill a
+        // high fraction of its bounding extent.
+        let csize = [
+            Vec2::new(10.0, 30.0),
+            Vec2::new(20.0, 5.0),
+            Vec2::new(8.0, 8.0),
+            Vec2::new(15.0, 22.0),
+            Vec2::new(5.0, 12.0),
+            Vec2::new(25.0, 6.0),
+            Vec2::new(12.0, 18.0),
+            Vec2::new(7.0, 7.0),
+        ];
+        let (offsets, w, h) = skyline_pack(&csize, 1.0, 0);
+
+        for i in 0..csize.len() {
+            for j in (i + 1)..csize.len() {
+                let (amn, amx) = (offsets[i], offsets[i] + csize[i]);
+                let (bmn, bmx) = (offsets[j], offsets[j] + csize[j]);
+                let overlap = amn.x < bmx.x - 1e-3
+                    && bmn.x < amx.x - 1e-3
+                    && amn.y < bmx.y - 1e-3
+                    && bmn.y < amx.y - 1e-3;
+                assert!(!overlap, "boxes {i} and {j} overlap");
+            }
+        }
+
+        let used: f32 = csize.iter().map(|s| s.x * s.y).sum();
+        let frac = used / (w * h);
+        assert!(frac >= 0.75, "skyline only {:.0}% efficient", frac * 100.0);
     }
 
     #[test]

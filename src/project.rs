@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 /// v2 (G28) added per-layer `effects`; v1 files load unchanged because the field
 /// is `#[serde(default)]` (an empty stack) and the version is only rejected if it
 /// is *newer* than this build understands.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// v3 added the optional `texture_folder` the project was painted against; older
+/// files load unchanged (the field is `#[serde(default)]` → `None`).
+pub const FORMAT_VERSION: u32 = 3;
 
 /// One per-layer effect, mirroring `effects::Effect` so serde stays off the core
 /// type (same split as `BlendMode` ↔ the `blend` index). The renderer converts.
@@ -62,6 +65,10 @@ pub struct ProjectDoc {
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
     pub layers: Vec<LayerDoc>,
+    /// The texture folder the project was painted against, so reopening the file
+    /// reopens the same brush browser. Absent in v1/v2 files → `None`.
+    #[serde(default)]
+    pub texture_folder: Option<String>,
 }
 
 impl ProjectDoc {
@@ -120,6 +127,7 @@ mod tests {
             normals: vec![[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
             uvs: vec![[0.0, 0.0], [1.0, 1.0]],
             indices: vec![0, 1, 0],
+            texture_folder: Some("/tmp/textures".into()),
             layers: vec![LayerDoc {
                 name: "Base".into(),
                 blend: 0,

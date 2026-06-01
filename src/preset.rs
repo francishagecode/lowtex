@@ -58,7 +58,12 @@ impl PresetLayer {
         noise: Option<NoiseMod>,
     ) -> Self {
         let (noise_kind, noise_scale, noise_contrast, noise_amount) = match noise {
-            Some(n) => (Some(n.kind.name().to_string()), n.scale, n.contrast, n.amount),
+            Some(n) => (
+                Some(n.kind.name().to_string()),
+                n.scale,
+                n.contrast,
+                n.amount,
+            ),
             None => (None, 0.0, 0.0, 0.0),
         };
         Self {
@@ -79,7 +84,16 @@ impl PresetLayer {
     /// Resolve back into the concrete generator arguments. Unknown names fall back
     /// to sensible defaults so a partially-understood file still does something
     /// reasonable rather than failing.
-    pub fn to_op(&self) -> (String, MapSource, Levels, [u8; 3], BlendMode, Option<NoiseMod>) {
+    pub fn to_op(
+        &self,
+    ) -> (
+        String,
+        MapSource,
+        Levels,
+        [u8; 3],
+        BlendMode,
+        Option<NoiseMod>,
+    ) {
         let src = map_source_from_name(&self.source).unwrap_or(MapSource::Cavities);
         let blend = blend_from_name(&self.blend).unwrap_or(BlendMode::Normal);
         let levels = Levels {
@@ -241,7 +255,15 @@ pub fn builtins() -> Vec<Preset> {
             vec![
                 layer("AO", "Cavities", [0, 0, 0], "Multiply", 0.65, 0.35),
                 noisy(
-                    "Rust", "Surface", [120, 64, 38], "Normal", 0.8, 0.0, "Worley", 9.0, 0.45,
+                    "Rust",
+                    "Surface",
+                    [120, 64, 38],
+                    "Normal",
+                    0.8,
+                    0.0,
+                    "Worley",
+                    9.0,
+                    0.45,
                     0.9,
                 ),
                 layer("Bare metal", "Edges", [188, 188, 198], "Normal", 0.55, 0.25),

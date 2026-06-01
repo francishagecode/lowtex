@@ -8,8 +8,8 @@
 // surface* instead — from the picked triangle it walks position-adjacent
 // triangles outward to a world-space radius, rasterizes each into its own UV
 // region, and weights every covered texel by its 3D distance to the hit point.
-// A dab on a cube edge then wraps onto the neighbouring face the same way the
-// fluid brush already flows across seams (see `particle::simulate_burst`).
+// A dab on a cube edge then wraps onto the neighbouring face, crossing UV seams
+// while staying on connected geometry.
 //
 // Adjacency is keyed on *position* only (not UV), so the walk crosses seams
 // while staying on connected geometry: the brush wraps around a 90° edge but
@@ -201,6 +201,54 @@ pub fn splat(
     out
 }
 
+/// Like [`splat`], but instead of a coverage scalar it returns each covered texel's
+/// *surface point* in world space — the raw geometry a stamp/decal needs to project
+/// the texel into its own oriented frame. Every texel within `radius_world` of the
+/// hit is returned (no falloff applied here; the caller decides coverage from the
+/// decal image's alpha). A texel on a shared edge can appear more than once; the
+/// caller's per-stroke coverage discipline makes the duplication harmless.
+pub fn splat_world(
+    mesh: &Mesh,
+    adj: &Adjacency,
+    hit: &Hit,
+    radius_world: f32,
+    size: u32,
+    scratch: &mut SplatScratch,
+) -> Vec<(usize, Vec3)> {
+    let mut out = Vec::new();
+    let tri_count = mesh.indices.len() / 3;
+    if radius_world <= 0.0 || hit.tri as usize >= tri_count {
+        return out;
+    }
+    let r = radius_world;
+    let gen = scratch.begin(tri_count);
+    scratch.stack.push(hit.tri as usize);
+    scratch.seen[hit.tri as usize] = gen;
+
+    while let Some(ti) = scratch.stack.pop() {
+        let (p, uv) = tri_data(mesh, ti as u32);
+        // Same frontier test as `splat`: only descend into a triangle whose closest
+        // point is within the radius (the root is always in).
+        let near = ti == hit.tri as usize || point_tri_dist(hit.pos, &p) <= r;
+        if !near {
+            continue;
+        }
+        rasterize(&uv, size, |texel, w| {
+            let world = p[0] * w[0] + p[1] * w[1] + p[2] * w[2];
+            if world.distance(hit.pos) <= r {
+                out.push((texel, world));
+            }
+        });
+        for &nb in &adj.neighbors[ti] {
+            if nb >= 0 && scratch.seen[nb as usize] != gen {
+                scratch.seen[nb as usize] = gen;
+                scratch.stack.push(nb as usize);
+            }
+        }
+    }
+    out
+}
+
 /// Scan-fill a triangle's UV footprint at `size`, calling `f(texel, [w0, w1, w2])`
 /// for each covered texel with its barycentric weights (`w_i` is the weight of
 /// vertex `i`). Same edge-function rasterizer as `fill.rs` / `bake.rs`.
@@ -233,7 +281,7 @@ fn rasterize(uv: &[Vec2; 3], size: u32, mut f: impl FnMut(usize, [f32; 3])) {
 }
 
 /// The world positions and UVs of a triangle (mesh-order index).
-fn tri_data(mesh: &Mesh, ti: u32) -> ([Vec3; 3], [Vec2; 3]) {
+pub fn tri_data(mesh: &Mesh, ti: u32) -> ([Vec3; 3], [Vec2; 3]) {
     let i = (ti * 3) as usize;
     let idx = [mesh.indices[i], mesh.indices[i + 1], mesh.indices[i + 2]];
     let v = |k: usize| &mesh.vertices[idx[k] as usize];
@@ -353,6 +401,27 @@ mod tests {
     }
 
     #[test]
+    fn splat_world_returns_points_inside_the_radius() {
+        // Every returned texel's surface point must lie within the flood radius of
+        // the hit, and the set must be non-empty (the hit face is always covered).
+        let size = 64;
+        let (mesh, hit) = cube_hit(0);
+        let adj = Adjacency::build(&mesh);
+        let r = 0.2;
+        let pts = splat_world(&mesh, &adj, &hit, r, size, &mut SplatScratch::new());
+        assert!(!pts.is_empty(), "the hit face must yield texels");
+        for &(_, wp) in &pts {
+            assert!(
+                wp.distance(hit.pos) <= r + 1e-4,
+                "point {wp:?} is outside the flood radius"
+            );
+        }
+        // A larger radius reaches strictly more texels (it wraps toward the edges).
+        let wide = splat_world(&mesh, &adj, &hit, 0.45, size, &mut SplatScratch::new());
+        assert!(wide.len() > pts.len(), "a wider flood covers more surface");
+    }
+
+    #[test]
     fn small_dab_stays_on_one_face() {
         // A radius far smaller than the cube's 1-unit faces can't reach a
         // neighbouring face: every painted texel lands in the hit face's island.
@@ -360,7 +429,16 @@ mod tests {
         let (mesh, hit) = cube_hit(0);
         let adj = Adjacency::build(&mesh);
         let map = FillMap::build(&mesh, size);
-        let splats = splat(&mesh, &adj, &hit, 0.05, 1.0, 1.0, size, &mut SplatScratch::new());
+        let splats = splat(
+            &mesh,
+            &adj,
+            &hit,
+            0.05,
+            1.0,
+            1.0,
+            size,
+            &mut SplatScratch::new(),
+        );
         assert!(!splats.is_empty(), "the dab must paint something");
         let islands: std::collections::HashSet<i32> = splats
             .iter()
@@ -385,12 +463,28 @@ mod tests {
         // Hit on tri 0, at the midpoint of an edge it shares with another face.
         let (p, _) = tri_data(&mesh, 0);
         let nbs = adj.neighbors()[0];
-        let shared_e = (0..3).find(|&e| nbs[e] >= 0).expect("tri 0 has a neighbour");
+        let shared_e = (0..3)
+            .find(|&e| nbs[e] >= 0)
+            .expect("tri 0 has a neighbour");
         let mid = (p[shared_e] + p[(shared_e + 1) % 3]) * 0.5;
         let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
-        let hit = Hit { uv: Vec2::ZERO, tri: 0, pos: mid, normal };
+        let hit = Hit {
+            uv: Vec2::ZERO,
+            tri: 0,
+            pos: mid,
+            normal,
+        };
         // Radius bigger than a texel but well under the 1-unit face.
-        let splats = splat(&mesh, &adj, &hit, 0.1, 1.0, 1.0, size, &mut SplatScratch::new());
+        let splats = splat(
+            &mesh,
+            &adj,
+            &hit,
+            0.1,
+            1.0,
+            1.0,
+            size,
+            &mut SplatScratch::new(),
+        );
         let islands: std::collections::HashSet<i32> = splats
             .iter()
             .map(|&(texel, _)| map.texel_island[texel])
@@ -412,7 +506,16 @@ mod tests {
         let (mesh, hit) = cube_hit(0);
         let adj = Adjacency::build(&mesh);
         let map = FillMap::build(&mesh, size);
-        let splats = splat(&mesh, &adj, &hit, 5.0, 1.0, 1.0, size, &mut SplatScratch::new());
+        let splats = splat(
+            &mesh,
+            &adj,
+            &hit,
+            5.0,
+            1.0,
+            1.0,
+            size,
+            &mut SplatScratch::new(),
+        );
         let islands: std::collections::HashSet<i32> = splats
             .iter()
             .map(|&(texel, _)| map.texel_island[texel])
@@ -441,10 +544,23 @@ mod tests {
             let (p, _) = tri_data(&mesh, tri);
             let centroid = (p[0] + p[1] + p[2]) / 3.0;
             let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
-            let hit = Hit { uv: Vec2::ZERO, tri, pos: centroid, normal };
+            let hit = Hit {
+                uv: Vec2::ZERO,
+                tri,
+                pos: centroid,
+                normal,
+            };
             let from_reused = splat(&mesh, &adj, &hit, radius, 1.0, 1.0, size, &mut reused);
-            let from_fresh =
-                splat(&mesh, &adj, &hit, radius, 1.0, 1.0, size, &mut SplatScratch::new());
+            let from_fresh = splat(
+                &mesh,
+                &adj,
+                &hit,
+                radius,
+                1.0,
+                1.0,
+                size,
+                &mut SplatScratch::new(),
+            );
             assert_eq!(
                 from_reused, from_fresh,
                 "reused scratch diverged on dab tri={tri} r={radius}"

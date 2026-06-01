@@ -41,8 +41,7 @@ pub struct Bvh {
 
 /// The closest triangle a ray struck: the interpolated UV at the hit, the original
 /// mesh-triangle index (for keying per-triangle data like UV islands), and the
-/// world-space hit point + geometric face normal (used by the fluid brush to flow
-/// particles across the surface — see `particle::simulate_burst`).
+/// world-space hit point + geometric face normal.
 #[derive(Clone, Copy)]
 pub struct Hit {
     pub uv: Vec2,

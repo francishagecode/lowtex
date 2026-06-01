@@ -6,10 +6,13 @@
 //
 //   - ao        : ambient occlusion — fraction of a cosine-weighted hemisphere
 //                 blocked by other geometry within a local radius (dark crevices).
-//   - curvature : signed surface convexity in roughly [-1, 1] — the smooth-vs-face
-//                 normal divergence (peaks on edges/corners) signed by whether the
-//                 surface bulges out (convex, > 0, an edge) or pinches in (concave,
-//                 < 0, a crease).
+//   - curvature : signed hard-edge proximity in [-1, 1] — a falloff band hugging the
+//                 mesh's hard edges, +ve on convex edges (where wear collects), −ve in
+//                 concave creases (where dirt sinks), 0 on smooth/flat surface. Keyed
+//                 off the *dihedral angle* between adjacent faces and the texel's
+//                 distance to such an edge, so the band stays thin and local instead of
+//                 spreading across a big low-poly face the way a per-texel normal
+//                 divergence does.
 //
 // These two channels are *inputs*, in the Substance-Painter sense: rather than
 // each producing one fixed layer, `MeshMaps::sample` reads a `MapSource` through a
@@ -18,7 +21,7 @@
 // (AO)", "Highlights"), the Dirt and Edge-wear presets, and "mask from map" are all
 // the same path with different source + color + blend.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use glam::{Vec2, Vec3};
 
@@ -30,7 +33,9 @@ use crate::noise::{self, NoiseKind, NoiseParams};
 pub struct MeshMaps {
     pub size: u32,
     pub ao: Vec<f32>,
-    /// Signed convexity, ≈[-1, 1]: > 0 on convex edges, < 0 in concave creases.
+    /// Signed hard-edge proximity in [-1, 1]: a band that is +1 on a convex hard edge
+    /// and −1 in a concave crease, falling to 0 within `EDGE_WIDTH_FRAC` of the edge
+    /// (and 0 everywhere on smooth/flat surface). Drives `Edges`/`Creases`.
     pub curvature: Vec<f32>,
     pub mask: Vec<bool>, // true where a triangle covered the texel
     /// World position per texel — the sampling point for procedural noise (so it
@@ -54,8 +59,18 @@ pub struct MeshMaps {
 /// Hemisphere ray count per texel for AO. Modest — bakes stay sub-second.
 const AO_SAMPLES: u32 = 24;
 
-/// Scales raw convexity (≈0.4 at a cube corner) up toward 1 for edge effects.
-const EDGE_SCALE: f32 = 1.8;
+/// A mesh edge counts as "hard" (and so seeds an edge/crease band) when its two
+/// adjacent faces diverge by more than this in `1 − n₁·n₂`: 0 is coplanar, ~0.13 is
+/// a 30° fold, 1.0 a right-angle cube edge. Below it the edge is treated as a smooth
+/// interior edge and contributes nothing.
+const SHARP_COS: f32 = 0.1;
+
+/// Half-width of the edge/crease band as a fraction of the model's bounding-box
+/// diagonal. The `Edges`/`Creases` weight is 1 *on* a hard edge and falls to 0 this
+/// far away (in world space, so the band is a consistent physical width regardless of
+/// texture resolution or how big the adjoining faces are — the fix for the old
+/// curvature "dome" that washed whole low-poly faces).
+const EDGE_WIDTH_FRAC: f32 = 0.04;
 
 /// Which baked channel an effect reads from. Phrased as what it *selects* on the
 /// surface, not the raw map name (principle #1: painter words).
@@ -178,8 +193,8 @@ impl MeshMaps {
             let raw = match src {
                 MapSource::Cavities => self.ao[i],
                 MapSource::Exposed => 1.0 - self.ao[i],
-                MapSource::Edges => (self.curvature[i].max(0.0) * EDGE_SCALE).min(1.0),
-                MapSource::Creases => ((-self.curvature[i]).max(0.0) * EDGE_SCALE).min(1.0),
+                MapSource::Edges => self.curvature[i].max(0.0),
+                MapSource::Creases => (-self.curvature[i]).max(0.0),
                 MapSource::Surface => 1.0,
                 MapSource::Light => self.light[i],
             };
@@ -258,13 +273,17 @@ pub fn bake(mesh: &Mesh, bvh: &Bvh, size: u32) -> MeshMaps {
     let mut pos_map = vec![Vec3::ZERO; n];
     let mut nrm_map = vec![Vec3::Y; n];
 
-    let (smooth, convexity) = welded_attributes(mesh);
+    let smooth = welded_smooth_normals(mesh);
+    // Hard edges and their convex/concave sign, keyed by welded vertex-id pair, plus
+    // the welded id of each mesh vertex so the rasterizer can look its edges up.
+    let (sharp, wid) = sharp_edges(mesh);
 
     // Scale-dependent AO reach + ray bias from the model's bounding box.
     let (mn, mx) = mesh.bounds();
     let diag = (mx - mn).length().max(1e-3);
     let ao_dist = diag * 0.25;
     let bias = diag * 1e-3;
+    let edge_width = diag * EDGE_WIDTH_FRAC;
 
     // --- Rasterize triangles into UV space ---
     for tri in mesh.indices.chunks_exact(3) {
@@ -275,8 +294,23 @@ pub fn bake(mesh: &Mesh, bvh: &Bvh, size: u32) -> MeshMaps {
             Vec3::from(mesh.vertices[i2].position),
         ];
         let sn = [smooth[i0], smooth[i1], smooth[i2]];
-        let cv = [convexity[i0], convexity[i1], convexity[i2]];
         let face_n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+
+        // This triangle's hard edges as world segments + sign (+convex / −concave).
+        // Only edges that fold sharply enough seed a band; at most 3 per triangle.
+        let mut tri_sharp: [(Vec3, Vec3, f32); 3] = [(Vec3::ZERO, Vec3::ZERO, 0.0); 3];
+        let mut n_sharp = 0usize;
+        for &(va, vb, pa, pb) in &[
+            (wid[i0], wid[i1], p[0], p[1]),
+            (wid[i1], wid[i2], p[1], p[2]),
+            (wid[i2], wid[i0], p[2], p[0]),
+        ] {
+            let key = if va < vb { (va, vb) } else { (vb, va) };
+            if let Some(&sign) = sharp.get(&key) {
+                tri_sharp[n_sharp] = (pa, pb, sign);
+                n_sharp += 1;
+            }
+        }
 
         // UVs → texel space (V down, like the paint texture).
         let t = [
@@ -315,18 +349,18 @@ pub fn bake(mesh: &Mesh, bvh: &Bvh, size: u32) -> MeshMaps {
                     smooth_n
                 };
                 nrm_map[idx] = nrm;
-                // Curvature = smooth-vs-face divergence (peaks on edges/corners),
-                // signed by interpolated convexity so we can tell a convex edge
-                // (where wear collects) from a concave crease (where dirt sinks).
-                let magnitude = (1.0 - nrm.dot(face_n)).clamp(0.0, 1.0);
-                let convex = cv[0] * w0 + cv[1] * w1 + cv[2] * w2;
-                curvature[idx] = if convex > 0.0 {
-                    magnitude
-                } else if convex < 0.0 {
-                    -magnitude
-                } else {
-                    0.0
-                };
+                // Hard-edge proximity: distance from this surface point to the
+                // triangle's sharpest nearby hard edge, as a falloff band. Keep the
+                // strongest (closest) edge and carry its convex/concave sign.
+                let mut best = 0.0f32;
+                for &(ea, eb, sign) in &tri_sharp[..n_sharp] {
+                    let dist = point_segment_dist(pos, ea, eb);
+                    let w = 1.0 - smoothstep(0.0, edge_width, dist);
+                    if w > best.abs() {
+                        best = sign * w;
+                    }
+                }
+                curvature[idx] = best;
             }
         }
     }
@@ -368,6 +402,24 @@ pub fn bake(mesh: &Mesh, bvh: &Bvh, size: u32) -> MeshMaps {
     }
 }
 
+/// Hermite smoothstep: 0 below `lo`, 1 above `hi`, smooth ramp between.
+fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
+    let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Distance from point `p` to the segment `a`–`b`.
+fn point_segment_dist(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_squared();
+    let t = if len2 > 1e-12 {
+        ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p - (a + ab * t)).length()
+}
+
 /// 2D edge function (twice the signed area of triangle a,b,c).
 fn edge_fn(a: Vec2, b: Vec2, c: Vec2) -> f32 {
     (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
@@ -392,35 +444,28 @@ fn hash2(a: u32, b: u32) -> (f32, f32) {
     (r1, r2)
 }
 
-/// Per-mesh-vertex smooth normal and signed convexity, computed on a *welded*
-/// copy of the mesh (vertices sharing a position are merged). The mesh may store
-/// split per-face normals; welding recovers the cross-face adjacency that hides,
-/// which is what both smooths the AO hemisphere at hard edges and lets us
-/// distinguish a convex edge from a concave crease.
-///
-/// Convexity = −mean over welded neighbors of `normalize(q − p) · n`: neighbors
-/// behind the tangent plane (along −n) mean the surface bulges out (convex, > 0);
-/// neighbors in front mean a crease (concave, < 0).
-fn welded_attributes(mesh: &Mesh) -> (Vec<Vec3>, Vec<f32>) {
-    let quant = |p: [f32; 3]| {
-        (
-            (p[0] * 1e4).round() as i64,
-            (p[1] * 1e4).round() as i64,
-            (p[2] * 1e4).round() as i64,
-        )
-    };
+/// Quantize a position to a welding grid key (~1e-4 units), so vertices the importer
+/// split at a UV seam or hard edge but that share a position are recognised as one.
+fn weld_key(p: [f32; 3]) -> (i64, i64, i64) {
+    (
+        (p[0] * 1e4).round() as i64,
+        (p[1] * 1e4).round() as i64,
+        (p[2] * 1e4).round() as i64,
+    )
+}
 
-    // Weld: assign each mesh vertex a welded index; accumulate averaged normals.
+/// Per-mesh-vertex smooth normal, computed on a *welded* copy of the mesh (vertices
+/// sharing a position are merged). The mesh may store split per-face normals; welding
+/// recovers the cross-face adjacency that hides, which is what smooths the AO
+/// hemisphere across hard edges.
+fn welded_smooth_normals(mesh: &Mesh) -> Vec<Vec3> {
     let mut index_of: HashMap<(i64, i64, i64), usize> = HashMap::new();
-    let mut wpos: Vec<Vec3> = Vec::new();
     let mut wnrm: Vec<Vec3> = Vec::new();
     let mut wid: Vec<usize> = Vec::with_capacity(mesh.vertices.len());
     for v in &mesh.vertices {
-        let key = quant(v.position);
-        let id = *index_of.entry(key).or_insert_with(|| {
-            wpos.push(Vec3::from(v.position));
+        let id = *index_of.entry(weld_key(v.position)).or_insert_with(|| {
             wnrm.push(Vec3::ZERO);
-            wpos.len() - 1
+            wnrm.len() - 1
         });
         wnrm[id] += Vec3::from(v.normal);
         wid.push(id);
@@ -428,40 +473,67 @@ fn welded_attributes(mesh: &Mesh) -> (Vec<Vec3>, Vec<f32>) {
     for nrm in &mut wnrm {
         *nrm = nrm.normalize_or_zero();
     }
+    wid.iter().map(|&id| wnrm[id]).collect()
+}
 
-    // Welded adjacency from triangle edges.
-    let mut nbrs: Vec<HashSet<usize>> = vec![HashSet::new(); wpos.len()];
+/// Classify the mesh's hard edges for the edge/crease band. Returns, per welded
+/// vertex-id pair that forms a hard edge, its sign (`+1` convex / `−1` concave), and
+/// — for the rasterizer — the welded id of every mesh vertex.
+///
+/// An edge is "hard" when its two adjacent faces fold by more than `SHARP_COS`. The
+/// sign comes from where the *opposite* vertex of the second face sits relative to the
+/// first face's plane: behind it (along −n₁) means the surface bulges out (convex);
+/// in front means a crease (concave). Boundary edges (one face) and non-manifold edges
+/// (>2 faces) are skipped.
+fn sharp_edges(mesh: &Mesh) -> (HashMap<(u32, u32), f32>, Vec<u32>) {
+    // Weld vertices by position so split copies share an id.
+    let mut index_of: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut wpos: Vec<Vec3> = Vec::new();
+    let mut wid: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+    for v in &mesh.vertices {
+        let id = *index_of.entry(weld_key(v.position)).or_insert_with(|| {
+            wpos.push(Vec3::from(v.position));
+            (wpos.len() - 1) as u32
+        });
+        wid.push(id);
+    }
+
+    // Per welded edge, the adjacent faces as (normal, opposite-vertex position).
+    let mut faces: HashMap<(u32, u32), Vec<(Vec3, Vec3)>> = HashMap::new();
     for tri in mesh.indices.chunks_exact(3) {
-        let (a, b, c) = (
-            wid[tri[0] as usize],
-            wid[tri[1] as usize],
-            wid[tri[2] as usize],
-        );
-        for (i, j) in [(a, b), (b, c), (c, a)] {
-            if i != j {
-                nbrs[i].insert(j);
-                nbrs[j].insert(i);
+        let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let (a, b, c) = (wid[i0], wid[i1], wid[i2]);
+        let p = [
+            Vec3::from(mesh.vertices[i0].position),
+            Vec3::from(mesh.vertices[i1].position),
+            Vec3::from(mesh.vertices[i2].position),
+        ];
+        let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+        // Each edge paired with the triangle's opposite vertex.
+        for &(u, v, opp) in &[(a, b, p[2]), (b, c, p[0]), (c, a, p[1])] {
+            if u == v {
+                continue;
             }
+            let key = if u < v { (u, v) } else { (v, u) };
+            faces.entry(key).or_default().push((n, opp));
         }
     }
 
-    // Signed convexity per welded vertex.
-    let mut wcurv = vec![0.0f32; wpos.len()];
-    for i in 0..wpos.len() {
-        if nbrs[i].is_empty() {
-            continue;
+    let mut sharp = HashMap::new();
+    for (&key, fs) in &faces {
+        if fs.len() != 2 {
+            continue; // boundary or non-manifold edge
         }
-        let mut sum = 0.0;
-        for &j in &nbrs[i] {
-            let d = (wpos[j] - wpos[i]).normalize_or_zero();
-            sum += d.dot(wnrm[i]);
+        let (n1, _c1) = fs[0];
+        let (n2, c2) = fs[1];
+        if 1.0 - n1.dot(n2) <= SHARP_COS {
+            continue; // too flat to be a hard edge
         }
-        wcurv[i] = -sum / nbrs[i].len() as f32;
+        let edge_a = wpos[key.0 as usize];
+        let convex = n1.dot(c2 - edge_a) < 0.0;
+        sharp.insert(key, if convex { 1.0 } else { -1.0 });
     }
-
-    let smooth = wid.iter().map(|&id| wnrm[id]).collect();
-    let convexity = wid.iter().map(|&id| wcurv[id]).collect();
-    (smooth, convexity)
+    (sharp, wid)
 }
 
 #[cfg(test)]
@@ -470,6 +542,44 @@ mod tests {
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn edges_form_a_thin_band_on_the_hard_edges() {
+        // A bare cube is the worst case for the old smooth-vs-face metric: every
+        // face is one quad, so the divergence "dome" washed the whole surface. The
+        // distance-to-hard-edge metric must instead keep the Edges weight to a thin
+        // band hugging the cube's edges, and leave the flat face centres at 0.
+        let mesh = crate::mesh::Mesh::cube();
+        let bvh = Bvh::build(&mesh);
+        let maps = bake(&mesh, &bvh, 64);
+        let edges = maps.sample(MapSource::Edges, &Levels::amount(1.0), None);
+
+        let covered = maps.mask.iter().filter(|&&m| m).count();
+        let banded = edges.iter().filter(|&&w| w > 0.5).count();
+        // The band is a small fraction of the surface — not the whole-face wash the
+        // old dome produced (which lit ~all covered texels).
+        assert!(covered > 0);
+        let frac = banded as f32 / covered as f32;
+        assert!(frac > 0.0, "the cube's hard edges must register at all");
+        assert!(
+            frac < 0.35,
+            "edge band should be local, got {frac:.2} of the surface"
+        );
+
+        // A texel right at the centre of a +Z face sits far from any edge → ~0; the
+        // cube's convex edges read positive (Edges), never negative.
+        assert!(edges.iter().all(|&w| w >= 0.0));
+        assert!(
+            edges.iter().cloned().fold(0.0, f32::max) > 0.9,
+            "on-edge texels reach full weight"
+        );
+        // A bare convex cube has no concave creases.
+        let creases = maps.sample(MapSource::Creases, &Levels::amount(1.0), None);
+        assert!(
+            creases.iter().all(|&w| close(w, 0.0)),
+            "a convex cube has no creases"
+        );
     }
 
     #[test]
@@ -617,7 +727,10 @@ mod tests {
         let no_shadow = maps.light.clone();
         maps.compute_light(&bvh, Vec3::Y, true);
         assert!(
-            maps.light.iter().zip(&no_shadow).all(|(a, b)| close(*a, *b)),
+            maps.light
+                .iter()
+                .zip(&no_shadow)
+                .all(|(a, b)| close(*a, *b)),
             "a convex mesh casts no self-shadow"
         );
     }
@@ -638,7 +751,10 @@ mod tests {
             diag: 1.0,
         };
         let w = maps.sample(MapSource::Light, &Levels::amount(1.0), None);
-        assert!(close(w[0], 0.9) && close(w[1], 0.1), "Light reads its channel");
+        assert!(
+            close(w[0], 0.9) && close(w[1], 0.1),
+            "Light reads its channel"
+        );
         // Inverting turns the lit map into a shadow mask (dark side high).
         let inv = maps.sample(
             MapSource::Light,
@@ -677,7 +793,10 @@ mod tests {
         };
         let with = maps.sample(MapSource::Cavities, &lv, Some(&nm));
         let without = maps.sample(MapSource::Cavities, &lv, None);
-        assert!(close(with[0], without[0]), "amount 0 must not change the weight");
+        assert!(
+            close(with[0], without[0]),
+            "amount 0 must not change the weight"
+        );
     }
 
     #[test]
@@ -691,7 +810,10 @@ mod tests {
             amount: 1.0,
         };
         let w = maps.sample(MapSource::Surface, &Levels::amount(1.0), Some(&nm))[0];
-        assert!((0.0..=1.0).contains(&w), "noise-multiplied weight out of range: {w}");
+        assert!(
+            (0.0..=1.0).contains(&w),
+            "noise-multiplied weight out of range: {w}"
+        );
         // A second call is deterministic (noise is hash-based).
         let w2 = maps.sample(MapSource::Surface, &Levels::amount(1.0), Some(&nm))[0];
         assert!(close(w, w2));

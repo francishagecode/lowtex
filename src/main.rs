@@ -16,6 +16,7 @@ mod bake;
 mod bleed;
 mod bvh;
 mod camera;
+mod config;
 mod effects;
 mod export;
 mod fill;
@@ -27,7 +28,6 @@ mod model;
 mod noise;
 mod paint;
 mod palette;
-mod particle;
 mod preset;
 mod project;
 mod renderer;
@@ -482,11 +482,15 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         None
     };
     let (pixels, w, h) =
-        renderer.capture(ui_paint.as_ref().map(|(jobs, td, ppp, _)| renderer::UiPaint {
-            jobs,
-            textures_delta: td,
-            pixels_per_point: *ppp,
-        }));
+        renderer.capture(
+            ui_paint
+                .as_ref()
+                .map(|(jobs, td, ppp, _)| renderer::UiPaint {
+                    jobs,
+                    textures_delta: td,
+                    pixels_per_point: *ppp,
+                }),
+        );
     image::save_buffer(out, &pixels, w, h, image::ColorType::Rgba8)
         .expect("failed to write screenshot PNG");
     log::info!("wrote screenshot {out} ({w}x{h})");
@@ -510,5 +514,10 @@ fn build_headless_ui(
     let mut state = ui::UiState::default();
     let out = ctx.run(raw_input, |ctx| ui::build(ctx, &mut state));
     let jobs = ctx.tessellate(out.shapes, out.pixels_per_point);
-    (jobs, out.textures_delta, out.pixels_per_point, state.panel_width)
+    (
+        jobs,
+        out.textures_delta,
+        out.pixels_per_point,
+        state.panel_width,
+    )
 }

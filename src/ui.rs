@@ -20,7 +20,6 @@ use crate::export::ExportPreset;
 use crate::layers::BlendMode;
 use crate::noise::NoiseKind;
 use crate::paint::Brush;
-use crate::particle::{FluidKind, FluidSpec};
 use crate::renderer::{PaletteSettings, SymmetryAxis, TextureFilter};
 
 /// The active editing tool. The brush drags a stroke; the fills are one-shot
@@ -32,8 +31,6 @@ pub enum Tool {
     /// brush image is loaded, the UV-tiled image (revealing the same content a material
     /// fill would, only where you drag). Clear the image to go back to solid color.
     Brush,
-    /// Fluid brush — drag to flow oil/water/blood down the surface under gravity.
-    Fluid,
     /// Fill the flat face (coplanar facet) of the model under the cursor.
     FillFace,
     /// Fill the UV island under the cursor.
@@ -64,6 +61,18 @@ pub struct LayerInfo {
     pub effects: Vec<Effect>,
 }
 
+/// One entry in the texture-folder brush/stamp browser: a source image found in the
+/// user's chosen folder, plus its lazily-uploaded thumbnail for the grid swatch.
+pub struct BrushEntry {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    /// A freshly-downsampled `(w, h, RGBA8)` thumbnail staged by the App on scan; the
+    /// UI uploads it to `tex` once, then takes it back to `None`.
+    pub thumb: Option<(u32, u32, Vec<u8>)>,
+    /// The GPU handle for this entry's swatch, held across frames after the first upload.
+    pub tex: Option<egui::TextureHandle>,
+}
+
 /// One-shot requests the UI raises this frame, drained by the App after the egui
 /// run (file dialogs and texture ops happen outside the egui closure).
 #[derive(Default)]
@@ -71,8 +80,11 @@ pub struct UiActions {
     pub save_png: bool,
     pub open_texture: bool,
     pub open_model: bool,
-    /// Project save/load (G24).
+    /// Project save/load (G24). `save_project` is always "Save As" (a dialog);
+    /// `quicksave` (G31) writes straight to the open file's path, falling back to a
+    /// dialog only when the project hasn't been saved anywhere yet.
     pub save_project: bool,
+    pub quicksave: bool,
     pub open_project: bool,
     // Undo/redo (history over the layer stack).
     pub undo: bool,
@@ -89,6 +101,7 @@ pub struct UiActions {
     pub remove_layer: bool,
     pub move_layer_up: bool,
     pub move_layer_down: bool,
+    pub merge_layer_down: bool,
     pub select_layer: Option<usize>,
     pub set_layer_visible: Option<(usize, bool)>,
     pub set_layer_opacity: Option<(usize, f32)>,
@@ -128,6 +141,11 @@ pub struct UiActions {
     pub load_brush_image: bool,
     /// Drop the loaded brush image, reverting the brush to painting solid color.
     pub clear_brush_image: bool,
+    /// Open a native folder picker; the App scans it for images and stages their
+    /// thumbnails into `brush_folder_entries` for the brush/stamp browser.
+    pub open_brush_folder: bool,
+    /// Use a texture from the folder browser as the brush image (carries its path).
+    pub use_brush_entry: Option<std::path::PathBuf>,
     /// Re-unwrap the mesh's UVs at the chosen texel density (the atlas size is
     /// derived from it). Carries the density the user picked.
     pub unwrap: Option<crate::unwrap::Density>,
@@ -168,12 +186,16 @@ pub struct UiState {
     /// The GPU texture handle for the brush-image swatch, held across frames so the
     /// preview isn't re-uploaded every frame. Cleared with the brush image.
     pub brush_thumb_tex: Option<egui::TextureHandle>,
-    /// Fluid brush (oil/water/blood): the chosen fluid sets the starting viscosity
-    /// (then tweakable); it's laid down in the current brush color. `fluid_amount` is
-    /// the overall deposit strength.
-    pub fluid_kind: FluidKind,
-    pub fluid_viscosity: f32,
-    pub fluid_amount: f32,
+    /// How a loaded brush image is applied: `false` = Brush (tiled, consistent material
+    /// field), `true` = Stamp (oriented decal). For Stamp, `stamp_angle_deg` rotates it
+    /// and `stamp_tint` recolours a grayscale alpha to the brush swatch.
+    pub brush_stamp: bool,
+    pub stamp_angle_deg: f32,
+    pub stamp_tint: bool,
+    /// The user-chosen texture folder (for the panel header) and the images found in
+    /// it, each usable as a tiled brush or a stamp. Empty until a folder is opened.
+    pub brush_folder: Option<std::path::PathBuf>,
+    pub brush_folder_entries: Vec<BrushEntry>,
     /// Mirror painting: when on, every dab is also painted at its reflection across
     /// the model-symmetry plane for `symmetry_axis` (through the mesh center).
     pub symmetry_on: bool,
@@ -269,9 +291,11 @@ impl Default for UiState {
             brush_image_loaded: false,
             brush_thumb: None,
             brush_thumb_tex: None,
-            fluid_kind: FluidKind::Water,
-            fluid_viscosity: FluidKind::Water.defaults().1,
-            fluid_amount: 0.85,
+            brush_stamp: false,
+            stamp_angle_deg: 0.0,
+            stamp_tint: false,
+            brush_folder: None,
+            brush_folder_entries: Vec::new(),
             symmetry_on: false,
             lock_face: false,
             symmetry_axis: SymmetryAxis::X,
@@ -286,8 +310,8 @@ impl Default for UiState {
             sun_elevation: 50.0, // high, warm key — matches the shader's fixed light
             sun_azimuth: 45.0,
             sun_shadow: true,
-            grad_low: [0.10, 0.09, 0.12], // deep shadow → ...
-            grad_high: [0.85, 0.82, 0.74], // ... pale highlight
+            grad_low: [0.10, 0.09, 0.12],    // deep shadow → ...
+            grad_high: [0.85, 0.82, 0.74],   // ... pale highlight
             bg_color: [0.221, 0.272, 0.313], // sRGB of the default dark teal
             show_grid: true,
             texture_filter: TextureFilter::default(),
@@ -340,11 +364,6 @@ impl UiState {
         let el = self.sun_elevation.to_radians();
         let az = self.sun_azimuth.to_radians();
         [el.cos() * az.cos(), el.sin(), el.cos() * az.sin()]
-    }
-
-    /// The fluid-brush settings the controls currently describe.
-    pub fn fluid_spec(&self) -> FluidSpec {
-        FluidSpec::with(self.brush.color, self.fluid_viscosity, self.fluid_amount)
     }
 }
 
@@ -444,7 +463,19 @@ fn menu_bar(ctx: &Context, state: &mut UiState) {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Save project (.lowtex)…").clicked() {
+                if ui
+                    .button("Save project")
+                    .on_hover_text("Ctrl/⌘+S — write to the open file (asks where the first time)")
+                    .clicked()
+                {
+                    state.actions.quicksave = true;
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Save project as…")
+                    .on_hover_text("Ctrl/⌘+Shift+S")
+                    .clicked()
+                {
                     state.actions.save_project = true;
                     ui.close_menu();
                 }
@@ -545,10 +576,11 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 segmented(
                     ui,
                     &mut state.tool,
-                    &[
-                        (Tool::Brush, "Brush", "Drag to paint color, or a loaded image"),
-                        (Tool::Fluid, "Fluid", "Drag to flow oil/water/blood down the surface"),
-                    ],
+                    &[(
+                        Tool::Brush,
+                        "Brush",
+                        "Drag to paint color, or a loaded image",
+                    )],
                 );
                 ui.label(egui::RichText::new("Fill").weak());
                 segmented(
@@ -565,7 +597,9 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 // the unwrapped atlas with the same brush, seeing both views update live.
                 ui.add_space(2.0);
                 ui.checkbox(&mut state.show_uv_panel, "UV editor")
-                    .on_hover_text("Paint directly on the unwrapped texture in a panel beside the model");
+                    .on_hover_text(
+                        "Paint directly on the unwrapped texture in a panel beside the model",
+                    );
 
                 // ---- Color (used by both the brush and the fills) ----
                 heading(ui, "Color");
@@ -574,12 +608,21 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 // Brush shape sliders apply only to the tools that drag a brush; for
                 // the one-shot fills they're irrelevant, so we hide them entirely
                 // rather than show a row of dead, greyed-out controls.
-                let brush_active = matches!(state.tool, Tool::Brush | Tool::Fluid);
+                let brush_active = matches!(state.tool, Tool::Brush);
                 if brush_active {
                     ui.add_space(2.0);
                     ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
                     ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
-                    ui.add(egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"));
+                    ui.add(
+                        egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"),
+                    );
+
+                    // Eraser: the same brush, but it removes paint (lowers alpha toward
+                    // transparent) instead of laying the swatch color, revealing whatever
+                    // sits below. Shape/opacity/symmetry/snap all still apply.
+                    ui.checkbox(&mut state.brush.erase, "Eraser").on_hover_text(
+                        "Remove paint instead of laying color, revealing the layers below",
+                    );
 
                     // Mirror painting: stamp every dab on the symmetric side of the
                     // model too. The axis picker is live only while symmetry is on.
@@ -592,11 +635,7 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                                 .width(44.0)
                                 .show_ui(ui, |ui| {
                                     for a in SymmetryAxis::ALL {
-                                        ui.selectable_value(
-                                            &mut state.symmetry_axis,
-                                            a,
-                                            a.name(),
-                                        );
+                                        ui.selectable_value(&mut state.symmetry_axis, a, a.name());
                                     }
                                 });
                         });
@@ -606,6 +645,21 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                     // strokes near an edge don't wrap onto the neighbouring face.
                     ui.checkbox(&mut state.lock_face, "Lock to face")
                         .on_hover_text("Confine each dab to the flat face under the cursor");
+
+                    // Grid snap: round each dab's center to a coarse texel cell, so
+                    // strokes quantize to the grid for crisp, blocky PSX-style edges.
+                    ui.checkbox(&mut state.brush.snap_to_texel, "Snap to grid")
+                        .on_hover_text(
+                        "Round each dab to a texel-grid cell for crisp, blocky PSX-style strokes",
+                    );
+                    if state.brush.snap_to_texel {
+                        ui.add(
+                            egui::Slider::new(&mut state.brush.snap_grid, 2.0..=16.0)
+                                .step_by(1.0)
+                                .text("Grid"),
+                        )
+                        .on_hover_text("Grid cell size in texels — bigger is chunkier");
+                    }
                 }
 
                 // Brush image: load one to paint it (UV-tiled) instead of solid color;
@@ -648,7 +702,38 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                                 }
                             });
                         });
-                        ui.add(egui::Slider::new(&mut state.brush_tile, 1.0..=16.0).text("Tile"));
+                        // Brush = the image anchored & tiled in texture space (a
+                        // consistent material field); Stamp = an oriented decal you can
+                        // overdraw, shift, and rotate.
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut state.brush_stamp, false, "Brush")
+                                .on_hover_text("Tile the image as a consistent material");
+                            ui.selectable_value(&mut state.brush_stamp, true, "Stamp")
+                                .on_hover_text("Place the image as an oriented decal");
+                        });
+                        if state.brush_stamp {
+                            ui.add(
+                                egui::Slider::new(&mut state.stamp_angle_deg, 0.0..=360.0)
+                                    .text("Angle")
+                                    .suffix("°"),
+                            );
+                            // Same `brush_tile` knob, but here it scales the decal down
+                            // within the brush footprint (1 = full, larger = smaller),
+                            // so the stamp size isn't tied to brush radius alone.
+                            ui.add(
+                                egui::Slider::new(&mut state.brush_tile, 1.0..=16.0).text("Scale"),
+                            )
+                            .on_hover_text("Shrink the stamp within the brush footprint");
+                            ui.checkbox(&mut state.stamp_tint, "Tint to color")
+                                .on_hover_text(
+                                    "Recolor a grayscale stamp to the brush color \
+                                 (off = keep the image's own colors)",
+                                );
+                        } else {
+                            ui.add(
+                                egui::Slider::new(&mut state.brush_tile, 1.0..=16.0).text("Tile"),
+                            );
+                        }
                     } else {
                         if ui.button("Brush image…").clicked() {
                             state.actions.load_brush_image = true;
@@ -659,30 +744,24 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                                 .small(),
                         );
                     }
-                }
 
-                // Fluid-brush specifics: pick a fluid (sets a starting viscosity), then
-                // tweak. It paints in the current brush color above. Drag on the model to
-                // flow it downhill; pooling on flat/upward faces and in creases is automatic.
-                if state.tool == Tool::Fluid {
-                    ui.add_space(2.0);
-                    egui::ComboBox::from_label("Fluid")
-                        .selected_text(state.fluid_kind.name())
-                        .show_ui(ui, |ui| {
-                            for k in FluidKind::ALL {
-                                if ui
-                                    .selectable_value(&mut state.fluid_kind, k, k.name())
-                                    .clicked()
-                                {
-                                    // Reset viscosity to the chosen fluid's default; the
-                                    // fluid is laid down in the current brush color.
-                                    state.fluid_viscosity = k.defaults().1;
-                                }
-                            }
-                        });
-                    ui.add(egui::Slider::new(&mut state.fluid_viscosity, 0.0..=1.0).text("Viscosity"))
-                        .on_hover_text("Low = thin, runs far; high = thick, pools");
-                    ui.add(egui::Slider::new(&mut state.fluid_amount, 0.0..=1.0).text("Amount"));
+                    // Texture folder: point at any folder of images, then click a swatch
+                    // to load it as the brush image (it stamps when on the 3D surface).
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Texture folder…").clicked() {
+                            state.actions.open_brush_folder = true;
+                        }
+                        if let Some(name) = state
+                            .brush_folder
+                            .as_ref()
+                            .and_then(|f| f.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                        {
+                            ui.label(egui::RichText::new(name).weak().small());
+                        }
+                    });
+                    brush_folder_grid(ui, state);
                 }
 
                 ui.add_space(6.0);
@@ -756,10 +835,7 @@ fn uv_panel(ctx: &Context, state: &mut UiState) {
             // brush thumb. The handle `uv_tex` persists across frames, so we read the
             // size/guard from it — not from `uv_image`, which is consumed here.
             if let Some((w, px)) = state.uv_image.take() {
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, w as usize],
-                    &px,
-                );
+                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, w as usize], &px);
                 state.uv_tex = Some(ui.ctx().load_texture(
                     "uv-atlas",
                     img,
@@ -774,23 +850,16 @@ fn uv_panel(ctx: &Context, state: &mut UiState) {
                 Some(tex) => (tex.id(), tex.size()[0] as u32),
                 None => {
                     ui.label(
-                        egui::RichText::new("Unwrap the mesh to paint its texture here.")
-                            .weak(),
+                        egui::RichText::new("Unwrap the mesh to paint its texture here.").weak(),
                     );
                     return;
                 }
             };
 
             // Fit the square atlas to the panel (leave a little breathing room).
-            let side = ui
-                .available_width()
-                .min(ui.available_height())
-                .max(64.0)
-                - 4.0;
+            let side = ui.available_width().min(ui.available_height()).max(64.0) - 4.0;
             let sized = egui::load::SizedTexture::new(tex_id, egui::vec2(side, side));
-            let resp = ui.add(
-                egui::Image::new(sized).sense(egui::Sense::click_and_drag()),
-            );
+            let resp = ui.add(egui::Image::new(sized).sense(egui::Sense::click_and_drag()));
             let rect = resp.rect;
 
             // Overlay the UV island wireframe. The atlas is drawn row-major top-left
@@ -800,7 +869,10 @@ fn uv_panel(ctx: &Context, state: &mut UiState) {
             let edge_color = egui::Color32::from_rgba_unmultiplied(120, 200, 255, 90);
             let stroke = egui::Stroke::new(1.0, edge_color);
             let to_screen = |u: f32, v: f32| {
-                egui::pos2(rect.min.x + u * rect.width(), rect.min.y + v * rect.height())
+                egui::pos2(
+                    rect.min.x + u * rect.width(),
+                    rect.min.y + v * rect.height(),
+                )
             };
             for &[u0, v0, u1, v1] in &state.uv_edges {
                 painter.line_segment([to_screen(u0, v0), to_screen(u1, v1)], stroke);
@@ -837,7 +909,10 @@ fn uv_panel(ctx: &Context, state: &mut UiState) {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let uv = to_uv(p);
                     let from = state.uv_drag_last.unwrap_or(uv);
-                    state.actions.uv_strokes.push(UvEvent::Segment { from, to: uv });
+                    state
+                        .actions
+                        .uv_strokes
+                        .push(UvEvent::Segment { from, to: uv });
                     state.uv_drag_last = Some(uv);
                 }
             }
@@ -850,7 +925,10 @@ fn uv_panel(ctx: &Context, state: &mut UiState) {
                 if let Some(p) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) {
                     let uv = to_uv(p);
                     state.actions.uv_strokes.push(UvEvent::Begin);
-                    state.actions.uv_strokes.push(UvEvent::Segment { from: uv, to: uv });
+                    state
+                        .actions
+                        .uv_strokes
+                        .push(UvEvent::Segment { from: uv, to: uv });
                     state.actions.uv_strokes.push(UvEvent::End);
                 }
             }
@@ -894,12 +972,14 @@ fn layers_header(ui: &mut egui::Ui, state: &mut UiState) {
             ("−", "Delete layer"),
             ("↑", "Move up"),
             ("↓", "Move down"),
+            ("⇊", "Merge down"),
         ],
     ) {
         Some(0) => state.actions.add_layer = true,
         Some(1) => state.actions.remove_layer = true,
         Some(2) => state.actions.move_layer_up = true,
         Some(3) => state.actions.move_layer_down = true,
+        Some(4) => state.actions.merge_layer_down = true,
         _ => {}
     }
 }
@@ -1046,10 +1126,7 @@ fn effects_section(ui: &mut egui::Ui, state: &mut UiState) {
         let mut fx = effects[i];
         ui.group(|ui| {
             ui.label(egui::RichText::new(fx.name()).strong());
-            match button_group(
-                ui,
-                &[("↑", "Move up"), ("↓", "Move down"), ("X", "Remove")],
-            ) {
+            match button_group(ui, &[("↑", "Move up"), ("↓", "Move down"), ("X", "Remove")]) {
                 Some(0) => state.actions.move_effect_up = Some(i),
                 Some(1) => state.actions.move_effect_down = Some(i),
                 Some(2) => state.actions.remove_effect = Some(i),
@@ -1223,13 +1300,15 @@ fn mesh_effects_section(ui: &mut egui::Ui, state: &mut UiState) {
     match button_group(
         ui,
         &[
-            ("Tint layer", "New layer: the Color above, masked to the source"),
+            (
+                "Tint layer",
+                "New layer: the Color above, masked to the source",
+            ),
             ("Mask layer", "Set the active layer's mask from the source"),
         ],
     ) {
         Some(0) => {
-            state.actions.apply_tint =
-                Some((state.effect_source, levels, state.brush.color, noise))
+            state.actions.apply_tint = Some((state.effect_source, levels, state.brush.color, noise))
         }
         Some(1) => state.actions.mask_from_map = Some((state.effect_source, levels, noise)),
         _ => {}
@@ -1260,6 +1339,51 @@ fn mesh_effects_section(ui: &mut egui::Ui, state: &mut UiState) {
                 ));
             }
         });
+}
+
+/// A wrapping grid of swatches for the textures found in the chosen brush folder.
+/// Each freshly-staged thumbnail is uploaded to a GPU texture once; clicking a swatch
+/// loads that image as the brush (the App reads `use_brush_entry`).
+fn brush_folder_grid(ui: &mut egui::Ui, state: &mut UiState) {
+    if state.brush_folder_entries.is_empty() {
+        return;
+    }
+    let entries = &mut state.brush_folder_entries;
+    let mut clicked: Option<std::path::PathBuf> = None;
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for entry in entries.iter_mut() {
+                    // Upload this entry's staged thumbnail to a GPU texture once.
+                    if let Some((w, h, px)) = entry.thumb.take() {
+                        let img =
+                            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px);
+                        entry.tex = Some(ui.ctx().load_texture(
+                            format!("brush-folder-{}", entry.name),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                    if let Some(tex) = &entry.tex {
+                        let [tw, th] = tex.size();
+                        let scale = 40.0 / tw.max(th) as f32;
+                        let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+                        let img = egui::load::SizedTexture::new(tex.id(), size);
+                        if ui
+                            .add(egui::ImageButton::new(img))
+                            .on_hover_text(&entry.name)
+                            .clicked()
+                        {
+                            clicked = Some(entry.path.clone());
+                        }
+                    }
+                }
+            });
+        });
+    if let Some(p) = clicked {
+        state.actions.use_brush_entry = Some(p);
+    }
 }
 
 /// Fill the active layer with a tiled material image (brick, moss…).

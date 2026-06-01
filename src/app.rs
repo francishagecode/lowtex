@@ -9,7 +9,9 @@
 // hover and widgets don't paint through to the mesh. Once a drag has begun on
 // the viewport, it continues until release regardless of where the cursor goes.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::ViewportId;
 use winit::{
@@ -34,6 +36,12 @@ enum Drag {
     Pan,
 }
 
+/// How often a timed autosave fires, and how many rolling version files it keeps
+/// (G31). At PSX texture sizes each version is a few hundred KB, so a ring of ten
+/// recovery points costs only a handful of MB on disk.
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const AUTOSAVE_VERSIONS: u32 = 10;
+
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -49,21 +57,57 @@ pub struct App {
     drag: Drag,
     /// Latest keyboard modifier state, tracked for the undo/redo shortcuts.
     modifiers: ModifiersState,
+
+    /// Save/exit/autosave state (G31). `project_path` is the `.lowtex` file the user
+    /// is editing — `None` until they save or open one; quicksave writes here.
+    /// `last_autosave` paces the timed recovery write; `autosave_counter` cycles the
+    /// rolling version files. `window_title` mirrors the last title we set so we
+    /// only call `set_title` when the name or the unsaved dot actually changes.
+    project_path: Option<PathBuf>,
+    last_autosave: Instant,
+    autosave_counter: u32,
+    window_title: String,
+    /// Save shortcuts (⌘/Ctrl+S, ⌘/Ctrl+Shift+S) captured during key events. They
+    /// can't go through `ui.actions` because `ui::build` resets that at the top of
+    /// each frame, before `handle_ui_actions` reads it; these App-owned flags
+    /// survive the reset and are merged in there.
+    pending_quicksave: bool,
+    pending_save_as: bool,
+
+    /// Persistent app settings (e.g. the last texture folder), saved across launches.
+    config: crate::config::Config,
 }
 
 impl App {
     pub fn new(mesh: Mesh) -> Self {
+        // Restore the last-used texture folder so the brush browser reopens where the
+        // user left off. Scan it now (best-effort) so its thumbnails are ready; a
+        // folder that has since moved/been deleted is silently dropped.
+        let config = crate::config::Config::load();
+        let mut ui = UiState::default();
+        if let Some(dir) = config.last_texture_folder.as_ref().filter(|d| d.is_dir()) {
+            ui.brush_folder_entries = scan_brush_folder(dir);
+            ui.brush_folder = Some(dir.clone());
+        }
+
         Self {
             window: None,
             renderer: None,
             mesh: Some(mesh),
             egui_ctx: egui::Context::default(),
             egui_state: None,
-            ui: UiState::default(),
+            ui,
             mouse_pos: (0.0, 0.0),
             last_pos: (0.0, 0.0),
             drag: Drag::None,
             modifiers: ModifiersState::empty(),
+            project_path: None,
+            last_autosave: Instant::now(),
+            autosave_counter: 0,
+            window_title: String::new(),
+            pending_quicksave: false,
+            pending_save_as: false,
+            config,
         }
     }
 
@@ -168,14 +212,15 @@ impl App {
         });
         renderer.set_mask_reveal(self.ui.mask_reveal);
 
-        // Push brush-image state: how tightly the loaded image tiles (whether the
-        // brush paints an image at all is just whether one is loaded in the renderer).
+        // Brush-image state: how it's applied (Brush=tiled vs Stamp=decal), the tiling
+        // factor, and the stamp's rotation (degrees → radians) + tint-to-swatch.
+        renderer.set_brush_image_mode(if self.ui.brush_stamp {
+            crate::renderer::BrushImageMode::Stamp
+        } else {
+            crate::renderer::BrushImageMode::Tiled
+        });
         renderer.set_brush_tile(self.ui.brush_tile);
-
-        // Push fluid-brush state: whether the active tool is the fluid brush, and its
-        // color/viscosity/amount settings.
-        renderer.set_fluid(self.ui.tool == crate::ui::Tool::Fluid);
-        renderer.set_fluid_spec(self.ui.fluid_spec());
+        renderer.set_stamp_options(self.ui.stamp_angle_deg.to_radians(), self.ui.stamp_tint);
 
         // Push mirror-painting state: the chosen axis when enabled, else off.
         renderer.set_symmetry(self.ui.symmetry_on.then_some(self.ui.symmetry_axis));
@@ -185,7 +230,7 @@ impl App {
 
         // Outline the active face while a painting tool has the lock on, so the user
         // sees exactly where the brush is confined. Cleared (None) otherwise.
-        let painting_tool = matches!(self.ui.tool, crate::ui::Tool::Brush | crate::ui::Tool::Fluid);
+        let painting_tool = matches!(self.ui.tool, crate::ui::Tool::Brush);
         let outline_cursor = (self.ui.lock_face && painting_tool).then_some(self.mouse_pos);
         renderer.set_face_outline(outline_cursor);
 
@@ -193,8 +238,7 @@ impl App {
         renderer.set_brush_cursor(painting_tool.then_some(self.mouse_pos), &self.ui.brush);
 
         // Ghost-preview the stamp under the cursor for the solid/image brush, so the
-        // painter sees what a click lays down before committing. (Fluid is a dynamic
-        // sim with no static footprint, so it only gets the ring.)
+        // painter sees what a click lays down before committing.
         let preview_cursor = (self.ui.tool == crate::ui::Tool::Brush).then_some(self.mouse_pos);
         renderer.set_brush_preview(preview_cursor, &self.ui.brush);
 
@@ -224,14 +268,39 @@ impl App {
                 }
             }
         }
-        if actions.save_project {
+        // Project save (G31): quicksave writes straight to the open file; Save As
+        // always asks. A quicksave with no file chosen yet falls back to Save As.
+        // Merge the menu's one-shots with the keyboard shortcuts stashed on App
+        // (those are raised outside the egui frame, so they bypass `ui.actions`).
+        let want_quicksave = actions.quicksave || std::mem::take(&mut self.pending_quicksave);
+        let want_save_as = actions.save_project
+            || std::mem::take(&mut self.pending_save_as)
+            || (want_quicksave && self.project_path.is_none());
+        if want_quicksave {
+            if let Some(path) = self.project_path.clone() {
+                match renderer.save_project(&path.to_string_lossy()) {
+                    Ok(()) => log::info!("saved project {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
+        if want_save_as {
+            let suggested = self
+                .project_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "untitled.lowtex".to_string());
             if let Some(path) = rfd::FileDialog::new()
-                .set_file_name("untitled.lowtex")
+                .set_file_name(suggested)
                 .add_filter("lowtex project", &["lowtex"])
                 .save_file()
             {
                 match renderer.save_project(&path.to_string_lossy()) {
-                    Ok(()) => log::info!("saved project {}", path.display()),
+                    Ok(()) => {
+                        log::info!("saved project {}", path.display());
+                        self.project_path = Some(path);
+                    }
                     Err(e) => log::error!("{e}"),
                 }
             }
@@ -242,7 +311,24 @@ impl App {
                 .pick_file()
             {
                 match renderer.load_project(&path.to_string_lossy()) {
-                    Ok(()) => log::info!("opened project {}", path.display()),
+                    Ok(()) => {
+                        log::info!("opened project {}", path.display());
+                        self.project_path = Some(path);
+                        // Reopen the brush browser on the folder the project recorded.
+                        // A folder that no longer exists keeps its path (shown in the
+                        // header) but loads no thumbnails.
+                        if let Some(dir) = renderer.texture_folder().map(PathBuf::from) {
+                            if dir.is_dir() {
+                                self.ui.brush_folder_entries = scan_brush_folder(&dir);
+                                self.config.last_texture_folder = Some(dir.clone());
+                                self.config.save();
+                            } else {
+                                self.ui.brush_folder_entries.clear();
+                                log::warn!("texture folder {} not found", dir.display());
+                            }
+                            self.ui.brush_folder = Some(dir);
+                        }
+                    }
                     Err(e) => log::error!("{e}"),
                 }
             }
@@ -252,7 +338,11 @@ impl App {
             self.ui.last_atlas_clamped = clamped;
             log::info!(
                 "unwrapped → {atlas}×{atlas}{}",
-                if clamped { " (density clamped to GPU max)" } else { "" }
+                if clamped {
+                    " (density clamped to GPU max)"
+                } else {
+                    ""
+                }
             );
         }
         if let Some(tile) = actions.fill_material {
@@ -287,6 +377,41 @@ impl App {
             self.ui.brush_image_loaded = false;
             self.ui.brush_thumb = None;
             self.ui.brush_thumb_tex = None;
+        }
+        // Open a folder of textures and stage a thumbnail for each image in it, for the
+        // brush/stamp browser. Capped so a huge folder can't stall the load.
+        if actions.open_brush_folder {
+            // Reopen the dialog on the last folder so picking a sibling is one step.
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(prev) = self.ui.brush_folder.as_ref().filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(prev);
+            }
+            if let Some(dir) = dialog.pick_folder() {
+                self.ui.brush_folder_entries = scan_brush_folder(&dir);
+                log::info!(
+                    "brush folder {} — {} textures",
+                    dir.display(),
+                    self.ui.brush_folder_entries.len()
+                );
+                // Record it on the document (for the next save) and persist it as the
+                // last-used folder so it's restored on the next launch.
+                renderer.set_texture_folder(Some(dir.to_string_lossy().into_owned()));
+                self.config.last_texture_folder = Some(dir.clone());
+                self.config.save();
+                self.ui.brush_folder = Some(dir);
+            }
+        }
+        // Use a folder texture as the brush image (keeps the current Tile/Stamp mode).
+        if let Some(path) = actions.use_brush_entry {
+            match renderer.load_brush_material(&path.to_string_lossy()) {
+                Ok(()) => {
+                    self.ui.brush_image_loaded = true;
+                    self.ui.brush_thumb = renderer.brush_thumbnail(64);
+                    self.ui.brush_thumb_tex = None;
+                    log::info!("brush image {}", path.display());
+                }
+                Err(e) => log::error!("{e}"),
+            }
         }
         if let Some(indexed) = actions.export_png {
             let preset = self.ui.export_preset;
@@ -370,6 +495,9 @@ impl App {
         if actions.move_layer_down {
             renderer.move_active_layer(false);
         }
+        if actions.merge_layer_down {
+            renderer.merge_active_layer_down();
+        }
         if let Some(i) = actions.select_layer {
             renderer.set_active_layer(i);
         }
@@ -423,7 +551,14 @@ impl App {
                 (color[1] * 255.0).round() as u8,
                 (color[2] * 255.0).round() as u8,
             ];
-            renderer.add_map_layer("Tint", src, lv, rgb, crate::layers::BlendMode::Normal, noise);
+            renderer.add_map_layer(
+                "Tint",
+                src,
+                lv,
+                rgb,
+                crate::layers::BlendMode::Normal,
+                noise,
+            );
         }
         if let Some((src, lv, noise)) = actions.mask_from_map {
             renderer.fill_active_mask_from_map(src, lv, noise);
@@ -489,6 +624,140 @@ impl App {
                 effects: l.effects.clone(),
             })
             .collect();
+
+        // Reflect the open file name + an unsaved-changes dot in the window title
+        // (G31). Only call `set_title` when the string actually changes, so we don't
+        // hand the OS a fresh title every frame.
+        let name = self
+            .project_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".to_string());
+        let title = format!(
+            "{}{} — lowtex",
+            if renderer.is_dirty() { "• " } else { "" },
+            name
+        );
+        if title != self.window_title {
+            if let Some(window) = self.window.as_ref() {
+                window.set_title(&title);
+            }
+            self.window_title = title;
+        }
+    }
+
+    /// The destination for the next autosave version (G31): a rolling ring of files
+    /// so successive autosaves don't grow without bound. When a project file is
+    /// open, versions sit beside it (`sketch.lowtex` → `sketch.autosave3.lowtex`) so
+    /// recovery is obvious; for an untitled session they go to a `lowtex-autosave`
+    /// folder under the system temp dir.
+    fn autosave_path(&self) -> PathBuf {
+        let n = self.autosave_counter % AUTOSAVE_VERSIONS;
+        match &self.project_path {
+            Some(p) => {
+                let stem = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "untitled".to_string());
+                p.with_file_name(format!("{stem}.autosave{n}.lowtex"))
+            }
+            None => {
+                let dir = std::env::temp_dir().join("lowtex-autosave");
+                let _ = std::fs::create_dir_all(&dir);
+                dir.join(format!("untitled.autosave{n}.lowtex"))
+            }
+        }
+    }
+
+    /// Write a timed recovery version if the interval has elapsed and the document
+    /// has changed since the last save/autosave. Called every wake from
+    /// `about_to_wait`; cheap (a clock check) until both conditions hold.
+    fn maybe_autosave(&mut self) {
+        if self.last_autosave.elapsed() < AUTOSAVE_INTERVAL {
+            return;
+        }
+        // Reset the clock whether or not we write, so a clean document is re-checked
+        // one interval later rather than on every single frame.
+        self.last_autosave = Instant::now();
+        let needs = self
+            .renderer
+            .as_ref()
+            .map(|r| r.needs_autosave())
+            .unwrap_or(false);
+        if !needs {
+            return;
+        }
+        let path = self.autosave_path();
+        if let Some(renderer) = self.renderer.as_mut() {
+            match renderer.autosave(&path.to_string_lossy()) {
+                Ok(()) => log::info!("autosaved {}", path.display()),
+                Err(e) => log::error!("autosave failed: {e}"),
+            }
+        }
+        self.autosave_counter = self.autosave_counter.wrapping_add(1);
+    }
+
+    /// Decide whether it's safe to close the window (G31). With no unsaved changes,
+    /// yes. Otherwise prompt Save / Don't Save / Cancel: Save persists (and aborts
+    /// the close if the user backs out of the Save As dialog), Don't Save discards,
+    /// Cancel keeps editing.
+    fn confirm_close(&mut self) -> bool {
+        let dirty = self
+            .renderer
+            .as_ref()
+            .map(|r| r.is_dirty())
+            .unwrap_or(false);
+        if !dirty {
+            return true;
+        }
+        use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+        let res = MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description("You have unsaved changes. Save them before closing?")
+            .set_buttons(MessageButtons::YesNoCancel)
+            .show();
+        match res {
+            MessageDialogResult::Yes => self.save_before_close(),
+            MessageDialogResult::No => true,
+            // Cancel, or the dialog dismissed — stay open.
+            _ => false,
+        }
+    }
+
+    /// Save for the close prompt: quicksave to the open file, or ask for a path if
+    /// the project was never saved. Returns whether a save actually happened — a
+    /// `false` (the user cancelled the Save As dialog, or the write failed) aborts
+    /// the close so the work isn't lost.
+    fn save_before_close(&mut self) -> bool {
+        let path = match self.project_path.clone() {
+            Some(p) => p,
+            None => match rfd::FileDialog::new()
+                .set_file_name("untitled.lowtex")
+                .add_filter("lowtex project", &["lowtex"])
+                .save_file()
+            {
+                Some(p) => {
+                    self.project_path = Some(p.clone());
+                    p
+                }
+                None => return false,
+            },
+        };
+        match self.renderer.as_mut() {
+            Some(renderer) => match renderer.save_project(&path.to_string_lossy()) {
+                Ok(()) => {
+                    log::info!("saved project {}", path.display());
+                    true
+                }
+                Err(e) => {
+                    log::error!("save failed: {e}");
+                    false
+                }
+            },
+            None => true,
+        }
     }
 }
 
@@ -508,7 +777,15 @@ impl ApplicationHandler for App {
         // Renderer setup is async (wgpu::Instance::request_adapter etc).
         // pollster::block_on runs it synchronously here.
         let mesh = self.mesh.take().unwrap_or_else(Mesh::cube);
-        let renderer = pollster::block_on(Renderer::new(window.clone(), mesh));
+        let mut renderer = pollster::block_on(Renderer::new(window.clone(), mesh));
+        // Carry the restored texture folder into the document so a save records it
+        // even if the user never re-opens the folder this session.
+        renderer.set_texture_folder(
+            self.ui
+                .brush_folder
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
 
         // egui platform integration.
         ui::install_style(&self.egui_ctx);
@@ -546,7 +823,11 @@ impl ApplicationHandler for App {
         // These need &mut self wholly, so handle them before borrowing renderer.
         match &event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                // Prompt to save unsaved work before quitting (G31); a Cancel (or a
+                // backed-out Save dialog) keeps the window open.
+                if self.confirm_close() {
+                    event_loop.exit();
+                }
                 return;
             }
             WindowEvent::RedrawRequested => {
@@ -608,7 +889,7 @@ impl ApplicationHandler for App {
                         // The brush starts a drag-stroke; the fills are one-shot
                         // bucket clicks that commit their own single undo step.
                         match self.ui.tool {
-                            crate::ui::Tool::Brush | crate::ui::Tool::Fluid => {
+                            crate::ui::Tool::Brush => {
                                 self.drag = Drag::Paint;
                                 renderer.begin_stroke();
                                 renderer.paint_at(self.mouse_pos, &self.ui.brush);
@@ -666,6 +947,17 @@ impl ApplicationHandler for App {
                         renderer.redo();
                         window.request_redraw();
                     }
+                    // Quicksave (⌘/Ctrl+S); Shift adds "as…" for a fresh path. The
+                    // dialogs/path tracking run in handle_ui_actions next frame, so
+                    // stash the request on App (ui.actions would be reset first).
+                    PhysicalKey::Code(KeyCode::KeyS) => {
+                        if shift {
+                            self.pending_save_as = true;
+                        } else {
+                            self.pending_quicksave = true;
+                        }
+                        window.request_redraw();
+                    }
                     _ => {}
                 }
             }
@@ -689,8 +981,51 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Timed recovery write (G31): cheap clock check most wakes, a save only when
+        // the interval has elapsed and the document actually changed.
+        self.maybe_autosave();
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
     }
+}
+
+/// Scan `dir` for image files and stage a small thumbnail for each, for the brush/
+/// stamp folder browser. Non-images and unreadable files are skipped, results are
+/// sorted by name, and the count is capped so a huge folder can't stall the UI thread.
+fn scan_brush_folder(dir: &std::path::Path) -> Vec<crate::ui::BrushEntry> {
+    const MAX: usize = 256;
+    const EXTS: [&str; 3] = ["png", "jpg", "jpeg"];
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<std::path::PathBuf> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| EXTS.contains(&e.to_ascii_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+    let mut entries = Vec::new();
+    for path in paths.into_iter().take(MAX) {
+        let Ok(mat) = crate::material::Material::load(&path.to_string_lossy()) else {
+            continue; // unreadable / undecodable — skip it
+        };
+        let (w, h, px) = mat.thumbnail(48);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        entries.push(crate::ui::BrushEntry {
+            path,
+            name,
+            thumb: Some((w, h, px)),
+            tex: None,
+        });
+    }
+    entries
 }

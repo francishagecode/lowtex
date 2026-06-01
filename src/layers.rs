@@ -319,6 +319,61 @@ impl Layers {
         }
     }
 
+    /// Flatten the active layer into the one directly below it ("merge down"), then
+    /// remove it. The lower layer stays the receiver — it keeps its own mask, opacity
+    /// and blend — while the upper layer's mask, opacity, blend and effects are baked
+    /// into the merged pixels, so the result composites just as the two layers did
+    /// (exactly so when the lower layer is fully opaque with a white mask). No-op on
+    /// the bottom layer, which has nothing beneath it.
+    pub fn merge_active_down(&mut self) {
+        let a = self.active;
+        if a == 0 {
+            return;
+        }
+        let count = (self.size() * self.size()) as usize;
+
+        // Bake the upper layer over the lower layer's *effected* pixels in isolation:
+        // the same per-texel math as `composite`, but starting from the lower layer's
+        // straight RGBA instead of a transparent accumulator. Scoped so the immutable
+        // borrows are released before we mutate the layer below.
+        let merged = {
+            let upper = &self.layers[a];
+            let lower = &self.layers[a - 1];
+            let up = upper.effected();
+            let lo = lower.effected();
+            let umask = &upper.mask.pixels;
+            let mut out = lo.to_vec();
+            for t in 0..count {
+                let i = t * 4;
+                let m = umask[i] as f32 / 255.0;
+                let sa = (up[i + 3] as f32 / 255.0) * upper.opacity * m;
+                if sa <= 0.0 {
+                    continue;
+                }
+                let da = lo[i + 3] as f32 / 255.0;
+                let oa = sa + da * (1.0 - sa);
+                for c in 0..3 {
+                    let dc = lo[i + c] as f32 / 255.0;
+                    let src = upper.blend.apply(dc, up[i + c] as f32 / 255.0);
+                    // Premultiplied over, then un-premultiply back to straight RGBA.
+                    let premult = src * sa + dc * da * (1.0 - sa);
+                    let straight = if oa > 0.0 { premult / oa } else { 0.0 };
+                    out[i + c] = (straight.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+                out[i + 3] = (oa.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+            out
+        };
+
+        let lower = &mut self.layers[a - 1];
+        lower.tex.pixels = merged;
+        lower.effects.clear(); // baked into the pixels now
+        lower.invalidate();
+
+        self.layers.remove(a);
+        self.active = a - 1;
+    }
+
     /// Resample every layer (and its mask) to a new square resolution.
     pub fn resize(&mut self, n: u32) {
         for l in &mut self.layers {
@@ -442,7 +497,12 @@ mod tests {
 
     #[test]
     fn record_op_builds_and_dedups_the_name() {
-        let mut l = Layer::new("Layer 2".into(), Texture::new(1, 1, [0, 0, 0, 0]), BlendMode::Normal, 1.0);
+        let mut l = Layer::new(
+            "Layer 2".into(),
+            Texture::new(1, 1, [0, 0, 0, 0]),
+            BlendMode::Normal,
+            1.0,
+        );
         l.record_op("AO");
         assert_eq!(l.name, "AO");
         l.record_op("Blur");
@@ -455,7 +515,12 @@ mod tests {
 
     #[test]
     fn rename_locks_out_auto_naming() {
-        let mut l = Layer::new("AO".into(), Texture::new(1, 1, [0, 0, 0, 0]), BlendMode::Normal, 1.0);
+        let mut l = Layer::new(
+            "AO".into(),
+            Texture::new(1, 1, [0, 0, 0, 0]),
+            BlendMode::Normal,
+            1.0,
+        );
         l.record_op("AO");
         l.rename("My shadows".into());
         l.record_op("Blur"); // ignored — the layer is hand-named now
@@ -472,7 +537,12 @@ mod tests {
     #[test]
     fn generated_layer_seeds_lead_then_extends() {
         let mut l = one_px_base([0, 0, 0, 255]);
-        l.push_generated("AO".into(), Texture::new(1, 1, [0, 0, 0, 0]), BlendMode::Multiply, 1.0);
+        l.push_generated(
+            "AO".into(),
+            Texture::new(1, 1, [0, 0, 0, 0]),
+            BlendMode::Multiply,
+            1.0,
+        );
         assert_eq!(l.layers[1].name, "AO");
         l.record_active_op("Blur");
         l.record_active_op("Stroke");
@@ -578,6 +648,42 @@ mod tests {
         }
         l.composite_into_region(&mut out, rect);
         assert_eq!(out, full);
+    }
+
+    #[test]
+    fn merge_down_matches_the_two_layer_composite() {
+        // Over an opaque base, merging the top layer down must leave the composite
+        // unchanged — mask, opacity, blend and effects all baked into the lower layer.
+        let mut l = Layers::new(Texture::new(4, 4, [200, 50, 25, 255]));
+        l.add_layer();
+        for (t, px) in l.active_tex_mut().pixels.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[(t * 9) as u8, 100, 255u8.wrapping_sub((t * 5) as u8), 170]);
+        }
+        l.layers[1].blend = BlendMode::Multiply;
+        l.layers[1].opacity = 0.8;
+        for (t, px) in l.layers[1].mask.pixels.chunks_exact_mut(4).enumerate() {
+            let v = ((t * 13) % 256) as u8;
+            px.copy_from_slice(&[v, v, v, 255]);
+        }
+
+        let before = l.composite();
+        l.merge_active_down();
+        assert_eq!(l.layers.len(), 1, "upper layer folded away");
+        assert_eq!(l.active, 0);
+        assert!(l.layers[0].effects.is_empty(), "effects baked into pixels");
+
+        // Allow ±1 for the round-trip through un-premultiplied u8.
+        for (a, b) in l.composite().iter().zip(&before) {
+            assert!((*a as i32 - *b as i32).abs() <= 1, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn merge_down_is_a_noop_on_the_bottom_layer() {
+        let mut l = one_px_base([10, 20, 30, 255]);
+        l.merge_active_down(); // active == 0, nothing beneath
+        assert_eq!(l.layers.len(), 1);
+        assert_eq!(&l.layers[0].tex.pixels[0..4], &[10, 20, 30, 255]);
     }
 
     #[test]

@@ -24,8 +24,11 @@ use crate::mesh::Mesh;
 pub struct Brush {
     pub color: [f32; 3],
     pub radius: f32,
-    pub opacity: f32,  // 0..1, per-stamp coverage
-    pub hardness: f32, // 0..1, fraction of the radius that is fully opaque
+    pub opacity: f32,        // 0..1, per-stamp coverage
+    pub hardness: f32,       // 0..1, fraction of the radius that is fully opaque
+    pub snap_to_texel: bool, // round each dab's center to the grid for crisp, grid-aligned PSX strokes
+    pub snap_grid: f32,      // grid cell size in texels (only meaningful when snap_to_texel is on)
+    pub erase: bool, // remove paint (lower alpha toward transparent) instead of laying color
 }
 
 impl Default for Brush {
@@ -35,6 +38,9 @@ impl Default for Brush {
             radius: 4.0,
             opacity: 1.0,
             hardness: 0.8,
+            snap_to_texel: false,
+            snap_grid: 4.0,
+            erase: false,
         }
     }
 }
@@ -87,7 +93,6 @@ impl Texture {
         }
         out
     }
-
 }
 
 /// Composite `src` (sRGB) into texel `texel` over the stroke's `base` snapshot at
@@ -103,6 +108,17 @@ pub(crate) fn blend_texel(pixels: &mut [u8], base: &[u8], texel: usize, src: [u8
     }
     let base_a = base[i + 3] as f32;
     pixels[i + 3] = (base_a * (1.0 - a) + 255.0 * a).round() as u8;
+}
+
+/// Erase texel `texel` over the stroke's `base` snapshot at coverage `a` (0..1),
+/// lowering alpha toward transparent — the inverse of [`blend_texel`]. RGB is left at
+/// the base color (it's invisible where alpha is 0, and keeping it avoids a black
+/// fringe if the layer is later flattened). `texel` must be in range.
+pub(crate) fn erase_texel(pixels: &mut [u8], base: &[u8], texel: usize, a: f32) {
+    let i = texel * 4;
+    pixels[i..i + 3].copy_from_slice(&base[i..i + 3]);
+    let base_a = base[i + 3] as f32;
+    pixels[i + 3] = (base_a * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
 }
 
 /// A rectangular region of texels, `[x0, x1) × [y0, y1)` (exclusive upper bound),
@@ -259,4 +275,38 @@ pub fn pick_uv(ray: &Ray, mesh: &Mesh) -> Option<Vec2> {
     }
 
     best.map(|(_, uv)| uv)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn erase_lowers_alpha_by_coverage() {
+        // An opaque painted texel...
+        let base = [200u8, 100, 50, 255];
+        let mut px = base;
+
+        // ...fully erased becomes transparent.
+        erase_texel(&mut px, &base, 0, 1.0);
+        assert_eq!(px[3], 0, "full coverage clears alpha");
+
+        // ...half erased keeps half its alpha; RGB stays at the base color.
+        let mut px = base;
+        erase_texel(&mut px, &base, 0, 0.5);
+        assert_eq!(px[3], 128, "half coverage halves alpha");
+        assert_eq!(&px[0..3], &base[0..3], "erase leaves RGB at the base color");
+    }
+
+    #[test]
+    fn erase_then_blend_are_inverse_at_full_coverage() {
+        // Blend to opaque, then erase fully → back to transparent.
+        let transparent = [0u8, 0, 0, 0];
+        let mut px = transparent;
+        blend_texel(&mut px, &transparent, 0, [255, 0, 0], 1.0);
+        assert_eq!(px[3], 255);
+        let painted = px;
+        erase_texel(&mut px, &painted, 0, 1.0);
+        assert_eq!(px[3], 0);
+    }
 }
