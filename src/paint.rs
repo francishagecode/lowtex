@@ -20,7 +20,7 @@ use crate::mesh::Mesh;
 
 /// Live brush settings, driven by the UI panel (G3). Color is sRGB in 0..1 to
 /// match egui's color picker; radius is in texels.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Brush {
     pub color: [f32; 3],
     pub radius: f32,
@@ -88,52 +88,21 @@ impl Texture {
         out
     }
 
-    /// Stamp a brush at a UV coordinate with per-stroke coverage accumulation.
-    ///
-    /// `base` is the texture as it was when the stroke began; `coverage` is the
-    /// stroke's accumulated per-texel coverage (0..1). Overlapping stamps within
-    /// one stroke take the *max* coverage rather than adding, so a slow drag or a
-    /// dense interpolation doesn't double-darken — the stroke tops out at the
-    /// brush's opacity. UV is in [0,1] with V=0 at the top.
-    pub fn stamp_stroke(&mut self, uv: Vec2, brush: &Brush, base: &[u8], coverage: &mut [f32]) {
-        let cx = uv.x * self.width as f32;
-        let cy = uv.y * self.height as f32;
-        let radius = brush.radius.max(0.5);
-        let r = radius.ceil() as i32;
-        let color = brush.color_u8();
+}
 
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let dist = ((dx * dx + dy * dy) as f32).sqrt();
-                let a = brush.opacity * falloff(dist / radius, brush.hardness);
-                if a <= 0.0 {
-                    continue;
-                }
-                let x = cx as i32 + dx;
-                let y = cy as i32 + dy;
-                if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
-                    continue;
-                }
-                let texel = (y as u32 * self.width + x as u32) as usize;
-                if a <= coverage[texel] {
-                    continue; // already covered at least this much this stroke
-                }
-                coverage[texel] = a;
-                let cov = a;
-                let i = texel * 4;
-                for (c, &src) in color.iter().enumerate() {
-                    let dst = base[i + c] as f32;
-                    self.pixels[i + c] = (dst * (1.0 - cov) + src as f32 * cov)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                }
-                // Raise alpha toward opaque by coverage. An opaque base (255)
-                // stays opaque; a transparent layer (0) gains paint where stamped.
-                let base_a = base[i + 3] as f32;
-                self.pixels[i + 3] = (base_a * (1.0 - cov) + 255.0 * cov).round() as u8;
-            }
-        }
+/// Composite `src` (sRGB) into texel `texel` over the stroke's `base` snapshot at
+/// coverage `a` (0..1), raising alpha toward opaque. An opaque base (255) stays
+/// opaque; a transparent layer (0) gains paint where stamped. Shared by every
+/// brush path — solid color, material image, mask, and the cross-face surface
+/// splat — so they all composite identically. `texel` must be in range.
+pub(crate) fn blend_texel(pixels: &mut [u8], base: &[u8], texel: usize, src: [u8; 3], a: f32) {
+    let i = texel * 4;
+    for (c, &s) in src.iter().enumerate() {
+        let dst = base[i + c] as f32;
+        pixels[i + c] = (dst * (1.0 - a) + s as f32 * a).round().clamp(0.0, 255.0) as u8;
     }
+    let base_a = base[i + 3] as f32;
+    pixels[i + 3] = (base_a * (1.0 - a) + 255.0 * a).round() as u8;
 }
 
 /// A rectangular region of texels, `[x0, x1) × [y0, y1)` (exclusive upper bound),
@@ -149,28 +118,6 @@ pub struct TexRect {
 }
 
 impl TexRect {
-    /// The texels a brush of `radius` centered at texel-space `(cx, cy)` can touch:
-    /// `cx as i32 ± radius.ceil()`, matching the stamp loops in `Texture::stamp_stroke`
-    /// and `Material::stamp` exactly. Clamped to `[0, size)`; `None` if it falls
-    /// entirely outside the texture.
-    pub fn from_stamp(cx: f32, cy: f32, radius: f32, size: u32) -> Option<TexRect> {
-        let r = radius.max(0.5).ceil() as i32;
-        let (cxi, cyi) = (cx as i32, cy as i32);
-        let x0 = (cxi - r).max(0);
-        let y0 = (cyi - r).max(0);
-        let x1 = (cxi + r + 1).min(size as i32); // +1: inclusive `+r` → exclusive bound
-        let y1 = (cyi + r + 1).min(size as i32);
-        if x0 >= x1 || y0 >= y1 {
-            return None;
-        }
-        Some(TexRect {
-            x0: x0 as u32,
-            y0: y0 as u32,
-            x1: x1 as u32,
-            y1: y1 as u32,
-        })
-    }
-
     /// Smallest rect covering both.
     pub fn union(self, other: TexRect) -> TexRect {
         TexRect {

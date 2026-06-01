@@ -16,8 +16,9 @@
 // so a screenshot is faithful to what the window shows.
 //
 // Flow on each paint:
-//   mouse pixel → Ray::from_screen → BVH pick_uv → Texture::stamp_stroke →
-//   (palette quantize if enabled) → Queue::write_texture (CPU → GPU)
+//   mouse pixel → Ray::from_screen → BVH pick → surface::splat (walk the mesh
+//   surface across faces) → blend_texel → (palette quantize if enabled) →
+//   Queue::write_texture (CPU → GPU)
 //
 // Flow on each frame:
 //   acquire target view → encode draw → submit → present
@@ -32,7 +33,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::bake::{Gradient, Levels, MapSource, NoiseMod};
-use crate::bvh::Bvh;
+use crate::bvh::{Bvh, Hit};
 use crate::camera::Camera;
 use crate::history::History;
 use crate::layers::Layers;
@@ -119,6 +120,38 @@ pub enum PaintTarget {
     Mask,
 }
 
+/// A model-symmetry plane for mirrored painting: the plane perpendicular to this
+/// axis, through the mesh's bounding-box center. With symmetry on, every dab is
+/// also painted at its reflection across the plane, so a stroke down one side of a
+/// symmetric model lays the same paint down the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SymmetryAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl SymmetryAxis {
+    pub const ALL: [SymmetryAxis; 3] = [SymmetryAxis::X, SymmetryAxis::Y, SymmetryAxis::Z];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SymmetryAxis::X => "X",
+            SymmetryAxis::Y => "Y",
+            SymmetryAxis::Z => "Z",
+        }
+    }
+
+    /// Index of the component this axis mirrors (x=0, y=1, z=2).
+    fn index(self) -> usize {
+        match self {
+            SymmetryAxis::X => 0,
+            SymmetryAxis::Y => 1,
+            SymmetryAxis::Z => 2,
+        }
+    }
+}
+
 /// A colored line-list vertex for the ground grid. Position is in the space the
 /// bound view-proj expects; color is linear RGB (see lines.wgsl).
 #[repr(C)]
@@ -153,6 +186,14 @@ impl LineVertex {
 /// (capped to the scene region) inset from the bottom-left corner by this margin.
 const COMPASS_SIZE_PX: f32 = 110.0;
 const COMPASS_MARGIN_PX: f32 = 12.0;
+
+/// Number of segments in the brush-cursor ring. 48 reads as a smooth circle at
+/// any zoom without being worth more vertices.
+const BRUSH_RING_SEGMENTS: u32 = 48;
+
+/// How opaque the brush stamp *preview* ghost is, as a fraction of the dab's own
+/// per-texel coverage. Low enough to read as a preview, high enough to see the color.
+const BRUSH_PREVIEW_ALPHA: f32 = 0.5;
 
 /// A vertex of the thick-line compass. Each axis segment is a quad (6 of these),
 /// so a vertex carries the *whole* segment (`start`, `end`) plus its corner in
@@ -198,6 +239,25 @@ impl CompassVertex {
     }
 }
 
+/// Everything the hovering brush-stamp ghost depends on. The app pushes the brush
+/// state and cursor every frame and the redraw loop runs continuously, so without
+/// a guard the preview re-picks + re-splats the whole footprint each idle frame —
+/// the same large-brush cost a stroke pays, but for nothing. We recompute only when
+/// this key changes; committed-image changes (paint commit, fills, undo, palette,
+/// resize, load) reset it to force a fresh ghost. `cam` is the camera generation, so
+/// an orbit/pan/zoom (which moves where the cursor lands) invalidates it too.
+#[derive(Clone, Copy, PartialEq)]
+struct PreviewKey {
+    cursor: (f32, f32),
+    cam: u64,
+    brush: Brush,
+    tile: f32,
+    material_gen: u64,
+    symmetry: Option<SymmetryAxis>,
+    lock_face: bool,
+    target: PaintTarget,
+}
+
 pub struct Renderer {
     window: Option<Arc<Window>>,
     surface: Option<wgpu::Surface<'static>>,
@@ -223,6 +283,39 @@ pub struct Renderer {
     compass_bind_group: wgpu::BindGroup,
     compass_vertex_buffer: wgpu::Buffer,
     compass_vertex_count: u32,
+    // Active-face outline: the boundary edges of the facet(s) being painted, drawn
+    // with the grid's line pipeline so the painter can see exactly where the face
+    // lock confines the brush. Rebuilt only when the outlined facet set changes
+    // (`outline_facets` is the cache key); `None`/0 when nothing is highlighted.
+    outline_vertex_buffer: Option<wgpu::Buffer>,
+    outline_vertex_count: u32,
+    outline_facets: Vec<i32>,
+    // Brush-cursor ring: a circle laid on the mesh surface at the cursor, sized to
+    // the brush's true world-space footprint, so the painter sees how big the brush
+    // is before stamping. Fixed-capacity buffer rewritten each frame; count is 0
+    // when hidden (no painting tool, or the cursor is off the mesh).
+    brush_ring_buffer: wgpu::Buffer,
+    brush_ring_count: u32,
+    // Inputs the ring last reflected (cursor, camera generation, brush radius). The
+    // ring is rebuilt only when these change, so a stationary cursor doesn't re-pick +
+    // re-upload the ring every idle frame. `None` = nothing drawn (force a rebuild).
+    last_ring: Option<(f32, f32, u64, f32)>,
+    // Brush stamp preview: a translucent ghost of the dab under the cursor, written
+    // straight into the GPU paint texture (never the layers) so the painter sees
+    // what a click would lay down. `preview_rect` is the region currently ghosted;
+    // it's reverted from `display_buf` (the committed mirror) before the next ghost
+    // or any commit, so nothing about the preview is ever persisted.
+    preview_rect: Option<TexRect>,
+    // Inputs the ghost last reflected; skip the (large-brush-expensive) re-splat when
+    // unchanged. Reset to `None` whenever the committed image changes (so the ghost is
+    // recomputed over the new pixels). See `PreviewKey`.
+    last_preview: Option<PreviewKey>,
+    // Monotonic camera/view generation, bumped in `update_uniforms`. Lets the ring and
+    // ghost keys detect an orbit/pan/zoom/resize without diffing the matrix.
+    camera_gen: std::cell::Cell<u64>,
+    // Bumped whenever the brush image is loaded/cleared, so the ghost key notices a
+    // material swap (the image itself isn't cheap to compare).
+    brush_material_gen: u64,
     // Background clear color, in sRGB (what the picker shows); converted to linear
     // at clear time. Grid visibility toggle.
     bg_color: [f32; 3],
@@ -276,6 +369,21 @@ pub struct Renderer {
     fluid_travel: f32,
     fluid_seed: u32,
 
+    // Mirror painting (symmetry): when `Some`, each dab is also stamped at its
+    // reflection across the model-symmetry plane for this axis (through the mesh
+    // bbox center). Synced from the UI; `None` = off.
+    symmetry: Option<SymmetryAxis>,
+
+    // Face lock: when true, a stroke is confined to the facet(s) under its *first*
+    // dab, so holding the mouse down and dragging onto neighbouring faces never
+    // paints them. Synced from the UI. Uses the cached `fill_map` facet partition
+    // — the same one the Face fill bucket fills.
+    lock_face: bool,
+    // The facet(s) the in-progress stroke is locked to: `None` until the first dab
+    // of a face-locked stroke fixes them (one facet, plus the mirror's when
+    // symmetry is on). Reset each `begin_stroke`.
+    stroke_lock_facets: Option<Vec<i32>>,
+
     // Undo/redo over the layer stack. A stroke records one entry on release (via
     // `pending` + `stroke_dirty`); discrete layer ops record one each.
     history: History,
@@ -312,6 +420,14 @@ pub struct Renderer {
     // Cached UV-island map at the current resolution, driving the fill tools.
     // Invalidated alongside mesh_maps (geometry or resolution change).
     fill_map: Option<crate::fill::FillMap>,
+    // Cached position-edge triangle adjacency, driving the cross-face brush
+    // (`surface::splat`). Topology-only, so unlike the maps above it is *not*
+    // invalidated on a resolution change — only when the geometry itself changes.
+    surface_adj: Option<crate::surface::Adjacency>,
+    // Reused flood scratch for `surface::splat`, so a stroke's many dabs don't each
+    // allocate + zero a per-triangle visited buffer (the cost scaled with mesh size,
+    // not brush size). Generation-stamped, so resetting between dabs is a counter bump.
+    splat_scratch: crate::surface::SplatScratch,
     // Cached UV-coverage mask for island bleed (G18): which texels a triangle
     // covers, so we can dilate paint into the gutter. Lazily built in the display
     // path; invalidated on geometry change. RefCell so the &self display helper can
@@ -326,6 +442,14 @@ pub struct Renderer {
     // in `mesh_maps` is (re)baked lazily for these whenever a Light effect is applied.
     sun_dir: glam::Vec3,
     sun_shadow: bool,
+
+    // Monotonic counters the 2D UV editor polls to know when to re-copy renderer
+    // state into the UI (the egui panel never sees the renderer directly). `paint_version`
+    // bumps whenever `display_buf` changes (any composite/flush), so the panel re-uploads
+    // the atlas image only on actual change; `topo_version` bumps whenever the mesh is
+    // swapped, so the panel rebuilds the UV island wireframe only then.
+    paint_version: u64,
+    topo_version: u64,
 }
 
 impl Renderer {
@@ -694,6 +818,17 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        // Brush-cursor ring: a fixed line loop (constant vertex count) refreshed in
+        // place each frame via `write_buffer`, so following the cursor never
+        // reallocates. Capacity = one segment per `BRUSH_RING_SEGMENTS`, ×2 verts.
+        let brush_ring_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("brush ring vertices"),
+            size: (BRUSH_RING_SEGMENTS as usize * 2 * std::mem::size_of::<LineVertex>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Palette quantize is applied to the texture on the CPU (G8).
         let palette = Palette::builtins().remove(0); // PICO-8 by default
         let palette_settings = PaletteSettings::default();
@@ -723,6 +858,16 @@ impl Renderer {
             compass_bind_group,
             compass_vertex_buffer,
             compass_vertex_count,
+            outline_vertex_buffer: None,
+            outline_vertex_count: 0,
+            outline_facets: Vec::new(),
+            brush_ring_buffer,
+            brush_ring_count: 0,
+            last_ring: None,
+            preview_rect: None,
+            last_preview: None,
+            camera_gen: std::cell::Cell::new(0),
+            brush_material_gen: 0,
             bg_color: [0.221, 0.272, 0.313], // sRGB of the old dark teal clear
             show_grid: true,
             uniform_buffer,
@@ -745,6 +890,9 @@ impl Renderer {
             fluid_spec: crate::particle::FluidSpec::default(),
             fluid_travel: 0.0,
             fluid_seed: 0,
+            symmetry: None,
+            lock_face: false,
+            stroke_lock_facets: None,
             history: History::new(HISTORY_CAP),
             pending: None,
             stroke_dirty: false,
@@ -759,11 +907,15 @@ impl Renderer {
             bvh,
             mesh_maps: None,
             fill_map: None,
+            surface_adj: None,
+            splat_scratch: crate::surface::SplatScratch::new(),
             coverage: std::cell::RefCell::new(None),
             recipe: Vec::new(),
             // Default sun matches the shader's fixed key light (warm, high, front-right).
             sun_dir: glam::Vec3::new(0.4, 0.8, 0.5).normalize(),
             sun_shadow: true,
+            paint_version: 0,
+            topo_version: 0,
         };
         // Composite the base layer into `display_buf` and upload it to the GPU texture.
         r.refresh_display_texture();
@@ -897,6 +1049,9 @@ impl Renderer {
     /// Write the view-projection matrix to the GPU. Also refreshes the compass
     /// gizmo's rotation-only matrix, so it tracks the camera as it orbits.
     fn update_uniforms(&self) {
+        // The camera/view moved: invalidate the brush ring + ghost keys (the cursor
+        // now lands on a different surface point).
+        self.camera_gen.set(self.camera_gen.get().wrapping_add(1));
         let view_proj = self.camera.view_proj();
         self.queue.write_buffer(
             &self.uniform_buffer,
@@ -967,6 +1122,7 @@ impl Renderer {
     /// so `display_buf` stays a faithful mirror of the GPU texture for them too.
     fn refresh_display_texture(&mut self) {
         self.display_buf = self.composite_display();
+        self.paint_version = self.paint_version.wrapping_add(1);
         upload_pixels(
             &self.queue,
             &self.paint_texture_gpu,
@@ -975,8 +1131,14 @@ impl Renderer {
             self.tex_size,
         );
         // A full upload supersedes any pending region (and a resize would otherwise
-        // leave a stale, possibly out-of-bounds, rect).
+        // leave a stale, possibly out-of-bounds, rect). The same goes for the brush
+        // preview's ghost region — the GPU now matches `display_buf` everywhere.
         self.dirty_rect = None;
+        self.preview_rect = None;
+        // The committed image (and possibly the geometry — load/unwrap/resize all land
+        // here) changed under the cursor, so rebuild the ghost and ring next frame.
+        self.last_preview = None;
+        self.last_ring = None;
     }
 
     /// Recompute just the texels a stroke touched (the dirty-rectangle path). Produces
@@ -1032,6 +1194,7 @@ impl Renderer {
         restore_margin(&mut self.display_buf, &before, size, proc, upload);
 
         upload_region(&self.queue, &self.paint_texture_gpu, &self.display_buf, size, upload);
+        self.paint_version = self.paint_version.wrapping_add(1);
     }
 
     /// Apply any pending stroke dirty-rect to the GPU, once per frame. Cheap no-op when
@@ -1202,15 +1365,353 @@ impl Renderer {
         self.fluid_spec = spec;
     }
 
+    /// Mirror-painting axis (`None` = off). Synced from the UI; works for both the
+    /// solid/image brush and the fluid brush.
+    pub fn set_symmetry(&mut self, axis: Option<SymmetryAxis>) {
+        self.symmetry = axis;
+    }
+
+    /// Lock each dab to the flat face under its hit point (`true` = on). Synced
+    /// from the UI; works for both the solid/image brush and the fluid brush.
+    pub fn set_lock_face(&mut self, on: bool) {
+        self.lock_face = on;
+    }
+
+    /// Refresh the active-face outline for this frame. `cursor` is the current
+    /// mouse pixel when a painting tool with face-lock is active, else `None` (the
+    /// outline is then cleared). Mid-stroke the locked face is outlined; otherwise
+    /// the face under the cursor is previewed. Rebuilds GPU geometry only when the
+    /// highlighted facet set actually changes, so it's cheap to call every frame.
+    pub fn set_face_outline(&mut self, cursor: Option<(f32, f32)>) {
+        let facets = self.outline_target_facets(cursor);
+        if facets == self.outline_facets {
+            return; // same face as last frame — keep the existing buffer
+        }
+        self.outline_facets = facets.clone();
+        self.build_outline(&facets);
+    }
+
+    /// Which facet(s) the outline should trace this frame: the stroke's locked
+    /// face while painting, else the face under the cursor (preview). Empty when
+    /// face-lock is off, there's no cursor, or the ray misses the mesh.
+    fn outline_target_facets(&mut self, cursor: Option<(f32, f32)>) -> Vec<i32> {
+        if !self.lock_face {
+            return Vec::new();
+        }
+        // Mid-stroke: trace the face the stroke locked onto, even as the cursor
+        // wanders off it. (`pending` marks an in-progress stroke.)
+        if self.pending.is_some() {
+            if let Some(facets) = &self.stroke_lock_facets {
+                if !facets.is_empty() {
+                    return facets.clone();
+                }
+            }
+        }
+        let Some((x, y)) = cursor else {
+            return Vec::new();
+        };
+        let ray = self.pick_ray(Vec2::new(x, y));
+        let Some(hit) = self.bvh.pick(&ray) else {
+            return Vec::new();
+        };
+        self.ensure_fill_map();
+        match self.fill_map.as_ref().unwrap().facet_for_tri(hit.tri) {
+            Some(f) => vec![f as i32],
+            None => Vec::new(),
+        }
+    }
+
+    /// Rebuild the outline vertex buffer: the boundary edges of `facets` — every
+    /// triangle edge whose neighbour lies in a different facet (or off the mesh) —
+    /// as a line list. Endpoints are nudged out along the face normal by a hair so
+    /// the lines sit just in front of the surface and aren't z-fought away.
+    fn build_outline(&mut self, facets: &[i32]) {
+        if facets.is_empty() {
+            self.outline_vertex_buffer = None;
+            self.outline_vertex_count = 0;
+            return;
+        }
+        self.ensure_fill_map();
+        self.ensure_surface_adj();
+        let (mn, mx) = self.mesh.bounds();
+        let eps = (mx - mn).length().max(1e-3) * 1.5e-3;
+        const COLOR: [f32; 3] = [1.0, 0.78, 0.12]; // amber, linear RGB (see lines.wgsl)
+
+        let verts = {
+            let map = self.fill_map.as_ref().unwrap();
+            let adj = self.surface_adj.as_ref().unwrap();
+            let mut verts: Vec<LineVertex> = Vec::new();
+            for ti in 0..self.mesh.indices.len() / 3 {
+                let f = map.facet_of_tri[ti] as i32;
+                if !facets.contains(&f) {
+                    continue;
+                }
+                let i = ti * 3;
+                let idx = [
+                    self.mesh.indices[i] as usize,
+                    self.mesh.indices[i + 1] as usize,
+                    self.mesh.indices[i + 2] as usize,
+                ];
+                let p = [
+                    glam::Vec3::from(self.mesh.vertices[idx[0]].position),
+                    glam::Vec3::from(self.mesh.vertices[idx[1]].position),
+                    glam::Vec3::from(self.mesh.vertices[idx[2]].position),
+                ];
+                let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero() * eps;
+                // The adjacency edge slot `e` spans triangle vertices e and (e+1)%3.
+                for e in 0..3 {
+                    let nb = adj.neighbors()[ti][e];
+                    let boundary = nb < 0 || map.facet_of_tri[nb as usize] as i32 != f;
+                    if boundary {
+                        let a = p[e] + n;
+                        let b = p[(e + 1) % 3] + n;
+                        verts.push(LineVertex { position: a.into(), color: COLOR });
+                        verts.push(LineVertex { position: b.into(), color: COLOR });
+                    }
+                }
+            }
+            verts
+        };
+
+        self.outline_vertex_count = verts.len() as u32;
+        self.outline_vertex_buffer = (!verts.is_empty()).then(|| {
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("face outline vertices"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+    }
+
+    /// Refresh the brush-cursor ring for this frame. `cursor` is the mouse pixel
+    /// when a painting tool is active, else `None` (the ring is then hidden). The
+    /// ring is a circle of the brush's true world-space footprint laid on the mesh
+    /// surface at the cursor, tilted into the hit face's tangent plane, so its size
+    /// tracks both the Size slider and the local texel density. Cheap to call every
+    /// frame: it rewrites a fixed buffer in place rather than reallocating.
+    pub fn set_brush_cursor(&mut self, cursor: Option<(f32, f32)>, brush: &Brush) {
+        let Some((x, y)) = cursor else {
+            self.brush_ring_count = 0;
+            self.last_ring = None;
+            return;
+        };
+        // Skip the pick + buffer rewrite when nothing the ring depends on changed
+        // (cursor, camera, brush radius) — the common case while the cursor sits still.
+        let key = (x, y, self.camera_gen.get(), brush.radius);
+        if self.last_ring == Some(key) {
+            return;
+        }
+        self.last_ring = Some(key);
+        let ray = self.pick_ray(Vec2::new(x, y));
+        let Some(hit) = self.bvh.pick(&ray) else {
+            self.brush_ring_count = 0;
+            return;
+        };
+        // Brush radius (texels) → world units, the same mapping the surface dab uses.
+        let radius = self.world_brush_radius(hit.tri, brush.radius);
+
+        // An orthonormal tangent basis in the hit face's plane: pick any axis not
+        // parallel to the normal, then two cross products give perpendicular u, v.
+        let n = hit.normal.normalize_or_zero();
+        let seed = if n.x.abs() < 0.9 { glam::Vec3::X } else { glam::Vec3::Y };
+        let u = n.cross(seed).normalize_or_zero();
+        let v = n.cross(u);
+        // Lift the ring just off the surface so it isn't z-fought by the face it sits on.
+        let (mn, mx) = self.mesh.bounds();
+        let lift = n * (mx - mn).length().max(1e-3) * 1.5e-3;
+        let center = hit.pos + lift;
+
+        const COLOR: [f32; 3] = [0.95, 0.95, 0.98]; // near-white, linear RGB
+        let seg = BRUSH_RING_SEGMENTS;
+        let mut verts: Vec<LineVertex> = Vec::with_capacity(seg as usize * 2);
+        let point = |k: u32| -> [f32; 3] {
+            let a = std::f32::consts::TAU * (k % seg) as f32 / seg as f32;
+            (center + (u * a.cos() + v * a.sin()) * radius).into()
+        };
+        // Line list: each segment connects point k to k+1 (wrapping closed).
+        for k in 0..seg {
+            verts.push(LineVertex { position: point(k), color: COLOR });
+            verts.push(LineVertex { position: point(k + 1), color: COLOR });
+        }
+        self.queue
+            .write_buffer(&self.brush_ring_buffer, 0, bytemuck::cast_slice(&verts));
+        self.brush_ring_count = verts.len() as u32;
+    }
+
+    /// Texel brush radius → a world-space sphere radius via the (constant) local
+    /// texel density at triangle `tri`. Falls back to a bbox-derived radius — the
+    /// same mapping the fluid brush uses — when the triangle is degenerate in UV.
+    /// Shared by the surface dab, the cursor ring, and the stamp preview so all
+    /// three agree on how big the brush is.
+    fn world_brush_radius(&self, tri: u32, radius_texels: f32) -> f32 {
+        crate::surface::world_radius(&self.mesh, tri, radius_texels, self.tex_size).unwrap_or_else(
+            || {
+                let (mn, mx) = self.mesh.bounds();
+                (mx - mn).length().max(1e-3) * (radius_texels / self.tex_size as f32)
+            },
+        )
+    }
+
+    /// The brush's on-screen radius in physical pixels at `mouse_px`, or `None` if
+    /// the cursor isn't over the mesh. Used to space stroke dabs: a large brush's
+    /// footprint covers many screen pixels, so dabs can be spaced far apart and
+    /// still overlap — re-splatting the whole footprint every 2px (the old fixed
+    /// step) is almost entirely redundant work. Projects the hit point and a point
+    /// offset by the world brush radius along a screen-horizontal world direction
+    /// (from the inverse projection, so a tilted face doesn't foreshorten it).
+    fn brush_screen_radius(&self, mouse_px: Vec2, brush: &Brush) -> Option<f32> {
+        let ray = self.pick_ray(mouse_px);
+        let hit = self.bvh.pick(&ray)?;
+        let radius_world = self.world_brush_radius(hit.tri, brush.radius);
+        let vp = self.camera.view_proj();
+        let inv = vp.inverse();
+        // A world direction that runs left-right across the screen at mid-depth.
+        let a = inv.project_point3(glam::Vec3::new(0.0, 0.0, 0.5));
+        let b = inv.project_point3(glam::Vec3::new(1.0, 0.0, 0.5));
+        let right = (b - a).normalize_or_zero();
+        let (_, _, vw, vh) = self.scene_viewport();
+        let c0 = vp.project_point3(hit.pos);
+        let c1 = vp.project_point3(hit.pos + right * radius_world);
+        // NDC delta → pixels (NDC spans -1..1 across the viewport, so ×0.5×extent).
+        let dx = (c1.x - c0.x) * 0.5 * vw;
+        let dy = (c1.y - c0.y) * 0.5 * vh;
+        Some((dx * dx + dy * dy).sqrt())
+    }
+
+    /// The texels a single dab from `hit` would cover, with coverage — the read-only
+    /// half of `surface_dab` (no blending, no dirty rect). `&mut` only to reuse the
+    /// flood scratch; `ensure_surface_adj` must have run.
+    fn dab_splats(&mut self, hit: &Hit, brush: &Brush) -> Vec<(usize, f32)> {
+        let radius_world = self.world_brush_radius(hit.tri, brush.radius);
+        let adj = self.surface_adj.as_ref().unwrap();
+        crate::surface::splat(
+            &self.mesh,
+            adj,
+            hit,
+            radius_world,
+            brush.opacity,
+            brush.hardness,
+            self.tex_size,
+            &mut self.splat_scratch,
+        )
+    }
+
+    /// Refresh the brush stamp preview for this frame: a translucent ghost of the dab
+    /// under the cursor, written into the GPU paint texture so the painter can see the
+    /// color/image and footprint a click would lay down — without committing it. The
+    /// layers and `display_buf` are never touched; the previous ghost is reverted from
+    /// `display_buf` first, so the preview leaves no trace. Shown only for the
+    /// solid/image brush while hovering (not mid-stroke) and painting color. `cursor`
+    /// is `None` (or off the mesh) to clear it.
+    pub fn set_brush_preview(&mut self, cursor: Option<(f32, f32)>, brush: &Brush) {
+        let size = self.tex_size;
+        // Everything the ghost depends on this frame (`None` = no cursor → no ghost).
+        let key = cursor.map(|(x, y)| PreviewKey {
+            cursor: (x, y),
+            cam: self.camera_gen.get(),
+            brush: *brush,
+            tile: self.brush_tile,
+            material_gen: self.brush_material_gen,
+            symmetry: self.symmetry,
+            lock_face: self.lock_face,
+            target: self.paint_target,
+        });
+        // Unchanged since last frame → the GPU already shows the correct thing (ghost
+        // or none), so skip the pick + (large-brush-expensive) re-splat + upload. A
+        // committed-image change resets `last_preview` to `None`, forcing a recompute.
+        if key == self.last_preview {
+            return;
+        }
+        self.last_preview = key;
+        // Revert last frame's ghost so the texture matches the committed display again.
+        if let Some(rect) = self.preview_rect.take() {
+            upload_region(&self.queue, &self.paint_texture_gpu, &self.display_buf, size, rect);
+        }
+        let Some((x, y)) = cursor else { return };
+        // A real stroke already shows the truth; a mask ghost (white/black) isn't
+        // meaningful, and an image brush still previews its sampled color.
+        if self.pending.is_some() || self.paint_target != PaintTarget::Color {
+            return;
+        }
+        let ray = self.pick_ray(Vec2::new(x, y));
+        let Some(hit) = self.bvh.pick(&ray) else { return };
+        self.ensure_surface_adj();
+
+        // The dab's splats, plus the symmetric dab's, exactly as a stamp would lay them.
+        let mirror = self
+            .symmetry
+            .and_then(|axis| self.bvh.pick(&self.mirror_ray(&ray, axis)));
+        let mut splats = self.dab_splats(&hit, brush);
+        if let Some(m) = &mirror {
+            splats.extend(self.dab_splats(m, brush));
+        }
+        // Face lock confines the ghost to the face the stroke would lock onto.
+        if self.lock_face {
+            self.ensure_fill_map();
+            let map = self.fill_map.as_ref().unwrap();
+            if let Some(f) = map.facet_for_tri(hit.tri).map(|f| f as i32) {
+                let tf = &map.texel_facet;
+                splats.retain(|&(t, _)| tf.get(t).copied() == Some(f));
+            }
+        }
+        if splats.is_empty() {
+            return;
+        }
+
+        // Bounding box of the touched texels (can span faces when the dab wraps a seam).
+        let (mut x0, mut y0, mut x1, mut y1) = (size, size, 0u32, 0u32);
+        for &(texel, _) in &splats {
+            let (tx, ty) = (texel as u32 % size, texel as u32 / size);
+            x0 = x0.min(tx);
+            y0 = y0.min(ty);
+            x1 = x1.max(tx + 1);
+            y1 = y1.max(ty + 1);
+        }
+        let rect = TexRect { x0, y0, x1, y1 };
+
+        // Blend the ghost over a copy of the committed region, then upload just that box.
+        let mut packed = copy_region(&self.display_buf, size, rect);
+        let rw = rect.width();
+        let mat = self.brush_material.as_ref();
+        let tile = self.brush_tile;
+        let solid = brush.color_u8();
+        for &(texel, a) in &splats {
+            let (tx, ty) = (texel as u32 % size, texel as u32 / size);
+            let src = match mat {
+                Some(m) => {
+                    let c = m.sample(tx as f32 / size as f32, ty as f32 / size as f32, tile);
+                    [c[0], c[1], c[2]]
+                }
+                None => solid,
+            };
+            let alpha = (a * BRUSH_PREVIEW_ALPHA).clamp(0.0, 1.0);
+            let li = (((ty - rect.y0) * rw + (tx - rect.x0)) * 4) as usize;
+            for c in 0..3 {
+                let dst = packed[li + c] as f32;
+                packed[li + c] = (dst * (1.0 - alpha) + src[c] as f32 * alpha).round() as u8;
+            }
+        }
+        upload_packed(&self.queue, &self.paint_texture_gpu, &packed, rect);
+        self.preview_rect = Some(rect);
+    }
+
     /// Load an image for the brush to paint (UV-tiled) instead of solid color.
     pub fn load_brush_material(&mut self, path: &str) -> Result<(), String> {
         self.brush_material = Some(crate::material::Material::load(path)?);
+        self.brush_material_gen = self.brush_material_gen.wrapping_add(1);
         Ok(())
     }
 
     /// Drop the loaded brush image; the brush reverts to painting its solid color.
     pub fn clear_brush_material(&mut self) {
         self.brush_material = None;
+        self.brush_material_gen = self.brush_material_gen.wrapping_add(1);
+    }
+
+    /// A small antialiased preview (≤`max`×`max`, RGBA8) of the loaded brush image,
+    /// or `None` if the brush is painting solid color. For the UI swatch.
+    pub fn brush_thumbnail(&self, max: u32) -> Option<(u32, u32, Vec<u8>)> {
+        self.brush_material.as_ref().map(|m| m.thumbnail(max))
     }
 
     pub fn add_layer(&mut self) {
@@ -1471,6 +1972,15 @@ impl Renderer {
         if stale {
             log::info!("baking mesh maps at {}²…", self.tex_size);
             self.mesh_maps = Some(crate::bake::bake(&self.mesh, &self.bvh, self.tex_size));
+        }
+    }
+
+    /// Ensure the cross-face brush's position-edge adjacency is built for the
+    /// current geometry. Cheap and topology-only, so it survives resolution
+    /// changes — rebuilt only after `surface_adj` is invalidated on a mesh change.
+    fn ensure_surface_adj(&mut self) {
+        if self.surface_adj.is_none() {
+            self.surface_adj = Some(crate::surface::Adjacency::build(&self.mesh));
         }
     }
 
@@ -1864,6 +2374,8 @@ impl Renderer {
         self.index_count = mesh.indices.len() as u32;
         self.bvh = Bvh::build(&mesh);
         self.mesh = mesh;
+        self.surface_adj = None; // topology changed; adjacency is stale
+        self.topo_version = self.topo_version.wrapping_add(1); // UV editor rebuilds the wireframe
         self.mesh_maps = None; // geometry changed; baked maps are stale
         self.fill_map = None; // geometry changed; island map is stale
         *self.coverage.get_mut() = None; // UV coverage is stale
@@ -1917,6 +2429,8 @@ impl Renderer {
         self.index_count = mesh.indices.len() as u32;
         self.bvh = Bvh::build(&mesh);
         self.mesh = mesh;
+        self.surface_adj = None; // topology changed; adjacency is stale
+        self.topo_version = self.topo_version.wrapping_add(1); // UV editor rebuilds the wireframe
         // Pick up the new size and recreate the GPU texture / bind group / stroke
         // buffers (the old fixed-resolution unwrap never needed this).
         self.rebuild_paint_gpu();
@@ -2000,6 +2514,8 @@ impl Renderer {
         self.index_count = mesh.indices.len() as u32;
         self.bvh = Bvh::build(&mesh);
         self.mesh = mesh;
+        self.surface_adj = None; // topology changed; adjacency is stale
+        self.topo_version = self.topo_version.wrapping_add(1); // UV editor rebuilds the wireframe
         self.mesh_maps = None;
         self.fill_map = None;
         *self.coverage.get_mut() = None;
@@ -2075,10 +2591,15 @@ impl Renderer {
         self.stroke_base = self.target_pixels().to_vec();
         self.stroke_coverage.fill(0.0);
         self.fluid_travel = 0.0;
+        // A fresh stroke hasn't fixed its locked face yet (the first dab will).
+        self.stroke_lock_facets = None;
         // Snapshot the pre-stroke stack so the whole stroke is one undo step. Held
         // until release, then committed only if the stroke actually painted.
         self.pending = Some(self.layers.clone());
         self.stroke_dirty = false;
+        // The hover ghost must be reverted now the stroke is taking over; force the
+        // preview path to run (and clear it) next frame rather than skip on a match.
+        self.last_preview = None;
     }
 
     /// End the current stroke, committing it to history as a single undo step.
@@ -2103,6 +2624,8 @@ impl Renderer {
             }
         }
         self.stroke_dirty = false;
+        // The stroke is committed; re-show the hover ghost over the new pixels.
+        self.last_preview = None;
     }
 
     /// Build a stable world-space pick ray for a screen pixel. The pixel is in
@@ -2122,60 +2645,190 @@ impl Renderer {
         }
     }
 
+    /// Reflect a pick ray across the model-symmetry plane for `axis` (perpendicular
+    /// to the axis, through the mesh bbox center). The origin reflects about the
+    /// plane; the direction just flips its component on that axis (a vector ignores
+    /// the plane offset), so the reflected ray points at the mirror-image surface.
+    fn mirror_ray(&self, ray: &Ray, axis: SymmetryAxis) -> Ray {
+        let (mn, mx) = self.mesh.bounds();
+        let center = (mn + mx) * 0.5;
+        let i = axis.index();
+        let mut origin = ray.origin;
+        origin[i] = 2.0 * center[i] - origin[i];
+        let mut direction = ray.direction;
+        direction[i] = -direction[i];
+        Ray { origin, direction }
+    }
+
     /// Pick + stamp a single dab at a screen pixel (no GPU upload). Returns
     /// whether it hit the mesh.
+    ///
+    /// The dab is a sphere on the mesh *surface*, not a circle in texture space:
+    /// from the picked triangle `surface::splat` walks position-adjacent triangles
+    /// out to a world-space radius and weights each covered texel by its 3D
+    /// distance to the hit. A stroke that reaches a UV seam therefore wraps onto
+    /// the neighbouring face instead of dying at the island edge — the cross-face
+    /// painting the flat texture-space stamp couldn't do.
     fn stamp_screen(&mut self, mouse_px: Vec2, brush: &Brush) -> bool {
         let ray = self.pick_ray(mouse_px);
-        if let Some(uv) = self.bvh.pick_uv(&ray) {
-            let base = &self.stroke_base;
-            let coverage = &mut self.stroke_coverage;
-            match self.paint_target {
-                PaintTarget::Color => match &self.brush_material {
-                    // A brush image is loaded: reveal it (UV-tiled) where the stroke lands.
-                    Some(mat) => {
-                        mat.stamp(
-                            self.layers.active_tex_mut(),
-                            uv,
-                            brush,
-                            self.brush_tile,
-                            base,
-                            coverage,
-                        );
-                    }
-                    // No image loaded: paint the brush's solid color.
-                    None => {
-                        self.layers
-                            .active_tex_mut()
-                            .stamp_stroke(uv, brush, base, coverage);
-                    }
-                },
-                PaintTarget::Mask => {
-                    // Mask painting ignores the brush color: reveal=white, hide=black.
-                    let v = if self.mask_reveal { 1.0 } else { 0.0 };
-                    let mask_brush = Brush {
-                        color: [v, v, v],
-                        ..*brush
+        let Some(hit) = self.bvh.pick(&ray) else {
+            return false;
+        };
+        self.ensure_surface_adj();
+        // Mirror painting: reflect the pick ray across the model-symmetry plane and
+        // re-pick, so the mirrored dab lands on the symmetric surface point with its
+        // own correct triangle/normal. Re-picking (vs. reflecting the hit) keeps the
+        // splat valid even where the mirror point sits on a different face.
+        let mirror = self
+            .symmetry
+            .and_then(|axis| self.bvh.pick(&self.mirror_ray(&ray, axis)));
+        // The first dab of the stroke fixes the locked face(s) — the hit's facet,
+        // plus the mirror's — for the rest of the stroke (face lock only).
+        let hits: Vec<&Hit> = std::iter::once(&hit).chain(mirror.as_ref()).collect();
+        self.ensure_stroke_lock(&hits);
+        let mut painted = self.surface_dab(&hit, brush);
+        if let Some(mirror) = mirror {
+            painted |= self.surface_dab(&mirror, brush);
+        }
+        painted
+    }
+
+    /// Fix the stroke's locked face(s) from its first dab's `hits` (the picked
+    /// triangle, plus the mirror's when symmetry is on). No-op once the lock is set
+    /// or when face-lock is off, so later dabs in the stroke can't extend it — the
+    /// whole stroke stays on the face painting began on. Builds the fill map on
+    /// demand, like the Face fill bucket.
+    fn ensure_stroke_lock(&mut self, hits: &[&Hit]) {
+        if !self.lock_face || self.stroke_lock_facets.is_some() {
+            return;
+        }
+        self.ensure_fill_map();
+        let map = self.fill_map.as_ref().unwrap();
+        let facets = hits
+            .iter()
+            .filter_map(|h| map.facet_for_tri(h.tri).map(|f| f as i32))
+            .collect();
+        self.stroke_lock_facets = Some(facets);
+    }
+
+    /// Drop every `(texel, _)` entry not on one of the stroke's locked facets, so a
+    /// face-locked dab stops at the face's edges instead of wrapping onto its
+    /// neighbours. No-op when the lock is off or unset. Shared by the brush and
+    /// fluid dabs.
+    fn retain_locked<T>(&self, items: &mut Vec<(usize, T)>) {
+        if !self.lock_face {
+            return;
+        }
+        let Some(facets) = self.stroke_lock_facets.as_deref() else {
+            return;
+        };
+        if facets.is_empty() {
+            return; // the first dab resolved no facet — don't cull (paint freely)
+        }
+        let texel_facet = &self.fill_map.as_ref().unwrap().texel_facet;
+        items.retain(|&(texel, _)| {
+            facets
+                .iter()
+                .any(|&f| texel_facet.get(texel).copied() == Some(f))
+        });
+    }
+
+    /// Splat one surface dab from an already-resolved `hit` into the active paint
+    /// target, accumulating the touched-texel bounding box into `dirty_rect`.
+    /// Returns whether it covered any texels. `ensure_surface_adj` must have run.
+    fn surface_dab(&mut self, hit: &Hit, brush: &Brush) -> bool {
+        let size = self.tex_size;
+        let radius_world = self.world_brush_radius(hit.tri, brush.radius);
+        // Distinct-field borrows (mesh/surface_adj immutable, splat_scratch mutable)
+        // in one call — the reused flood scratch keeps the stroke allocation-free.
+        let adj = self.surface_adj.as_ref().unwrap();
+        let mut splats = crate::surface::splat(
+            &self.mesh,
+            adj,
+            hit,
+            radius_world,
+            brush.opacity,
+            brush.hardness,
+            size,
+            &mut self.splat_scratch,
+        );
+        // Face lock: drop every texel that isn't on the stroke's locked face, so
+        // the dab stops at the face's edges instead of wrapping onto its neighbours.
+        self.retain_locked(&mut splats);
+        if splats.is_empty() {
+            return false; // hit the mesh, but the dab covered no texels
+        }
+        self.deposit(&splats, brush);
+        true
+    }
+
+    /// Composite a set of `(texel, coverage)` splats into the active paint target
+    /// through the per-stroke coverage discipline (max coverage per texel, so
+    /// overlapping stamps within one stroke don't double-darken), growing
+    /// `dirty_rect` by the touched texels' bounding box. Shared by the cross-face
+    /// surface brush (`surface_dab`) and the flat 2D UV brush (`stamp_uv_disc`) so
+    /// both composite identically — solid color, brush image, and mask alike.
+    fn deposit(&mut self, splats: &[(usize, f32)], brush: &Brush) {
+        if splats.is_empty() {
+            return;
+        }
+        let size = self.tex_size;
+        let base = &self.stroke_base;
+        let coverage = &mut self.stroke_coverage;
+        // Touched texels can be scattered across the atlas (one cluster per face a
+        // surface dab wrapped onto), so accumulate their bounding box rather than
+        // assume a fixed footprint around the cursor.
+        let (mut x0, mut y0, mut x1, mut y1) = (size, size, 0u32, 0u32);
+        let mut mark = |texel: usize, coverage: &mut [f32], a: f32, src: [u8; 3], pixels: &mut [u8]| {
+            if a <= coverage[texel] {
+                return; // already at least this covered this stroke
+            }
+            coverage[texel] = a;
+            crate::paint::blend_texel(pixels, base, texel, src, a);
+            let (tx, ty) = (texel as u32 % size, texel as u32 / size);
+            x0 = x0.min(tx);
+            y0 = y0.min(ty);
+            x1 = x1.max(tx + 1);
+            y1 = y1.max(ty + 1);
+        };
+        match self.paint_target {
+            PaintTarget::Color => {
+                // A brush image reveals itself (UV-tiled) per texel; otherwise the
+                // brush's solid color.
+                let mat = self.brush_material.as_ref();
+                let tile = self.brush_tile;
+                let solid = brush.color_u8();
+                let tex = self.layers.active_tex_mut();
+                for &(texel, a) in splats {
+                    let (tx, ty) = (texel as u32 % size, texel as u32 / size);
+                    let src = match mat {
+                        Some(m) => {
+                            let c = m.sample(tx as f32 / size as f32, ty as f32 / size as f32, tile);
+                            [c[0], c[1], c[2]]
+                        }
+                        None => solid,
                     };
-                    self.layers
-                        .active_mask_mut()
-                        .stamp_stroke(uv, &mask_brush, base, coverage);
+                    mark(texel, coverage, a, src, &mut tex.pixels);
                 }
             }
-            // Mark the touched texels dirty for the next per-frame flush. The footprint
-            // matches the stamp loops (`center ± radius.ceil()`) for every brush type.
-            let cx = uv.x * self.tex_size as f32;
-            let cy = uv.y * self.tex_size as f32;
-            if let Some(r) = TexRect::from_stamp(cx, cy, brush.radius, self.tex_size) {
-                self.dirty_rect = Some(match self.dirty_rect {
-                    Some(prev) => prev.union(r),
-                    None => r,
-                });
+            PaintTarget::Mask => {
+                // Mask painting ignores the brush color: reveal=white, hide=black.
+                let src = if self.mask_reveal { [255; 3] } else { [0; 3] };
+                let tex = self.layers.active_mask_mut();
+                for &(texel, a) in splats {
+                    mark(texel, coverage, a, src, &mut tex.pixels);
+                }
             }
-            self.stroke_dirty = true;
-            true
-        } else {
-            false
         }
+
+        if x1 > x0 && y1 > y0 {
+            let r = TexRect { x0, y0, x1, y1 };
+            self.dirty_rect = Some(match self.dirty_rect {
+                Some(prev) => prev.union(r),
+                None => r,
+            });
+        }
+        self.stroke_dirty = true;
     }
 
     /// Emit one fluid burst at a screen pixel: pick the surface point, flow a burst of
@@ -2189,6 +2842,23 @@ impl Renderer {
         let Some(hit) = self.bvh.pick(&ray) else {
             return false;
         };
+        // Mirror the burst onto the symmetric surface point (see `stamp_screen`).
+        let mirror = self
+            .symmetry
+            .and_then(|axis| self.bvh.pick(&self.mirror_ray(&ray, axis)));
+        // The first burst of the stroke fixes the locked face(s) (face lock only).
+        let hits: Vec<&Hit> = std::iter::once(&hit).chain(mirror.as_ref()).collect();
+        self.ensure_stroke_lock(&hits);
+        let mut emitted = self.fluid_dab(&hit, brush);
+        if let Some(mirror) = mirror {
+            emitted |= self.fluid_dab(&mirror, brush);
+        }
+        emitted
+    }
+
+    /// Flow one fluid burst from an already-resolved `hit` and deposit it into the
+    /// active layer's color. Returns whether anything was deposited.
+    fn fluid_dab(&mut self, hit: &Hit, brush: &Brush) -> bool {
         let size = self.tex_size;
         let (mn, mx) = self.mesh.bounds();
         let scale = (mx - mn).length().max(1e-3);
@@ -2202,8 +2872,11 @@ impl Renderer {
             normal: hit.normal,
             spawn: spawn_world,
         };
-        let deposits =
+        let mut deposits =
             crate::particle::simulate_burst(&self.bvh, emit, &self.fluid_spec, size, scale, seed);
+        // Face lock: confine the puddle to the stroke's locked face, so it can't
+        // stream over an edge onto an adjacent face.
+        self.retain_locked(&mut deposits);
         if deposits.is_empty() {
             return false;
         }
@@ -2282,15 +2955,93 @@ impl Renderer {
             }
             return;
         }
-        // ~2px steps guarantee overlap regardless of brush size. Cap the count so
-        // a giant drag can't stall; coverage accumulation prevents double-darken.
+        // Space dabs at ~half the brush's on-screen radius so consecutive dabs
+        // overlap solidly without re-splatting the whole footprint every 2px — the
+        // dominant cost at large brush sizes, since each splat floods the mesh and
+        // rasterizes the entire footprint. Tiny brushes fall back to a 2px floor so
+        // the stroke stays gap-free; off-mesh segments also use the floor.
         const STEP_PX: f32 = 2.0;
         let dist = (to - from).length();
-        let steps = ((dist / STEP_PX).ceil() as u32).clamp(1, 1024);
+        let spacing = self
+            .brush_screen_radius(to, brush)
+            .map(|r| (r * 0.5).max(STEP_PX))
+            .unwrap_or(STEP_PX);
+        let steps = ((dist / spacing).ceil() as u32).clamp(1, 1024);
         for k in 1..=steps {
             let t = k as f32 / steps as f32;
             self.stamp_screen(from.lerp(to, t), brush);
         }
+    }
+
+    /// Stamp one flat disc directly in UV space (no raycast, no cross-face walk):
+    /// `uv` in `[0,1]²` maps straight to a texel, and the dab is a circle in texture
+    /// space — the 2D UV editor's brush. Reuses the same `deposit` discipline (and so
+    /// the same undo/dirty-rect/upload path) as the surface brush. Texels outside any
+    /// island (gutter / empty atlas) paint fine; they're simply never sampled by the
+    /// mesh. Only mutates the layer + marks the dirty rect; upload coalesces into the
+    /// next `flush_paint`.
+    pub fn paint_uv_at(&mut self, uv: Vec2, brush: &Brush) {
+        let splats = uv_disc(uv, brush, self.tex_size);
+        self.deposit(&splats, brush);
+    }
+
+    /// Paint a continuous stroke segment between two UV points, interpolating discs so
+    /// a fast drag in the UV editor leaves a solid line. Spacing is in texels (~half
+    /// the brush radius), mirroring the surface `paint_segment`. A zero-length segment
+    /// (a single click) stamps exactly once.
+    pub fn paint_uv_segment(&mut self, from: Vec2, to: Vec2, brush: &Brush) {
+        let size = self.tex_size as f32;
+        let dist = ((to - from) * size).length();
+        let spacing = (brush.radius * 0.5).max(1.0);
+        let steps = ((dist / spacing).ceil() as u32).clamp(1, 4096);
+        for k in 1..=steps {
+            let t = k as f32 / steps as f32;
+            self.paint_uv_at(from.lerp(to, t), brush);
+        }
+    }
+
+    /// The composited display atlas (CPU mirror) the 2D UV editor draws: `(size, pixels)`,
+    /// `pixels` RGBA8 row-major, `size×size`. Pairs with [`paint_version`](Self::paint_version).
+    pub fn atlas_view(&self) -> (u32, &[u8]) {
+        (self.tex_size, &self.display_buf)
+    }
+
+    /// Bumps whenever the display atlas changes; the UV editor re-uploads its image only on change.
+    pub fn paint_version(&self) -> u64 {
+        self.paint_version
+    }
+
+    /// Bumps whenever the mesh is swapped; the UV editor rebuilds its wireframe only then.
+    pub fn topo_version(&self) -> u64 {
+        self.topo_version
+    }
+
+    /// Whether the mesh has usable UVs (false right after a fresh load that still needs
+    /// an unwrap). The UV editor shows a hint instead of painting when this is false.
+    pub fn mesh_has_uvs(&self) -> bool {
+        !self.mesh.needs_uvs
+    }
+
+    /// The UV island wireframe as flat `[u0, v0, u1, v1]` segments in `[0,1]²` — every
+    /// triangle's three edges, for the 2D editor's overlay. Rebuilt by the caller only
+    /// when [`topo_version`](Self::topo_version) changes (meshes are low-poly, so the
+    /// raw triangle edges are cheap and need no dedup).
+    pub fn build_uv_edges(&self) -> Vec<[f32; 4]> {
+        let v = &self.mesh.vertices;
+        let mut edges = Vec::with_capacity(self.mesh.indices.len());
+        for tri in self.mesh.indices.chunks_exact(3) {
+            let p = [
+                v[tri[0] as usize].uv,
+                v[tri[1] as usize].uv,
+                v[tri[2] as usize].uv,
+            ];
+            for k in 0..3 {
+                let a = p[k];
+                let b = p[(k + 1) % 3];
+                edges.push([a[0], a[1], b[0], b[1]]);
+            }
+        }
+        edges
     }
 
     /// Record the scene into `target_view`. Shared by window + offscreen paths.
@@ -2343,6 +3094,25 @@ impl Renderer {
             rpass.set_bind_group(0, &self.grid_bind_group, &[]);
             rpass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
             rpass.draw(0..self.grid_vertex_count, 0..1);
+        }
+
+        // Active-face outline: the locked/hovered facet's boundary edges, drawn with
+        // the grid pipeline (shares the scene view-proj) so it's occluded by nearer
+        // geometry but reads on top of the face it traces (its verts are nudged out).
+        if let Some(buf) = &self.outline_vertex_buffer {
+            rpass.set_pipeline(&self.line_pipeline);
+            rpass.set_bind_group(0, &self.grid_bind_group, &[]);
+            rpass.set_vertex_buffer(0, buf.slice(..));
+            rpass.draw(0..self.outline_vertex_count, 0..1);
+        }
+
+        // Brush-cursor ring: the brush footprint on the surface at the cursor. Same
+        // pipeline/bind group as the grid; drawn after the outline so it reads on top.
+        if self.brush_ring_count > 0 {
+            rpass.set_pipeline(&self.line_pipeline);
+            rpass.set_bind_group(0, &self.grid_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.brush_ring_buffer.slice(..));
+            rpass.draw(0..self.brush_ring_count, 0..1);
         }
 
         // Orientation compass: always shown, in its own square viewport in the
@@ -2774,6 +3544,34 @@ fn make_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Text
 /// Copy `rect` out of a full-size `width`-wide RGBA8 buffer into a contiguous
 /// `rect.width()*rect.height()*4` buffer (row-major). Used to snapshot the
 /// processed region before a region refresh, and to pack a sub-rect for upload.
+/// Rasterize a flat brush disc centered at UV `uv` (`[0,1]²`) into `(texel, coverage)`
+/// pairs over a `size×size` atlas. `coverage = falloff(d, hardness) * opacity`, sampled
+/// at each texel center within `brush.radius` texels of the center. The UV-editor analog
+/// of `surface::splat`, but a plain circle in texture space (no mesh walk).
+fn uv_disc(uv: Vec2, brush: &Brush, size: u32) -> Vec<(usize, f32)> {
+    let sz = size as f32;
+    let cx = uv.x * sz;
+    let cy = uv.y * sz;
+    let r = brush.radius.max(0.5);
+    let x0 = (cx - r).floor().clamp(0.0, sz) as u32;
+    let x1 = (cx + r).ceil().clamp(0.0, sz) as u32;
+    let y0 = (cy - r).floor().clamp(0.0, sz) as u32;
+    let y1 = (cy + r).ceil().clamp(0.0, sz) as u32;
+    let mut out = Vec::new();
+    for ty in y0..y1 {
+        for tx in x0..x1 {
+            let dx = tx as f32 + 0.5 - cx;
+            let dy = ty as f32 + 0.5 - cy;
+            let d = (dx * dx + dy * dy).sqrt() / r;
+            let a = crate::paint::falloff(d, brush.hardness) * brush.opacity;
+            if a > 0.0 {
+                out.push(((ty * size + tx) as usize, a));
+            }
+        }
+    }
+    out
+}
+
 fn copy_region(buf: &[u8], width: u32, rect: TexRect) -> Vec<u8> {
     let (rw, rh) = (rect.width() as usize, rect.height() as usize);
     let mut out = vec![0u8; rw * rh * 4];
@@ -2817,6 +3615,13 @@ fn upload_region(
     rect: TexRect,
 ) {
     let packed = copy_region(buf, width, rect);
+    upload_packed(queue, gpu, &packed, rect);
+}
+
+/// Upload an already-packed `rect`-sized RGBA8 buffer (row-major, `rect.width()`
+/// texels per row) into `rect` of the GPU texture. The packed-buffer counterpart
+/// to `upload_region`, used by the brush preview which builds its region by hand.
+fn upload_packed(queue: &wgpu::Queue, gpu: &wgpu::Texture, packed: &[u8], rect: TexRect) {
     queue.write_texture(
         wgpu::ImageCopyTexture {
             texture: gpu,
@@ -2828,7 +3633,7 @@ fn upload_region(
             },
             aspect: wgpu::TextureAspect::All,
         },
-        &packed,
+        packed,
         wgpu::ImageDataLayout {
             offset: 0,
             bytes_per_row: Some(rect.width() * 4),
@@ -2989,6 +3794,184 @@ mod tests {
     }
 
     #[test]
+    fn symmetry_mirrors_the_dab_to_the_other_side() {
+        // Painting one off-centre dab with X-symmetry on must paint a second,
+        // disjoint cluster on the mirror side: the symmetric changed-texel set is a
+        // superset of the plain one and is ~twice as large (the mirror is a distinct
+        // UV region, so the two clusters don't overlap).
+        let (w, h) = (256u32, 256u32);
+        let brush = Brush {
+            color: [0.1, 0.7, 0.3],
+            radius: 5.0,
+            ..Brush::default()
+        };
+        // Off-centre horizontally so the hit sits well off the x=0 symmetry plane and
+        // its mirror lands in a different part of the atlas.
+        let (cx, cy) = (w as f32 / 2.0 + 24.0, h as f32 / 2.0);
+
+        // The set of texels a single dab changes, for a given symmetry setting.
+        let changed = |axis: Option<SymmetryAxis>| -> std::collections::HashSet<usize> {
+            let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+            r.set_symmetry(axis);
+            let before = r.layers.active_tex().pixels.clone();
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.end_stroke();
+            before
+                .chunks_exact(4)
+                .zip(r.layers.active_tex().pixels.chunks_exact(4))
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, _)| i)
+                .collect()
+        };
+
+        let plain = changed(None);
+        let mirrored = changed(Some(SymmetryAxis::X));
+        assert!(!plain.is_empty(), "the dab must paint something with symmetry off");
+        assert!(
+            plain.is_subset(&mirrored),
+            "symmetry must keep the original dab and add to it, not replace it"
+        );
+        assert!(
+            mirrored.len() as f32 > plain.len() as f32 * 1.5,
+            "the mirror should roughly double the painted area (plain {}, mirrored {})",
+            plain.len(),
+            mirrored.len()
+        );
+    }
+
+    #[test]
+    fn lock_face_keeps_the_dab_on_one_face() {
+        // A dab at a cube face's centre with a radius wider than the face wraps onto
+        // the neighbouring faces (the cross-face surface splat). With the face lock
+        // on, the same dab must paint only the one facet it landed on.
+        let (w, h) = (256u32, 256u32);
+        let brush = Brush {
+            color: [0.1, 0.7, 0.3],
+            radius: 64.0, // wider than half the face → reaches across the edges
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+
+        // The set of facets a single dab touches, for a given lock setting.
+        let facets_touched = |lock: bool| -> std::collections::HashSet<i32> {
+            let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+            r.set_lock_face(lock);
+            let before = r.layers.active_tex().pixels.clone();
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.end_stroke();
+            r.ensure_fill_map();
+            let map = r.fill_map.as_ref().unwrap();
+            before
+                .chunks_exact(4)
+                .zip(r.layers.active_tex().pixels.chunks_exact(4))
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, _)| map.texel_facet[i])
+                .filter(|&f| f >= 0)
+                .collect()
+        };
+
+        let unlocked = facets_touched(false);
+        let locked = facets_touched(true);
+        assert!(
+            unlocked.len() >= 2,
+            "a dab wider than the face should wrap onto its neighbours (got {} facets)",
+            unlocked.len()
+        );
+        assert_eq!(
+            locked.len(),
+            1,
+            "with the face lock on, the dab must stay on a single facet (got {})",
+            locked.len()
+        );
+        assert!(
+            locked.is_subset(&unlocked),
+            "the locked facet must be one the unlocked dab also painted"
+        );
+    }
+
+    #[test]
+    fn face_outline_traces_the_locked_facet_boundary() {
+        // With face-lock on, hovering the brush over a cube face must produce an
+        // outline of that face: a quad (two coplanar triangles) has four boundary
+        // edges — the shared diagonal is interior, so 4 segments = 8 line vertices.
+        // With the lock off, nothing is outlined.
+        let (w, h) = (256u32, 256u32);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+
+        r.set_lock_face(false);
+        r.set_face_outline(Some((cx, cy)));
+        assert_eq!(r.outline_vertex_count, 0, "lock off → no outline");
+
+        r.set_lock_face(true);
+        r.set_face_outline(Some((cx, cy)));
+        assert_eq!(
+            r.outline_vertex_count, 8,
+            "a cube face is a quad: 4 boundary edges → 8 line vertices"
+        );
+
+        // Hovering off the mesh clears the outline again.
+        r.set_face_outline(Some((1.0, 1.0)));
+        assert_eq!(r.outline_vertex_count, 0, "ray missing the mesh → no outline");
+    }
+
+    #[test]
+    fn brush_cursor_ring_shows_over_mesh_and_hides_off_it() {
+        // A painting tool over the mesh shows the ring (one full loop of segments);
+        // pointing off the mesh, or passing no cursor, hides it.
+        let (w, h) = (256u32, 256u32);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let brush = Brush { radius: 8.0, ..Brush::default() };
+        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+
+        r.set_brush_cursor(Some((cx, cy)), &brush);
+        assert_eq!(
+            r.brush_ring_count,
+            BRUSH_RING_SEGMENTS * 2,
+            "the ring over the mesh is a closed loop of line segments"
+        );
+
+        r.set_brush_cursor(Some((1.0, 1.0)), &brush);
+        assert_eq!(r.brush_ring_count, 0, "off the mesh → no ring");
+
+        r.set_brush_cursor(None, &brush);
+        assert_eq!(r.brush_ring_count, 0, "no painting tool → no ring");
+    }
+
+    #[test]
+    fn brush_preview_ghosts_without_committing() {
+        // Hovering the brush over the mesh arms a preview region, but must not alter
+        // the layers or the committed `display_buf` (the ghost lives only on the GPU).
+        // Pointing off the mesh clears it again.
+        let (w, h) = (256u32, 256u32);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let brush = Brush { color: [0.9, 0.1, 0.1], radius: 8.0, ..Brush::default() };
+        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        let layer_before = r.layers.active_tex().pixels.clone();
+        let display_before = r.display_buf.clone();
+
+        r.set_brush_preview(Some((cx, cy)), &brush);
+        assert!(r.preview_rect.is_some(), "hovering the mesh should arm a preview");
+        assert_eq!(
+            r.layers.active_tex().pixels,
+            layer_before,
+            "preview must not write into the layer"
+        );
+        assert_eq!(
+            r.display_buf, display_before,
+            "preview must not touch the committed display mirror"
+        );
+
+        r.set_brush_preview(Some((1.0, 1.0)), &brush);
+        assert!(r.preview_rect.is_none(), "pointing off the mesh clears the preview");
+        assert_eq!(r.display_buf, display_before, "reverting leaves the committed mirror intact");
+    }
+
+    #[test]
     fn fluid_stroke_deposits_and_flush_matches_full() {
         // Exercise the fluid brush end-to-end: pick a surface point, flow a burst, and
         // deposit onto the active layer. It must change pixels, mark a dirty rect, and
@@ -3033,5 +4016,49 @@ mod tests {
             .effects
             .push(crate::effects::Effect::Blur { radius: 2.0 });
         assert_region_matches_full(&mut r);
+    }
+
+    #[test]
+    fn brush_preview_skips_recompute_when_inputs_unchanged() {
+        // The hover ghost must recompute only when its inputs change — the guard that
+        // keeps an idle frame from re-picking + re-splatting the whole footprint. We
+        // observe the skip by clearing `preview_rect` ourselves: a skipped call returns
+        // before touching it (stays cleared); a recompute sets it again.
+        let (w, h) = (256u32, 256u32);
+        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        r.refresh_display_texture();
+        let brush = Brush {
+            color: [0.1, 0.7, 0.3],
+            radius: 6.0,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+
+        // First hover over the cube: a ghost is laid down.
+        r.set_brush_preview(Some((cx, cy)), &brush);
+        assert!(r.preview_rect.is_some(), "preview should ghost over the mesh");
+        assert!(r.last_preview.is_some());
+
+        // Identical inputs → skip: the cleared rect stays cleared.
+        r.preview_rect = None;
+        r.set_brush_preview(Some((cx, cy)), &brush);
+        assert!(r.preview_rect.is_none(), "identical inputs must skip the recompute");
+
+        // A brush change recomputes.
+        let brush2 = Brush { color: [0.9, 0.1, 0.1], ..brush };
+        r.set_brush_preview(Some((cx, cy)), &brush2);
+        assert!(r.preview_rect.is_some(), "a brush change must recompute the ghost");
+
+        // A camera move recomputes too (the cursor now lands on a different point).
+        r.preview_rect = None;
+        r.orbit_camera(20.0, 12.0);
+        r.set_brush_preview(Some((cx, cy)), &brush2);
+        assert!(r.preview_rect.is_some(), "a camera move must recompute the ghost");
+
+        // Committing a stroke re-shows the ghost over the new pixels (no stale skip).
+        r.begin_stroke();
+        assert!(r.last_preview.is_none(), "begin_stroke must drop the hover ghost key");
+        r.end_stroke();
+        assert!(r.last_preview.is_none(), "end_stroke must force a fresh ghost");
     }
 }

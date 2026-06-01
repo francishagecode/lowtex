@@ -21,7 +21,7 @@ use crate::layers::BlendMode;
 use crate::noise::NoiseKind;
 use crate::paint::Brush;
 use crate::particle::{FluidKind, FluidSpec};
-use crate::renderer::{PaletteSettings, TextureFilter};
+use crate::renderer::{PaletteSettings, SymmetryAxis, TextureFilter};
 
 /// The active editing tool. The brush drags a stroke; the fills are one-shot
 /// "paint bucket" clicks (solid color, ignoring what's already there), scoped from
@@ -40,6 +40,17 @@ pub enum Tool {
     FillIsland,
     /// Fill the whole object (every texel its UVs cover).
     FillObject,
+}
+
+/// A pointer event inside the 2D UV editor, in UV space (`[0,1]²`). The panel emits a
+/// sequence per stroke — `Begin`, one `Segment` per drag step (a single click is one
+/// zero-length segment), then `End` — which the App replays onto the renderer's UV
+/// paint path so a UV stroke is one undo step, exactly like a 3D stroke.
+#[derive(Clone, Copy)]
+pub enum UvEvent {
+    Begin,
+    Segment { from: glam::Vec2, to: glam::Vec2 },
+    End,
 }
 
 /// A read-only snapshot of one layer, synced from the renderer for the UI list.
@@ -120,6 +131,9 @@ pub struct UiActions {
     /// Re-unwrap the mesh's UVs at the chosen texel density (the atlas size is
     /// derived from it). Carries the density the user picked.
     pub unwrap: Option<crate::unwrap::Density>,
+    /// Paint events from the 2D UV editor this frame, in order. Replayed onto the
+    /// renderer's `paint_uv_*` path by the App. Empty when the panel is closed or idle.
+    pub uv_strokes: Vec<UvEvent>,
 }
 
 /// All live editor state the UI mutates. The renderer reads `brush` when painting.
@@ -148,12 +162,25 @@ pub struct UiState {
     /// Whether an image has been loaded for the texture brush (mirrors the renderer),
     /// so the panel can hint when the brush has nothing to paint with yet.
     pub brush_image_loaded: bool,
+    /// A freshly-downsampled `(w, h, RGBA8)` brush-image preview the App stages on
+    /// load; `build` uploads it to `brush_thumb_tex` once, then takes it back to None.
+    pub brush_thumb: Option<(u32, u32, Vec<u8>)>,
+    /// The GPU texture handle for the brush-image swatch, held across frames so the
+    /// preview isn't re-uploaded every frame. Cleared with the brush image.
+    pub brush_thumb_tex: Option<egui::TextureHandle>,
     /// Fluid brush (oil/water/blood): the chosen fluid sets the starting viscosity
     /// (then tweakable); it's laid down in the current brush color. `fluid_amount` is
     /// the overall deposit strength.
     pub fluid_kind: FluidKind,
     pub fluid_viscosity: f32,
     pub fluid_amount: f32,
+    /// Mirror painting: when on, every dab is also painted at its reflection across
+    /// the model-symmetry plane for `symmetry_axis` (through the mesh center).
+    pub symmetry_on: bool,
+    pub symmetry_axis: SymmetryAxis,
+    /// Face lock: when on, each dab stays inside the flat face it lands on instead
+    /// of wrapping across an edge onto a neighbouring face.
+    pub lock_face: bool,
     /// Levels controls shared by every mesh effect: overall strength, mid-tone
     /// contrast, and invert. `effect_source` is which baked channel the generic
     /// "Tint layer" / "Mask layer" actions read from.
@@ -203,6 +230,24 @@ pub struct UiState {
     /// hand-set) name whenever the field isn't focused, so it tracks auto-renames and
     /// layer switches; while focused it holds the user's in-progress typing.
     pub layer_name_edit: String,
+    /// 2D UV editor (paint directly on the unwrapped atlas instead of the model).
+    /// `show_uv_panel` toggles the right-side split panel. The rest is state the panel
+    /// needs but the egui closure can't pull from the renderer directly, so the App
+    /// stages it in before `build`:
+    ///   - `uv_image` is the latest atlas `(size, RGBA8)`, restaged only when the
+    ///     renderer's paint version moves (`uv_image_version`); `build` uploads it to
+    ///     `uv_tex` once per change, mirroring the brush-thumbnail flow.
+    ///   - `uv_edges` is the island wireframe (`[u0,v0,u1,v1]` in `[0,1]`), restaged
+    ///     only when the mesh topology changes (`uv_edges_version`).
+    /// `uv_drag_last` is the previous UV during an in-panel drag, so each step emits a
+    /// `Segment { from, to }`.
+    pub show_uv_panel: bool,
+    pub uv_image: Option<(u32, Vec<u8>)>,
+    pub uv_image_version: u64,
+    pub uv_tex: Option<egui::TextureHandle>,
+    pub uv_edges: Vec<[f32; 4]>,
+    pub uv_edges_version: u64,
+    pub uv_drag_last: Option<glam::Vec2>,
     pub actions: UiActions,
 }
 
@@ -222,9 +267,14 @@ impl Default for UiState {
             material_tile: 4.0,
             brush_tile: 4.0,
             brush_image_loaded: false,
+            brush_thumb: None,
+            brush_thumb_tex: None,
             fluid_kind: FluidKind::Water,
             fluid_viscosity: FluidKind::Water.defaults().1,
             fluid_amount: 0.85,
+            symmetry_on: false,
+            lock_face: false,
+            symmetry_axis: SymmetryAxis::X,
             ao_strength: 0.75,
             effect_contrast: 0.0,
             effect_invert: false,
@@ -248,6 +298,13 @@ impl Default for UiState {
             can_redo: false,
             panel_width: 248.0,
             layer_name_edit: String::new(),
+            show_uv_panel: false,
+            uv_image: None,
+            uv_image_version: u64::MAX, // force the first stage to differ from the renderer's 0
+            uv_tex: None,
+            uv_edges: Vec::new(),
+            uv_edges_version: u64::MAX,
+            uv_drag_last: None,
             actions: UiActions::default(),
         }
     }
@@ -504,6 +561,12 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                     ],
                 );
 
+                // Open the 2D UV editor (a split panel on the right): paint straight on
+                // the unwrapped atlas with the same brush, seeing both views update live.
+                ui.add_space(2.0);
+                ui.checkbox(&mut state.show_uv_panel, "UV editor")
+                    .on_hover_text("Paint directly on the unwrapped texture in a panel beside the model");
+
                 // ---- Color (used by both the brush and the fills) ----
                 heading(ui, "Color");
                 ui.color_edit_button_rgb(&mut state.brush.color);
@@ -517,6 +580,32 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                     ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
                     ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
                     ui.add(egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"));
+
+                    // Mirror painting: stamp every dab on the symmetric side of the
+                    // model too. The axis picker is live only while symmetry is on.
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut state.symmetry_on, "Symmetry")
+                            .on_hover_text("Mirror each dab across the model's center plane");
+                        ui.add_enabled_ui(state.symmetry_on, |ui| {
+                            egui::ComboBox::from_id_salt("symmetry_axis")
+                                .selected_text(state.symmetry_axis.name())
+                                .width(44.0)
+                                .show_ui(ui, |ui| {
+                                    for a in SymmetryAxis::ALL {
+                                        ui.selectable_value(
+                                            &mut state.symmetry_axis,
+                                            a,
+                                            a.name(),
+                                        );
+                                    }
+                                });
+                        });
+                    });
+
+                    // Face lock: keep each dab inside the flat face it lands on, so
+                    // strokes near an edge don't wrap onto the neighbouring face.
+                    ui.checkbox(&mut state.lock_face, "Lock to face")
+                        .on_hover_text("Confine each dab to the flat face under the cursor");
                 }
 
                 // Brush image: load one to paint it (UV-tiled) instead of solid color;
@@ -525,13 +614,39 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 if state.tool == Tool::Brush {
                     ui.add_space(2.0);
                     if state.brush_image_loaded {
+                        // Upload a newly-staged preview to a GPU texture once; the handle
+                        // then persists across frames until the image is cleared/replaced.
+                        if let Some((w, h, px)) = state.brush_thumb.take() {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                &px,
+                            );
+                            state.brush_thumb_tex = Some(ui.ctx().load_texture(
+                                "brush-thumb",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                        // Show the swatch (fit within 48pt, keeping aspect) beside the
+                        // load/clear buttons.
+                        let swatch = state.brush_thumb_tex.as_ref().map(|tex| {
+                            let [tw, th] = tex.size();
+                            let scale = 48.0 / tw.max(th) as f32;
+                            let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+                            egui::load::SizedTexture::new(tex.id(), size)
+                        });
                         ui.horizontal(|ui| {
-                            if ui.button("Brush image…").clicked() {
-                                state.actions.load_brush_image = true;
+                            if let Some(swatch) = swatch {
+                                ui.add(egui::Image::new(swatch));
                             }
-                            if ui.button("Clear").clicked() {
-                                state.actions.clear_brush_image = true;
-                            }
+                            ui.vertical(|ui| {
+                                if ui.button("Brush image…").clicked() {
+                                    state.actions.load_brush_image = true;
+                                }
+                                if ui.button("Clear").clicked() {
+                                    state.actions.clear_brush_image = true;
+                                }
+                            });
                         });
                         ui.add(egui::Slider::new(&mut state.brush_tile, 1.0..=16.0).text("Tile"));
                     } else {
@@ -610,8 +725,136 @@ pub fn build(ctx: &Context, state: &mut UiState) {
     // offset the viewport object by the panel.
     state.panel_width = panel.response.rect.width();
 
+    // ---- 2D UV editor: a split panel on the right, when toggled on ----
+    if state.show_uv_panel {
+        uv_panel(ctx, state);
+    }
+
     // ---- Layers: a separate paint.net-style palette, floating bottom-right ----
     layers_window(ctx, state);
+}
+
+/// The 2D UV editor: a resizable right-side split panel showing the unwrapped atlas
+/// with the UV island wireframe overlaid, paintable with the active brush. The egui
+/// closure can't touch the renderer, so the App stages the atlas image + edges into
+/// `state` (version-gated) before this runs, and this emits `UvEvent`s into
+/// `state.actions.uv_strokes` which the App replays onto the renderer's UV paint path.
+fn uv_panel(ctx: &Context, state: &mut UiState) {
+    // A fixed 50/50 split: the UV editor takes exactly half the area left of it by the
+    // controls panel (whose width was just recorded into `panel_width`), so the model
+    // viewport and the editor get equal halves. Not user-resizable by design.
+    let editor_w = ((ctx.screen_rect().width() - state.panel_width) * 0.5).max(160.0);
+    egui::SidePanel::right("uv_editor")
+        .resizable(false)
+        .exact_width(editor_w)
+        .show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.heading("UV editor");
+
+            // Upload a freshly-staged atlas to a GPU texture once per change (the App
+            // restages `uv_image` only when the paint version moved), mirroring the
+            // brush thumb. The handle `uv_tex` persists across frames, so we read the
+            // size/guard from it — not from `uv_image`, which is consumed here.
+            if let Some((w, px)) = state.uv_image.take() {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, w as usize],
+                    &px,
+                );
+                state.uv_tex = Some(ui.ctx().load_texture(
+                    "uv-atlas",
+                    img,
+                    // Nearest keeps the crisp, pixelated texel feel of the painter.
+                    egui::TextureOptions::NEAREST,
+                ));
+            }
+
+            // Nothing staged yet (a fresh mesh awaiting an unwrap): there's nothing to
+            // paint on, so show a hint instead of a blank atlas.
+            let (tex_id, size) = match state.uv_tex.as_ref() {
+                Some(tex) => (tex.id(), tex.size()[0] as u32),
+                None => {
+                    ui.label(
+                        egui::RichText::new("Unwrap the mesh to paint its texture here.")
+                            .weak(),
+                    );
+                    return;
+                }
+            };
+
+            // Fit the square atlas to the panel (leave a little breathing room).
+            let side = ui
+                .available_width()
+                .min(ui.available_height())
+                .max(64.0)
+                - 4.0;
+            let sized = egui::load::SizedTexture::new(tex_id, egui::vec2(side, side));
+            let resp = ui.add(
+                egui::Image::new(sized).sense(egui::Sense::click_and_drag()),
+            );
+            let rect = resp.rect;
+
+            // Overlay the UV island wireframe. The atlas is drawn row-major top-left
+            // (same indexing the brush writes texels with), so UV maps straight to the
+            // rect with no V flip — the wireframe lands exactly on the painted content.
+            let painter = ui.painter_at(rect);
+            let edge_color = egui::Color32::from_rgba_unmultiplied(120, 200, 255, 90);
+            let stroke = egui::Stroke::new(1.0, edge_color);
+            let to_screen = |u: f32, v: f32| {
+                egui::pos2(rect.min.x + u * rect.width(), rect.min.y + v * rect.height())
+            };
+            for &[u0, v0, u1, v1] in &state.uv_edges {
+                painter.line_segment([to_screen(u0, v0), to_screen(u1, v1)], stroke);
+            }
+
+            // Map an in-panel pointer position to UV, clamped to the atlas.
+            let to_uv = |p: egui::Pos2| {
+                glam::Vec2::new(
+                    ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0),
+                    ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0),
+                )
+            };
+
+            // Brush footprint ring at the cursor (radius in texels → panel pixels).
+            if let Some(p) = resp.hover_pos() {
+                let r_px = state.brush.radius / size as f32 * rect.width();
+                painter.circle_stroke(
+                    p,
+                    r_px.max(1.0),
+                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(160)),
+                );
+            }
+
+            // Turn the drag into a Begin / Segment* / End sequence (one undo step).
+            if resp.drag_started() {
+                let uv = resp
+                    .interact_pointer_pos()
+                    .map(to_uv)
+                    .unwrap_or(glam::Vec2::ZERO);
+                state.actions.uv_strokes.push(UvEvent::Begin);
+                state.uv_drag_last = Some(uv);
+            }
+            if resp.dragged() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let uv = to_uv(p);
+                    let from = state.uv_drag_last.unwrap_or(uv);
+                    state.actions.uv_strokes.push(UvEvent::Segment { from, to: uv });
+                    state.uv_drag_last = Some(uv);
+                }
+            }
+            if resp.drag_stopped() {
+                state.actions.uv_strokes.push(UvEvent::End);
+                state.uv_drag_last = None;
+            }
+            // A plain click (press+release with no drag) still lays one dab down.
+            if resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) {
+                    let uv = to_uv(p);
+                    state.actions.uv_strokes.push(UvEvent::Begin);
+                    state.actions.uv_strokes.push(UvEvent::Segment { from: uv, to: uv });
+                    state.actions.uv_strokes.push(UvEvent::End);
+                }
+            }
+        });
 }
 
 /// Layers as a separate, paint.net-style palette floating in the bottom-right

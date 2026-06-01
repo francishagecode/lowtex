@@ -24,6 +24,15 @@
 //      (or a higher `Density`) just produce a bigger texture — the texel size stays
 //      put. The caller resizes its paint layers to `UnwrapResult::atlas_size`.
 //
+//   4. Texel snapping (`snap_texels`, on by default). A free-form unwrap puts edges
+//      at fractional, off-axis UVs, so at PSX resolutions a face edge cuts diagonally
+//      across texels and reads as jaggy/blurry — and tighter packing can't fix it.
+//      So each chart is first *rectified* (rotated so its longest edge is axis-
+//      aligned), then every vertex is rounded to a whole texel. Charts already pack at
+//      integer pixel offsets, so a snapped vertex lands exactly on a texel corner and
+//      face edges coincide with the grid. The trade is blockier non-rectangular faces
+//      and a little wasted atlas — the density-over-packing call this unwrap makes.
+//
 // Every unwrap splits vertices (3 per triangle): a vertex shared across faces with
 // different projections needs different UVs, so unwrapping rebuilds the vertex list
 // as 3·triangle_count flat vertices. Output is always a fresh `Mesh` with
@@ -81,6 +90,12 @@ pub struct UnwrapOptions {
     pub max_atlas: u32,
     /// The `Medium` density aims the atlas near this size for the current mesh.
     pub target_atlas_px: u32,
+    /// Snap charts to the texel grid: rectify each chart so its longest edge is
+    /// axis-aligned, then round every vertex to a whole texel. Face edges then land
+    /// on texel boundaries instead of cutting diagonally across texels — the crisp,
+    /// jaggy-free look you want at PSX resolutions. Costs some atlas (charts round up
+    /// to whole texels) and makes non-rectangular faces blocky. See `snap_charts`.
+    pub snap_texels: bool,
 }
 
 impl Default for UnwrapOptions {
@@ -88,9 +103,14 @@ impl Default for UnwrapOptions {
         Self {
             density: Density::Medium,
             angle_cone_deg: 40.0,
-            gutter_px: 2,
+            // Breathing room between charts. Snapped charts pack to tight integer
+            // rectangles, and display-time edge bleed dilates several px into this
+            // margin, so keep enough gutter that one island's bleed can't reach its
+            // neighbour at the seam.
+            gutter_px: 4,
             max_atlas: 8192,
             target_atlas_px: 128,
+            snap_texels: true,
         }
     }
 }
@@ -141,6 +161,53 @@ fn planar_basis(n: Vec3) -> (Vec3, Vec3) {
     let t = up.cross(n).normalize_or_zero();
     let b = n.cross(t);
     (t, b)
+}
+
+/// For each chart, the rotation — returned as `(sinθ, cosθ)` — that, applied as a
+/// `-θ` rotation, gives the chart its *minimum-area* axis-aligned bounding box. By a
+/// standard result the min-area box of a polygon has a side collinear with one of its
+/// edges, so we test every edge direction and keep the one whose box is smallest.
+/// This squares a face to its own sides rather than its diagonal: a quad split into
+/// two triangles has the diagonal as its longest edge, so an "align the longest edge"
+/// rule would rotate the whole face 45° into a diamond — twice the box area, and it
+/// no longer tiles or snaps cleanly. A chart with no measurable edge keeps the
+/// identity. `proj` holds each triangle's three projected UVs.
+fn chart_rectify(proj: &[[Vec2; 3]], chart_of: &[usize], num_charts: usize) -> Vec<(f32, f32)> {
+    // Group triangles by chart so each chart's box is measured over all its points.
+    let mut tris_by_chart: Vec<Vec<usize>> = vec![Vec::new(); num_charts];
+    for (ti, _) in proj.iter().enumerate() {
+        tris_by_chart[chart_of[ti]].push(ti);
+    }
+
+    let mut rot = vec![(0.0f32, 1.0f32); num_charts]; // identity: θ = 0
+    for (c, tris) in tris_by_chart.iter().enumerate() {
+        let mut best_area = f32::INFINITY;
+        for &ti in tris {
+            for e in 0..3 {
+                let d = proj[ti][(e + 1) % 3] - proj[ti][e];
+                let len = d.length();
+                if len < 1e-9 {
+                    continue;
+                }
+                let (sin, cos) = (d.y / len, d.x / len);
+                // Area of the chart's box when this edge is made axis-aligned.
+                let (mut mn, mut mx) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+                for &tj in tris {
+                    for p in &proj[tj] {
+                        let r = Vec2::new(p.x * cos + p.y * sin, -p.x * sin + p.y * cos);
+                        mn = mn.min(r);
+                        mx = mx.max(r);
+                    }
+                }
+                let area = (mx.x - mn.x) * (mx.y - mn.y);
+                if area < best_area {
+                    best_area = area;
+                    rot[c] = (sin, cos);
+                }
+            }
+        }
+    }
+    rot
 }
 
 /// Build a split-vertex mesh from per-triangle (positions, normal, uvs).
@@ -396,21 +463,36 @@ fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) 
     let (chart_of, chart_normal) = grow_charts(&normals, &areas, &adj, cos_cone);
     let num_charts = chart_normal.len();
 
-    // Project each triangle into its chart's tangent frame (coords in world units),
-    // tracking each chart's world-space bounding box.
+    // Project each triangle into its chart's tangent frame (coords in world units).
     let bases: Vec<(Vec3, Vec3)> = chart_normal.iter().map(|n| planar_basis(*n)).collect();
     let mut proj: Vec<[Vec2; 3]> = Vec::with_capacity(tri_count);
+    for ti in 0..tri_count {
+        let (tu, tv) = bases[chart_of[ti]];
+        proj.push(positions[ti].map(|pt| Vec2::new(pt.dot(tu), pt.dot(tv))));
+    }
+
+    // Rectify (snap mode only): rotate each chart so its longest edge is axis-aligned.
+    // A boxy face then becomes an axis-aligned rectangle whose edges can fall on texel
+    // boundaries once snapped — instead of a diagonal that cuts across texels at any
+    // resolution. Rigid rotation, so the no-fold projection guarantee is preserved.
+    if opts.snap_texels {
+        let rot = chart_rectify(&proj, &chart_of, num_charts);
+        for ti in 0..tri_count {
+            let (sin, cos) = rot[chart_of[ti]];
+            // Rotate by -θ so the chart's longest edge lands along +U.
+            proj[ti] = proj[ti].map(|p| Vec2::new(p.x * cos + p.y * sin, -p.x * sin + p.y * cos));
+        }
+    }
+
+    // Per-chart world-space bounding box, measured after any rectify rotation.
     let mut cmin = vec![Vec2::splat(f32::INFINITY); num_charts];
     let mut cmax = vec![Vec2::splat(f32::NEG_INFINITY); num_charts];
     for ti in 0..tri_count {
         let c = chart_of[ti];
-        let (tu, tv) = bases[c];
-        let q = positions[ti].map(|pt| Vec2::new(pt.dot(tu), pt.dot(tv)));
-        for v in &q {
+        for v in &proj[ti] {
             cmin[c] = cmin[c].min(*v);
             cmax[c] = cmax[c].max(*v);
         }
-        proj.push(q);
     }
     let csize: Vec<Vec2> = (0..num_charts)
         .map(|c| (cmax[c] - cmin[c]).max(Vec2::splat(1e-6)))
@@ -431,7 +513,16 @@ fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) 
         .map(|ti| {
             let c = chart_of[ti];
             let uv = proj[ti].map(|q| {
-                let px = (q - cmin[c]) * d + offsets[c] + g;
+                let mut local = (q - cmin[c]) * d;
+                // Snap each vertex to a whole texel. The chart's min corner sits at the
+                // origin and `offsets[c]`/`g` are integer pixels, so a rounded local
+                // pixel puts every vertex exactly on a texel corner and face edges land
+                // on the grid. Shared world positions project identically, so a seam
+                // edge snaps the same on both charts and stays watertight.
+                if opts.snap_texels {
+                    local = local.round();
+                }
+                let px = local + offsets[c] + g;
                 px * inv_atlas
             });
             (positions[ti], normals[ti], uv)
@@ -583,7 +674,13 @@ mod tests {
 
     #[test]
     fn constant_density_within_cone_bound() {
-        let opts = UnwrapOptions::default();
+        // The constant-density guarantee is a property of the projection. Texel
+        // snapping deliberately quantizes vertices on top of it, perturbing each
+        // triangle's exact area, so this invariant is checked with snapping off.
+        let opts = UnwrapOptions {
+            snap_texels: false,
+            ..UnwrapOptions::default()
+        };
         let r = auto_unwrap(&Mesh::cube(), &opts);
         let d2 = r.density_d * r.density_d;
         let cos2 = opts.angle_cone_deg.to_radians().cos().powi(2);
@@ -643,5 +740,57 @@ mod tests {
         let r = auto_unwrap(&empty, &UnwrapOptions::default());
         assert_eq!(r.mesh.vertices.len(), 0);
         assert!(r.atlas_size >= 8);
+    }
+
+    #[test]
+    fn snapped_uvs_land_on_texel_boundaries() {
+        // With snapping on (the default), every vertex sits on a whole texel, so face
+        // edges coincide with the texel grid instead of cutting across it.
+        let r = auto_unwrap(&Mesh::cube(), &UnwrapOptions::default());
+        for v in &r.mesh.vertices {
+            for px in [v.uv[0], v.uv[1]].map(|c| c * r.atlas_size as f32) {
+                assert!(
+                    (px - px.round()).abs() < 1e-3,
+                    "vertex UV at {px} px is not on a texel boundary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rectify_squares_faces_to_their_sides_not_diagonals() {
+        // Each cube face is an axis-aligned square split into two triangles, so a
+        // correctly rectified triangle keeps two of its three edges axis-aligned (a
+        // horizontal leg and a vertical leg). The old "align the longest edge" rule
+        // squared faces to the diagonal instead, rotating them 45° — every edge would
+        // then be off-axis and this would fail.
+        let r = auto_unwrap(&Mesh::cube(), &UnwrapOptions::default());
+        let atlas = r.atlas_size as f32;
+        for t in r.mesh.indices.chunks_exact(3) {
+            let uv = [0, 1, 2].map(|k| Vec2::from(r.mesh.vertices[t[k] as usize].uv) * atlas);
+            let axis_aligned = (0..3)
+                .filter(|&e| {
+                    let d = uv[(e + 1) % 3] - uv[e];
+                    d.x.abs() < 1e-3 || d.y.abs() < 1e-3
+                })
+                .count();
+            assert!(
+                axis_aligned >= 2,
+                "face triangle is not axis-aligned (diamond regression): {uv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapping_keeps_faces_non_degenerate() {
+        // Rounding to whole texels must not collapse a face: every triangle still spans
+        // at least one texel in each axis after the snap.
+        let r = auto_unwrap(&Mesh::cube(), &UnwrapOptions::default());
+        for (lo, hi) in pixel_bboxes(&r.mesh, r.atlas_size) {
+            assert!(
+                hi.x - lo.x >= 1.0 - 1e-3 && hi.y - lo.y >= 1.0 - 1e-3,
+                "a face snapped down to a sub-texel sliver: {lo:?}..{hi:?}"
+            );
+        }
     }
 }

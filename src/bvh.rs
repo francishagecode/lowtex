@@ -193,11 +193,6 @@ impl Bvh {
         self.subdivide(left_idx as usize + 1);
     }
 
-    /// Cast a ray and return the interpolated UV at the closest triangle hit.
-    pub fn pick_uv(&self, ray: &Ray) -> Option<Vec2> {
-        self.pick(ray).map(|h| h.uv)
-    }
-
     /// Cast a ray and return the closest hit: its interpolated UV and the index
     /// of the triangle it struck. The triangle index is the *original* mesh
     /// triangle (the `tris` Vec is built in mesh order and never reordered — only
@@ -395,7 +390,7 @@ mod tests {
         let t1 = Instant::now();
         let mut hits_a = 0;
         for r in &rays {
-            if bvh.pick_uv(r).is_some() {
+            if bvh.pick(r).is_some() {
                 hits_a += 1;
             }
         }
@@ -430,7 +425,7 @@ mod tests {
                 origin,
                 direction: dir.normalize(),
             };
-            let a = bvh.pick_uv(&ray);
+            let a = bvh.pick(&ray).map(|h| h.uv);
             let b = brute_pick(&ray, &mesh);
             match (a, b) {
                 (Some(a), Some(b)) => {

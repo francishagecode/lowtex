@@ -76,6 +76,37 @@ impl App {
             return;
         };
         let raw_input = state.take_egui_input(&window);
+
+        // Stage the 2D UV editor's inputs into UiState before the egui closure runs —
+        // the closure only sees UiState, never the renderer. Gated on the renderer's
+        // version counters so the ~MBs of atlas pixels are copied only when they
+        // actually changed and the panel is open; the wireframe rebuilds only on a
+        // topology change.
+        if self.ui.show_uv_panel {
+            if let Some(renderer) = self.renderer.as_ref() {
+                if renderer.mesh_has_uvs() {
+                    let pv = renderer.paint_version();
+                    if pv != self.ui.uv_image_version {
+                        let (size, px) = renderer.atlas_view();
+                        self.ui.uv_image = Some((size, px.to_vec()));
+                        self.ui.uv_image_version = pv;
+                    }
+                    let tv = renderer.topo_version();
+                    if tv != self.ui.uv_edges_version {
+                        self.ui.uv_edges = renderer.build_uv_edges();
+                        self.ui.uv_edges_version = tv;
+                    }
+                } else {
+                    // No UVs yet (mesh awaits an unwrap): drop any stale atlas so the
+                    // panel shows its hint, and force a restage once UVs exist.
+                    self.ui.uv_image = None;
+                    self.ui.uv_tex = None;
+                    self.ui.uv_image_version = u64::MAX;
+                    self.ui.uv_edges_version = u64::MAX;
+                }
+            }
+        }
+
         let full_output = self
             .egui_ctx
             .run(raw_input, |ctx| ui::build(ctx, &mut self.ui));
@@ -146,7 +177,41 @@ impl App {
         renderer.set_fluid(self.ui.tool == crate::ui::Tool::Fluid);
         renderer.set_fluid_spec(self.ui.fluid_spec());
 
+        // Push mirror-painting state: the chosen axis when enabled, else off.
+        renderer.set_symmetry(self.ui.symmetry_on.then_some(self.ui.symmetry_axis));
+
+        // Push face-lock state: confine each dab to the face it lands on.
+        renderer.set_lock_face(self.ui.lock_face);
+
+        // Outline the active face while a painting tool has the lock on, so the user
+        // sees exactly where the brush is confined. Cleared (None) otherwise.
+        let painting_tool = matches!(self.ui.tool, crate::ui::Tool::Brush | crate::ui::Tool::Fluid);
+        let outline_cursor = (self.ui.lock_face && painting_tool).then_some(self.mouse_pos);
+        renderer.set_face_outline(outline_cursor);
+
+        // Show the brush footprint ring at the cursor while a painting tool is active.
+        renderer.set_brush_cursor(painting_tool.then_some(self.mouse_pos), &self.ui.brush);
+
+        // Ghost-preview the stamp under the cursor for the solid/image brush, so the
+        // painter sees what a click lays down before committing. (Fluid is a dynamic
+        // sim with no static footprint, so it only gets the ring.)
+        let preview_cursor = (self.ui.tool == crate::ui::Tool::Brush).then_some(self.mouse_pos);
+        renderer.set_brush_preview(preview_cursor, &self.ui.brush);
+
         let actions = std::mem::take(&mut self.ui.actions);
+
+        // Replay this frame's 2D UV-editor strokes onto the renderer's UV paint path.
+        // Begin/End bracket each stroke into one undo step (exactly like a 3D stroke);
+        // each Segment paints a disc-interpolated line directly in texel space.
+        for ev in &actions.uv_strokes {
+            match *ev {
+                crate::ui::UvEvent::Begin => renderer.begin_stroke(),
+                crate::ui::UvEvent::Segment { from, to } => {
+                    renderer.paint_uv_segment(from, to, &self.ui.brush)
+                }
+                crate::ui::UvEvent::End => renderer.end_stroke(),
+            }
+        }
 
         if actions.open_model {
             if let Some(path) = rfd::FileDialog::new()
@@ -209,6 +274,8 @@ impl App {
                 match renderer.load_brush_material(&path.to_string_lossy()) {
                     Ok(()) => {
                         self.ui.brush_image_loaded = true;
+                        // Stage a preview for the panel swatch (uploaded by the UI).
+                        self.ui.brush_thumb = renderer.brush_thumbnail(64);
                         log::info!("loaded brush image {}", path.display());
                     }
                     Err(e) => log::error!("{e}"),
@@ -218,6 +285,8 @@ impl App {
         if actions.clear_brush_image {
             renderer.clear_brush_material();
             self.ui.brush_image_loaded = false;
+            self.ui.brush_thumb = None;
+            self.ui.brush_thumb_tex = None;
         }
         if let Some(indexed) = actions.export_png {
             let preset = self.ui.export_preset;

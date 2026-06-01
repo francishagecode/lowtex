@@ -31,6 +31,7 @@ mod particle;
 mod preset;
 mod project;
 mod renderer;
+mod surface;
 mod ui;
 mod unwrap;
 
@@ -49,6 +50,9 @@ struct Args {
     paint: bool,
     /// Headless verification: paint one fast drag (a single stroke) before capture.
     stroke: bool,
+    /// Headless verification: paint one stroke directly in UV space (the 2D UV editor's
+    /// path) before capture — a diagonal across the atlas, no raycast.
+    paint_uv: bool,
     /// Headless verification: orbit horizontally by this many degrees before capture.
     orbit_deg: f32,
     /// Headless verification: draw the egui panel into the screenshot.
@@ -110,6 +114,7 @@ fn parse_args() -> Args {
         height: 768,
         paint: false,
         stroke: false,
+        paint_uv: false,
         orbit_deg: 0.0,
         ui: false,
         brush_color: None,
@@ -147,6 +152,7 @@ fn parse_args() -> Args {
             "--screenshot" => args.screenshot = it.next(),
             "--paint" => args.paint = true,
             "--stroke" => args.stroke = true,
+            "--paint-uv" => args.paint_uv = true,
             "--ui" => args.ui = true,
             "--orbit" => {
                 if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
@@ -376,6 +382,16 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
         renderer.begin_stroke();
         renderer.paint_segment((cx - 80.0, cy - 50.0), (cx + 80.0, cy + 50.0), &brush);
         renderer.end_stroke();
+    }
+    if args.paint_uv {
+        // One diagonal stroke straight in UV space (the 2D UV editor's path): no
+        // raycast, a flat disc per step. With an unwrapped cube this paints a band
+        // across the atlas that shows on whichever faces those texels map to.
+        use glam::Vec2;
+        renderer.begin_stroke();
+        renderer.paint_uv_segment(Vec2::new(0.15, 0.15), Vec2::new(0.85, 0.85), &brush);
+        renderer.end_stroke();
+        log::info!("painted one UV-space stroke");
     }
     if let Some(path) = &args.texture_brush {
         // Paint one wide diagonal stroke that reveals the tiled image only where it

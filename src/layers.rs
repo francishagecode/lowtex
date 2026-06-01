@@ -619,7 +619,13 @@ mod tests {
             l.layers[k].invalidate();
         }
 
-        let rect = TexRect::from_stamp(64.0, 64.0, 8.0, SIZE).unwrap();
+        // A representative brush-dab dirty rect near the texture center.
+        let rect = TexRect {
+            x0: 56,
+            y0: 56,
+            x1: 73,
+            y1: 73,
+        };
         let mut out = vec![0u8; (SIZE * SIZE * 4) as usize];
         l.composite_into_region(&mut out, rect); // warm caches
 
