@@ -11,7 +11,9 @@
 // engine side, not encodable in the PNG — see the per-preset note.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
+
+use crate::mesh::Mesh;
 
 /// Target pipeline for an export. Affects the suggested filename + guidance.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +119,54 @@ fn save_indexed_png(
     Ok(())
 }
 
+/// Write `mesh` to a Wavefront OBJ at `path`: positions, texcoords, normals, and
+/// triangle faces (`v/vt/vn`, 1-based).
+///
+/// This is how a painter gets the *unwrapped* geometry back out. The unwrap rebuilds
+/// the UVs (and splits vertices to do it), and those UVs exist only inside lowtex —
+/// the exported texture maps onto them and nothing else. So the mesh has to travel
+/// with the texture, or the PNG is unusable in an engine.
+///
+/// Texcoord V is flipped back to OBJ's bottom-up convention (the loader flips it the
+/// other way on import, `1.0 - v`), so a round trip is stable and the exported PNG
+/// lines up the same way it does in the lowtex viewport.
+pub fn export_obj(path: &str, mesh: &Mesh) -> Result<(), String> {
+    let file = File::create(path).map_err(|e| format!("failed to create {path}: {e}"))?;
+    let mut w = BufWriter::new(file);
+    let mut write = |line: std::fmt::Arguments| -> Result<(), String> {
+        writeln!(w, "{line}").map_err(|e| format!("failed to write {path}: {e}"))
+    };
+
+    write(format_args!("# exported by lowtex"))?;
+    write(format_args!(
+        "# {} vertices, {} triangles",
+        mesh.vertices.len(),
+        mesh.indices.len() / 3
+    ))?;
+    for v in &mesh.vertices {
+        write(format_args!(
+            "v {} {} {}",
+            v.position[0], v.position[1], v.position[2]
+        ))?;
+    }
+    for v in &mesh.vertices {
+        write(format_args!("vt {} {}", v.uv[0], 1.0 - v.uv[1]))?;
+    }
+    for v in &mesh.vertices {
+        write(format_args!(
+            "vn {} {} {}",
+            v.normal[0], v.normal[1], v.normal[2]
+        ))?;
+    }
+    for t in mesh.indices.chunks_exact(3) {
+        // OBJ indices are 1-based; position/texcoord/normal share one index here
+        // because the unwrap emits a flat, split-vertex mesh.
+        let (a, b, c) = (t[0] + 1, t[1] + 1, t[2] + 1);
+        write(format_args!("f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}"))?;
+    }
+    w.flush().map_err(|e| format!("failed to write {path}: {e}"))
+}
+
 fn nearest_index(palette: &[[u8; 3]], c: [u8; 3]) -> usize {
     let mut best = 0;
     let mut best_d = i32::MAX;
@@ -155,6 +205,26 @@ mod tests {
         assert_eq!(info.color_type, png::ColorType::Indexed);
         assert_eq!((info.width, info.height), (2, 2));
         assert!(info.palette.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exported_obj_reloads_with_matching_uvs() {
+        // Unwrap a cube, export it, and re-import: vertex count and UVs must survive
+        // the round trip (the V flip on the way out cancels the loader's flip back).
+        use crate::mesh::Mesh;
+        let unwrapped = crate::unwrap::auto_unwrap(&Mesh::cube(), &Default::default()).mesh;
+        let path = std::env::temp_dir().join("lowtex_obj_test.obj");
+        let p = path.to_string_lossy();
+        export_obj(&p, &unwrapped).unwrap();
+
+        let reloaded = crate::model::load(&p).unwrap();
+        assert_eq!(reloaded.vertices.len(), unwrapped.vertices.len());
+        assert_eq!(reloaded.indices.len(), unwrapped.indices.len());
+        // model::load recenters/normalizes positions, so compare UVs (untouched).
+        for (a, b) in reloaded.vertices.iter().zip(&unwrapped.vertices) {
+            assert!((a.uv[0] - b.uv[0]).abs() < 1e-4 && (a.uv[1] - b.uv[1]).abs() < 1e-4);
+        }
         let _ = std::fs::remove_file(&path);
     }
 

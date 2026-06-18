@@ -450,6 +450,18 @@ impl App {
                 }
             }
         }
+        if actions.export_obj {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name("model.obj")
+                .add_filter("OBJ", &["obj"])
+                .save_file()
+            {
+                match renderer.export_obj(&path.to_string_lossy()) {
+                    Ok(()) => log::info!("exported mesh {}", path.display()),
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+        }
         if let Some(i) = actions.select_builtin_palette {
             if let Some(p) = crate::palette::Palette::builtins().into_iter().nth(i) {
                 renderer.set_palette(p);
