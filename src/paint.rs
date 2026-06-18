@@ -46,6 +46,24 @@ impl Default for Brush {
 }
 
 impl Brush {
+    /// A copy of this brush with pen-tablet `pressure` (0..1) applied to the
+    /// enabled axes. `size`/`opacity` toggle which axes respond; `min_size` is the
+    /// radius fraction at zero pressure, so a light touch still leaves a visible
+    /// mark instead of collapsing to nothing. A plain mouse reports full pressure
+    /// (1.0), which leaves the brush unchanged — so this is a no-op without a pen.
+    pub fn with_pressure(self, pressure: f32, size: bool, opacity: bool, min_size: f32) -> Brush {
+        let p = pressure.clamp(0.0, 1.0);
+        let mut b = self;
+        if size {
+            let min = min_size.clamp(0.0, 1.0);
+            b.radius = (b.radius * (min + (1.0 - min) * p)).max(0.5);
+        }
+        if opacity {
+            b.opacity = (b.opacity * p).clamp(0.0, 1.0);
+        }
+        b
+    }
+
     /// Brush color as sRGB u8, for writing into the RGBA8 texture.
     pub fn color_u8(&self) -> [u8; 3] {
         [
@@ -296,6 +314,54 @@ mod tests {
         erase_texel(&mut px, &base, 0, 0.5);
         assert_eq!(px[3], 128, "half coverage halves alpha");
         assert_eq!(&px[0..3], &base[0..3], "erase leaves RGB at the base color");
+    }
+
+    #[test]
+    fn full_pressure_leaves_the_brush_unchanged() {
+        // A mouse reports pressure 1.0, so painting must be identical to the raw
+        // brush regardless of which axes are enabled.
+        let b = Brush {
+            radius: 10.0,
+            opacity: 0.5,
+            ..Brush::default()
+        };
+        let scaled = b.with_pressure(1.0, true, true, 0.1);
+        assert_eq!(scaled.radius, b.radius);
+        assert_eq!(scaled.opacity, b.opacity);
+    }
+
+    #[test]
+    fn pressure_scales_only_enabled_axes() {
+        let b = Brush {
+            radius: 20.0,
+            opacity: 0.8,
+            ..Brush::default()
+        };
+
+        // Size only: radius interpolates from min_size*radius (here 0) up to radius;
+        // opacity is untouched.
+        let size = b.with_pressure(0.5, true, false, 0.0);
+        assert!((size.radius - 10.0).abs() < 1e-4, "half pressure → half radius");
+        assert_eq!(size.opacity, b.opacity, "opacity left alone when size-only");
+
+        // Opacity only: opacity scales linearly; radius is untouched.
+        let opa = b.with_pressure(0.25, false, true, 0.0);
+        assert_eq!(opa.radius, b.radius, "radius left alone when opacity-only");
+        assert!((opa.opacity - 0.2).abs() < 1e-4, "quarter pressure → quarter opacity");
+    }
+
+    #[test]
+    fn min_size_floors_the_radius_at_low_pressure() {
+        let b = Brush {
+            radius: 30.0,
+            ..Brush::default()
+        };
+        // At zero pressure with a 0.1 floor, radius is 10% of nominal — visible, not zero.
+        let near_zero = b.with_pressure(0.0, true, false, 0.1);
+        assert!((near_zero.radius - 3.0).abs() < 1e-4);
+        // And never collapses below the 0.5-texel hard floor even with min_size 0.
+        let tiny = b.with_pressure(0.0, true, false, 0.0);
+        assert!(tiny.radius >= 0.5);
     }
 
     #[test]

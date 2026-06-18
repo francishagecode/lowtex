@@ -23,7 +23,9 @@ use winit::{
 };
 
 use crate::mesh::Mesh;
+use crate::paint::Brush;
 use crate::renderer::{Renderer, UiPaint};
+use crate::tablet::Tablet;
 use crate::ui::{self, UiState};
 
 /// What the current mouse drag is doing. LMB paints; RMB orbits; MMB pans — so
@@ -76,6 +78,11 @@ pub struct App {
 
     /// Persistent app settings (e.g. the last texture folder), saved across launches.
     config: crate::config::Config,
+
+    /// Pen-tablet pressure source. On macOS this taps NSEvent for stylus pressure;
+    /// elsewhere it's a stub that reports full pressure. Read per dab to scale the
+    /// brush via [`Brush::with_pressure`].
+    tablet: Tablet,
 }
 
 impl App {
@@ -108,7 +115,20 @@ impl App {
             pending_quicksave: false,
             pending_save_as: false,
             config,
+            tablet: Tablet::new(),
         }
+    }
+
+    /// The current brush with pen pressure folded in, per the UI's pressure toggles.
+    /// Used for every painting stroke; a plain mouse reports full pressure so this
+    /// is identical to `self.ui.brush` without a pen.
+    fn pressured_brush(&self) -> Brush {
+        self.ui.brush.with_pressure(
+            self.tablet.latest(),
+            self.ui.pressure_size,
+            self.ui.pressure_opacity,
+            self.ui.pen_min_size,
+        )
     }
 
     /// Run egui for this frame and render the scene + overlay.
@@ -178,6 +198,8 @@ impl App {
     /// Apply this frame's UI requests (file dialogs, resolution change). Runs
     /// outside the egui closure so native dialogs can block safely.
     fn handle_ui_actions(&mut self) {
+        // Fold pen pressure in now, before `renderer` takes a mutable borrow of self.
+        let pressured = self.pressured_brush();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -251,7 +273,7 @@ impl App {
             match *ev {
                 crate::ui::UvEvent::Begin => renderer.begin_stroke(),
                 crate::ui::UvEvent::Segment { from, to } => {
-                    renderer.paint_uv_segment(from, to, &self.ui.brush)
+                    renderer.paint_uv_segment(from, to, &pressured)
                 }
                 crate::ui::UvEvent::End => renderer.end_stroke(),
             }
@@ -798,6 +820,10 @@ impl ApplicationHandler for App {
             None,
         );
 
+        // Tap the platform pen-pressure source now the app is up (no-op off macOS,
+        // and idempotent if `resumed` fires again).
+        self.tablet.install();
+
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.egui_state = Some(egui_state);
@@ -837,6 +863,9 @@ impl ApplicationHandler for App {
             _ => {}
         }
 
+        // Fold pen pressure in now (the tablet monitor has already recorded this
+        // event's pressure), before `renderer` takes a mutable borrow of self.
+        let pressured = self.pressured_brush();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -856,7 +885,7 @@ impl ApplicationHandler for App {
                 match self.drag {
                     Drag::Paint => {
                         // Interpolate from the previous sample so fast drags stay solid.
-                        renderer.paint_segment(prev, pos, &self.ui.brush);
+                        renderer.paint_segment(prev, pos, &pressured);
                         window.request_redraw();
                     }
                     Drag::Orbit => {
@@ -892,7 +921,7 @@ impl ApplicationHandler for App {
                             crate::ui::Tool::Brush => {
                                 self.drag = Drag::Paint;
                                 renderer.begin_stroke();
-                                renderer.paint_at(self.mouse_pos, &self.ui.brush);
+                                renderer.paint_at(self.mouse_pos, &pressured);
                             }
                             crate::ui::Tool::FillFace => {
                                 renderer.fill_face_at(self.mouse_pos, &self.ui.brush);

@@ -196,7 +196,7 @@ paint → export a PNG.** That single loop is the line between tech demo and too
 - **Build:** interpolate brush stamps between consecutive mouse samples by
   spacing (% of brush size); soft falloff by hardness; opacity accumulation per
   stroke (not per stamp, so overlap within one stroke doesn't double-darken).
-  Stylus pressure later (stretch).
+  Stylus pressure later (stretch). _[done 2026-06-18]_
 - **Touches:** `paint.rs`, `app.rs`.
 - **Done when:** a fast drag across the model leaves a solid, even line.
 - **Depends on:** G3
@@ -208,6 +208,13 @@ paint → export a PNG.** That single loop is the line between tech demo and too
   double-darkening). app.rs drives begin/segment/end on LMB. Verified headless
   (`--stroke`): a single big diagonal jump renders a solid even line; at
   `--brush-opacity 0.4` the heavily-overlapping band stays uniform 40%._
+- _2026-06-18 (stretch): pen pressure. `src/tablet.rs` taps `NSEvent` via an
+  app-global local monitor on macOS (stub returning 1.0 elsewhere — winit 0.30
+  drops the pen fields). `Brush::with_pressure(p, size, opacity, min_size)` folds
+  the latest pressure into a per-stroke brush copy at the input layer, so no
+  renderer/`paint_*` signatures changed. UI toggles (Pressure → Size on by
+  default, → Opacity off) live in `UiState`. A mouse reports pressure 1.0, so
+  mouse painting is unchanged. Works in both the 3D viewport and the 2D UV editor._
 
 ---
 

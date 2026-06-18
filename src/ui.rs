@@ -203,6 +203,14 @@ pub struct UiState {
     /// Face lock: when on, each dab stays inside the flat face it lands on instead
     /// of wrapping across an edge onto a neighbouring face.
     pub lock_face: bool,
+    /// Pen-tablet pressure mapping: when on, a pressure-sensitive stylus scales the
+    /// brush radius (`pressure_size`) and/or per-dab opacity (`pressure_opacity`).
+    /// A plain mouse reports full pressure, so these are no-ops without a pen.
+    /// `pen_min_size` is the radius fraction at zero pressure, so a light touch
+    /// still leaves a visible mark rather than vanishing to nothing.
+    pub pressure_size: bool,
+    pub pressure_opacity: bool,
+    pub pen_min_size: f32,
     /// Levels controls shared by every mesh effect: overall strength, mid-tone
     /// contrast, and invert. `effect_source` is which baked channel the generic
     /// "Tint layer" / "Mask layer" actions read from.
@@ -298,6 +306,9 @@ impl Default for UiState {
             brush_folder_entries: Vec::new(),
             symmetry_on: false,
             lock_face: false,
+            pressure_size: true,
+            pressure_opacity: false,
+            pen_min_size: 0.1,
             symmetry_axis: SymmetryAxis::X,
             ao_strength: 0.75,
             effect_contrast: 0.0,
@@ -616,6 +627,20 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                     ui.add(
                         egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"),
                     );
+
+                    // Pen pressure: a pressure-sensitive stylus can drive the brush
+                    // size and/or opacity. A plain mouse reports full pressure, so
+                    // these do nothing without a pen — safe to leave Size on.
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut state.pressure_size, "Pressure → Size")
+                            .on_hover_text(
+                                "Stylus pressure scales the brush size (needs a pen tablet)",
+                            );
+                        ui.checkbox(&mut state.pressure_opacity, "Opacity")
+                            .on_hover_text(
+                                "Stylus pressure scales per-dab opacity (needs a pen tablet)",
+                            );
+                    });
 
                     // Eraser: the same brush, but it removes paint (lowers alpha toward
                     // transparent) instead of laying the swatch color, revealing whatever

@@ -32,6 +32,7 @@ mod preset;
 mod project;
 mod renderer;
 mod surface;
+mod tablet;
 mod ui;
 mod unwrap;
 
