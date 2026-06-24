@@ -2049,6 +2049,18 @@ impl Renderer {
         self.update_uniforms();
     }
 
+    /// First-person mouse-look (RMB fly): turn the view in place and refresh.
+    pub fn look_camera(&mut self, dx: f32, dy: f32) {
+        self.camera.look(dx, dy);
+        self.update_uniforms();
+    }
+
+    /// Fly the camera by world-space forward/right/up amounts (WASD/QE) and refresh.
+    pub fn fly_camera(&mut self, forward: f32, right: f32, up: f32) {
+        self.camera.fly(forward, right, up);
+        self.update_uniforms();
+    }
+
     /// Zoom (dolly) the camera and refresh the uniform.
     pub fn zoom_camera(&mut self, delta: f32) {
         self.camera.zoom(delta);
@@ -2597,13 +2609,16 @@ impl Renderer {
     /// world-space texel density (the atlas size is *derived* from `density`).
     /// Geometry is unchanged but vertices are split and re-UV'd, so the GPU buffers,
     /// BVH, and cached maps are rebuilt; the paint texture is resampled to the new
-    /// atlas size and re-maps onto the new UVs. Returns `(atlas_size, clamped)` where
-    /// `clamped` means density was reduced to stay within the GPU texture limit.
-    pub fn apply_unwrap(&mut self, density: crate::unwrap::Density) -> (u32, bool) {
+    /// atlas size and re-maps onto the new UVs. With `overlap`, congruent charts are
+    /// stacked onto shared atlas slots (identical/mirrored parts share texels). Returns
+    /// `(atlas_size, clamped)` where `clamped` means density was reduced to stay within
+    /// the GPU texture limit.
+    pub fn apply_unwrap(&mut self, density: crate::unwrap::Density, overlap: bool) -> (u32, bool) {
         self.checkpoint();
         let opts = crate::unwrap::UnwrapOptions {
             density,
             max_atlas: self.max_texture_dim,
+            overlap_identical: overlap,
             ..Default::default()
         };
         let result = crate::unwrap::auto_unwrap(&self.mesh, &opts);

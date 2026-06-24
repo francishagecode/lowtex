@@ -28,15 +28,51 @@ use crate::renderer::{Renderer, UiPaint};
 use crate::tablet::Tablet;
 use crate::ui::{self, UiState};
 
-/// What the current mouse drag is doing. LMB paints; RMB orbits; MMB pans — so
-/// camera control and painting never fight over the same button.
+/// What the current mouse drag is doing (game-engine bindings). LMB paints;
+/// Alt+LMB orbits the model; RMB flies (mouse-look in place, WASD to move); MMB
+/// pans — so camera control and painting never fight over the same button.
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
     None,
     Paint,
     Orbit,
     Pan,
+    Fly,
 }
+
+/// Held state of the WASD/QE fly keys plus the Shift sprint, updated on key
+/// press/release. Applied per frame while the RMB fly drag is active.
+#[derive(Default)]
+struct FlyKeys {
+    forward: bool, // W
+    back: bool,    // S
+    left: bool,    // A
+    right: bool,   // D
+    up: bool,      // E
+    down: bool,    // Q
+    fast: bool,    // Shift
+}
+
+impl FlyKeys {
+    /// Whether any directional key is down (sprint alone doesn't move).
+    fn any(&self) -> bool {
+        self.forward || self.back || self.left || self.right || self.up || self.down
+    }
+
+    /// Drop all held keys — used when the fly drag ends or focus is lost, so a
+    /// key whose release we never saw can't keep the camera drifting.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Fly speed in world units per second, the multiplier Shift applies, and the
+/// clamp the mouse-wheel speed adjustment stays within. The default suits the
+/// roughly unit-sized sample meshes; the wheel scales it while flying.
+const FLY_SPEED_DEFAULT: f32 = 2.5;
+const FLY_SPRINT: f32 = 4.0;
+const FLY_SPEED_MIN: f32 = 0.2;
+const FLY_SPEED_MAX: f32 = 40.0;
 
 /// How often a timed autosave fires, and how many rolling version files it keeps
 /// (G31). At PSX texture sizes each version is a few hundred KB, so a ring of ten
@@ -59,6 +95,14 @@ pub struct App {
     drag: Drag,
     /// Latest keyboard modifier state, tracked for the undo/redo shortcuts.
     modifiers: ModifiersState,
+
+    /// Game-engine fly navigation: which WASD/QE keys are held, the current fly
+    /// speed (wheel-adjustable, units/sec), and the clock used to make movement
+    /// frame-rate independent. Movement is applied each `about_to_wait` while the
+    /// RMB fly drag is active.
+    fly_keys: FlyKeys,
+    fly_speed: f32,
+    last_frame: Instant,
 
     /// Save/exit/autosave state (G31). `project_path` is the `.lowtex` file the user
     /// is editing — `None` until they save or open one; quicksave writes here.
@@ -108,6 +152,9 @@ impl App {
             last_pos: (0.0, 0.0),
             drag: Drag::None,
             modifiers: ModifiersState::empty(),
+            fly_keys: FlyKeys::default(),
+            fly_speed: FLY_SPEED_DEFAULT,
+            last_frame: Instant::now(),
             project_path: None,
             last_autosave: Instant::now(),
             autosave_counter: 0,
@@ -356,7 +403,7 @@ impl App {
             }
         }
         if let Some(density) = actions.unwrap {
-            let (atlas, clamped) = renderer.apply_unwrap(density);
+            let (atlas, clamped) = renderer.apply_unwrap(density, self.ui.unwrap_overlap);
             self.ui.last_atlas_clamped = clamped;
             log::info!(
                 "unwrapped → {atlas}×{atlas}{}",
@@ -908,6 +955,12 @@ impl ApplicationHandler for App {
                         renderer.pan_camera(dx, dy);
                         window.request_redraw();
                     }
+                    Drag::Fly => {
+                        // Mouse-look in place (FPS yaw/pitch); WASD translation is
+                        // applied per frame in about_to_wait.
+                        renderer.look_camera(dx, dy);
+                        window.request_redraw();
+                    }
                     Drag::None => {}
                 }
             }
@@ -921,6 +974,12 @@ impl ApplicationHandler for App {
                 }
                 match (button, pressed) {
                     (MouseButton::Left, true) => {
+                        // Alt+LMB orbits the model (game-engine convention), instead
+                        // of painting or hitting the compass.
+                        if self.modifiers.alt_key() {
+                            self.drag = Drag::Orbit;
+                            return;
+                        }
                         // A click on the orientation compass snaps the view down that
                         // axis instead of painting the mesh behind the gizmo.
                         if renderer.click_compass(self.mouse_pos) {
@@ -947,11 +1006,16 @@ impl ApplicationHandler for App {
                         }
                         window.request_redraw();
                     }
-                    (MouseButton::Right, true) => self.drag = Drag::Orbit,
+                    (MouseButton::Right, true) => self.drag = Drag::Fly,
                     (MouseButton::Middle, true) => self.drag = Drag::Pan,
                     (_, false) => {
                         if self.drag == Drag::Paint {
                             renderer.end_stroke();
+                        }
+                        // Leaving fly: drop held WASD/QE so the camera stops dead and
+                        // no key whose release we missed keeps it drifting.
+                        if self.drag == Drag::Fly {
+                            self.fly_keys.clear();
                         }
                         self.drag = Drag::None;
                     }
@@ -964,14 +1028,41 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event: key, .. } => {
-                // Let egui claim keys first (e.g. a focused widget); only then do
-                // viewport shortcuts fire. Ctrl/⌘+Z undo, Ctrl/⌘+Shift+Z or
-                // Ctrl/⌘+Y redo. Super covers macOS's Cmd.
-                if egui_consumed || key.state != ElementState::Pressed {
+                // Let egui claim keys first (e.g. typing in a focused widget); only
+                // then do viewport shortcuts and fly navigation fire.
+                if egui_consumed {
                     return;
                 }
                 let cmd = self.modifiers.control_key() || self.modifiers.super_key();
+
+                // Fly-navigation keys (no Ctrl/Cmd, so they don't shadow ⌘+S etc.):
+                // track WASD/QE + Shift sprint on both press and release for
+                // continuous movement, applied per frame in about_to_wait while the
+                // RMB fly drag is active. Returns so they never reach the shortcuts.
                 if !cmd {
+                    if let PhysicalKey::Code(code) = key.physical_key {
+                        let down = key.state == ElementState::Pressed;
+                        let handled = match code {
+                            KeyCode::KeyW => set(&mut self.fly_keys.forward, down),
+                            KeyCode::KeyS => set(&mut self.fly_keys.back, down),
+                            KeyCode::KeyA => set(&mut self.fly_keys.left, down),
+                            KeyCode::KeyD => set(&mut self.fly_keys.right, down),
+                            KeyCode::KeyE => set(&mut self.fly_keys.up, down),
+                            KeyCode::KeyQ => set(&mut self.fly_keys.down, down),
+                            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                                set(&mut self.fly_keys.fast, down)
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            return;
+                        }
+                    }
+                }
+
+                // Command shortcuts (press only): Ctrl/⌘+Z undo, Ctrl/⌘+Shift+Z or
+                // Ctrl/⌘+Y redo, Ctrl/⌘+S save. Super covers macOS's Cmd.
+                if key.state != ElementState::Pressed || !cmd {
                     return;
                 }
                 let shift = self.modifiers.shift_key();
@@ -1011,8 +1102,25 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05,
                 };
-                renderer.zoom_camera(amount);
+                if self.drag == Drag::Fly {
+                    // While flying, the wheel tunes movement speed (game-engine
+                    // convention) rather than dollying the view.
+                    let factor = (1.0 + amount * 0.1).clamp(0.2, 5.0);
+                    self.fly_speed = (self.fly_speed * factor).clamp(FLY_SPEED_MIN, FLY_SPEED_MAX);
+                } else {
+                    renderer.zoom_camera(amount);
+                }
                 window.request_redraw();
+            }
+
+            // Dropping focus (e.g. Alt+Tab) can swallow the key-release events, so
+            // forget any held fly keys and end a fly drag — otherwise the camera
+            // would keep gliding after the window comes back.
+            WindowEvent::Focused(false) => {
+                self.fly_keys.clear();
+                if self.drag == Drag::Fly {
+                    self.drag = Drag::None;
+                }
             }
 
             WindowEvent::RedrawRequested => self.redraw(),
@@ -1025,10 +1133,37 @@ impl ApplicationHandler for App {
         // Timed recovery write (G31): cheap clock check most wakes, a save only when
         // the interval has elapsed and the document actually changed.
         self.maybe_autosave();
+
+        // Advance the per-frame clock every wake (the loop polls continuously), and
+        // apply WASD/QE fly movement while the RMB fly drag is active. Scaling by dt
+        // keeps the speed frame-rate independent; the cap stops a stall from
+        // lurching the camera across the scene on the first frame back.
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+        if self.drag == Drag::Fly && self.fly_keys.any() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                let speed = self.fly_speed * if self.fly_keys.fast { FLY_SPRINT } else { 1.0 };
+                let step = speed * dt;
+                let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32 * step;
+                let forward = axis(self.fly_keys.forward, self.fly_keys.back);
+                let right = axis(self.fly_keys.right, self.fly_keys.left);
+                let up = axis(self.fly_keys.up, self.fly_keys.down);
+                renderer.fly_camera(forward, right, up);
+            }
+        }
+
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
     }
+}
+
+/// Write `v` into a fly-key slot and report that the key was one we handle, so the
+/// keyboard match can both record the state and short-circuit in one arm.
+fn set(slot: &mut bool, v: bool) -> bool {
+    *slot = v;
+    true
 }
 
 /// Scan `dir` for image files and stage a small thumbnail for each, for the brush/

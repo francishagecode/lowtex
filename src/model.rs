@@ -169,8 +169,14 @@ fn load_obj(path: &str) -> Result<Mesh, String> {
     for model in &models {
         let m = &model.mesh;
         let vert_count = m.positions.len() / 3;
-        had_normals &= !m.normals.is_empty();
-        had_uvs &= !m.texcoords.is_empty();
+        // tobj's single_index expansion can leave normals/texcoords shorter than
+        // the position count for meshes that mix face formats (e.g. some faces
+        // `v//vn`, some plain `v`). Only treat an attribute as present when it
+        // fully covers every vertex; otherwise synthesize it downstream.
+        let has_normals = m.normals.len() >= vert_count * 3;
+        let has_uvs = m.texcoords.len() >= vert_count * 2;
+        had_normals &= has_normals;
+        had_uvs &= has_uvs;
 
         let base = vertices.len() as u32;
         for i in 0..vert_count {
@@ -179,16 +185,16 @@ fn load_obj(path: &str) -> Result<Mesh, String> {
                 m.positions[i * 3 + 1],
                 m.positions[i * 3 + 2],
             ];
-            let normal = if m.normals.is_empty() {
-                [0.0, 1.0, 0.0]
-            } else {
+            let normal = if has_normals {
                 [m.normals[i * 3], m.normals[i * 3 + 1], m.normals[i * 3 + 2]]
+            } else {
+                [0.0, 1.0, 0.0]
             };
             // OBJ V runs bottom-up; flip to match wgpu's top-down texture space.
-            let uv = if m.texcoords.is_empty() {
-                [0.0, 0.0]
-            } else {
+            let uv = if has_uvs {
                 [m.texcoords[i * 2], 1.0 - m.texcoords[i * 2 + 1]]
+            } else {
+                [0.0, 0.0]
             };
             vertices.push(Vertex {
                 position,

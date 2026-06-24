@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 
-use glam::{Vec2, Vec3};
+use glam::{Mat2, Vec2, Vec3};
 
 use crate::mesh::{Mesh, Vertex};
 
@@ -96,6 +96,15 @@ pub struct UnwrapOptions {
     /// jaggy-free look you want at PSX resolutions. Costs some atlas (charts round up
     /// to whole texels) and makes non-rectangular faces blocky. See `snap_charts`.
     pub snap_texels: bool,
+    /// Stack congruent charts on top of each other in the atlas instead of packing each
+    /// into its own slot. Any two charts that are the same shape — at any position or
+    /// orientation, including mirror images — collapse onto one shared region so
+    /// corresponding surface points land on the same texels (paint one, paint all).
+    /// Identical parts then cost the atlas nothing, which also lets the density fill the
+    /// texture with fewer slots (slightly sharper). Off by default; matching relies on
+    /// the rectify normalization, which is forced on whenever this is set. See
+    /// `group_congruent_charts`.
+    pub overlap_identical: bool,
 }
 
 impl Default for UnwrapOptions {
@@ -111,6 +120,7 @@ impl Default for UnwrapOptions {
             max_atlas: 8192,
             target_atlas_px: 128,
             snap_texels: true,
+            overlap_identical: false,
         }
     }
 }
@@ -526,6 +536,191 @@ fn pack_pixels(
     (offsets, atlas, d, clamped)
 }
 
+/// How a chart is placed into its shared slot: the affine map `lin · q + trans` (in the
+/// chart's projected coords) that lands it on the slot representative's layout, so
+/// corresponding vertices coincide texel-for-texel. `lin` is a rotation, or a
+/// rotation+reflection for a mirror image; `trans` folds in the translation. The
+/// representative — and *every* chart when overlap is off — gets `lin = I`,
+/// `trans = -cmin`, i.e. the plain `q - cmin` layout the packer already expects.
+#[derive(Clone, Copy)]
+struct SlotRemap {
+    lin: Mat2,
+    trans: Vec2,
+}
+
+/// The identity placement for a chart drawn in its own slot: `q - cmin`.
+fn id_remap(cmin: Vec2) -> SlotRemap {
+    SlotRemap {
+        lin: Mat2::IDENTITY,
+        trans: -cmin,
+    }
+}
+
+/// Deduplicate a chart's projected vertices by quantized position — charts arrive split, so
+/// shared edges repeat a vertex. First-seen order; the isometry matching below is
+/// order-independent.
+fn dedup_verts(pts: &[Vec2], eps: f32) -> Vec<Vec2> {
+    let inv = 1.0 / eps;
+    let mut seen: HashMap<(i64, i64), ()> = HashMap::new();
+    let mut out = Vec::new();
+    for &p in pts {
+        let key = ((p.x * inv).round() as i64, (p.y * inv).round() as i64);
+        if seen.insert(key, ()).is_none() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The farthest-apart pair of points (the set's diameter), or `None` if all coincide. A
+/// well-defined, isometry-stable anchor for registration.
+fn diameter(v: &[Vec2]) -> Option<(usize, usize)> {
+    let mut best = (0usize, 0usize);
+    let mut best_d2 = 0.0f32;
+    for i in 0..v.len() {
+        for j in (i + 1)..v.len() {
+            let d2 = v[i].distance_squared(v[j]);
+            if d2 > best_d2 {
+                best_d2 = d2;
+                best = (i, j);
+            }
+        }
+    }
+    (best_d2 > 0.0).then_some(best)
+}
+
+/// The rotation taking unit vector `from` onto unit vector `to`.
+fn rot_between(from: Vec2, to: Vec2) -> Mat2 {
+    let c = from.dot(to); // cos θ
+    let s = from.perp_dot(to); // sin θ
+    Mat2::from_cols(Vec2::new(c, s), Vec2::new(-s, c))
+}
+
+/// Find the rigid (optionally mirrored) transform mapping every point of `m` onto a point
+/// of `r` within `tol`, anchored on each set's diameter: returns `(lin, a_m, a_r)` for the
+/// map `lin · (p - a_m) + a_r`. `None` if no orientation/reflection lines the sets up —
+/// i.e. a distance-key collision between genuinely different shapes, which then stays
+/// unmerged. `r` and `m` share a pairwise-distance key, so they're congruence candidates.
+fn register(r: &[Vec2], m: &[Vec2], tol: f32) -> Option<(Mat2, Vec2, Vec2)> {
+    let (ri, rj) = diameter(r)?;
+    let (mi, mj) = diameter(m)?;
+    let dir_r = (r[rj] - r[ri]).normalize();
+    let tol2 = tol * tol;
+    let reflect = Mat2::from_cols(Vec2::new(1.0, 0.0), Vec2::new(0.0, -1.0));
+    // Map either end of the member's diameter onto r[ri], with and without a reflection —
+    // four hypotheses, the first that lines every vertex up wins.
+    for &(ma, mb) in &[(mi, mj), (mj, mi)] {
+        let to_x = rot_between((m[mb] - m[ma]).normalize(), Vec2::X);
+        for &mirror in &[false, true] {
+            let refl = if mirror { reflect } else { Mat2::IDENTITY };
+            // dir_m → +x, optionally reflect across it, then +x → dir_r.
+            let lin = rot_between(Vec2::X, dir_r) * refl * to_x;
+            let (a_m, a_r) = (m[ma], r[ri]);
+            let ok = m.iter().all(|&p| {
+                let q = lin * (p - a_m) + a_r;
+                r.iter().any(|&rp| rp.distance_squared(q) <= tol2)
+            });
+            if ok {
+                return Some((lin, a_m, a_r));
+            }
+        }
+    }
+    None
+}
+
+/// Collapse congruent charts onto shared atlas slots — the "overlap identical UVs"
+/// feature. Two charts are congruent when one maps onto the other by a rigid motion or a
+/// mirror; congruent charts share a `slot_of`, and each carries a `SlotRemap` placing it on
+/// the slot's representative so corresponding vertices coincide texel-for-texel.
+/// `slot_sizes` holds one box per slot (the representative's). With `overlap = false` every
+/// chart is its own slot with an identity remap, so the caller's packing and UV math are
+/// unchanged.
+///
+/// Charts are first bucketed by an isometry-invariant key (vertex count + sorted pairwise
+/// distances), then each candidate is *registered* against its bucket's representatives and
+/// the alignment verified vertex-by-vertex — so a key collision between genuinely different
+/// shapes can't produce a bad overlap (it just falls back to a private slot). This is
+/// independent of `chart_rectify`, whose minimum-area-box ties can otherwise orient
+/// congruent charts inconsistently.
+fn group_congruent_charts(
+    proj: &[[Vec2; 3]],
+    chart_of: &[usize],
+    cmin: &[Vec2],
+    csize: &[Vec2],
+    num_charts: usize,
+    eps: f32,
+    overlap: bool,
+) -> (Vec<usize>, Vec<Vec2>, Vec<SlotRemap>) {
+    if !overlap {
+        return (
+            (0..num_charts).collect(),
+            csize.to_vec(),
+            (0..num_charts).map(|c| id_remap(cmin[c])).collect(),
+        );
+    }
+
+    // Deduplicated projected vertices per chart.
+    let mut chart_pts: Vec<Vec<Vec2>> = vec![Vec::new(); num_charts];
+    for (ti, tri) in proj.iter().enumerate() {
+        chart_pts[chart_of[ti]].extend_from_slice(tri);
+    }
+    let verts: Vec<Vec<Vec2>> = chart_pts.iter().map(|p| dedup_verts(p, eps)).collect();
+
+    // The distance-key cell is coarse enough to absorb the ~1e-6 float drift between
+    // congruent charts yet far finer than the gap between genuinely different shapes; it
+    // also serves as the registration tolerance.
+    let cell = eps * 10.0;
+    let inv_cell = 1.0 / cell;
+    // Skip matching for very large charts: the O(v²) distance key would blow up, and a huge
+    // chart almost never has an exact duplicate anyway.
+    const MAX_MATCH_VERTS: usize = 256;
+    let dist_key = |v: &[Vec2]| -> Vec<i64> {
+        let mut ds = vec![v.len() as i64];
+        for i in 0..v.len() {
+            for j in (i + 1)..v.len() {
+                ds.push((v[i].distance(v[j]) * inv_cell).round() as i64);
+            }
+        }
+        ds[1..].sort_unstable();
+        ds
+    };
+
+    let mut slot_of = vec![0usize; num_charts];
+    let mut slot_sizes: Vec<Vec2> = Vec::new();
+    let mut remap: Vec<SlotRemap> = (0..num_charts).map(|c| id_remap(cmin[c])).collect();
+    // distance key → representative chart indices sharing that key (usually exactly one).
+    let mut buckets: HashMap<Vec<i64>, Vec<usize>> = HashMap::new();
+
+    for c in 0..num_charts {
+        let mut placed = false;
+        if verts[c].len() <= MAX_MATCH_VERTS {
+            let reps = buckets.entry(dist_key(&verts[c])).or_default();
+            for &rep in reps.iter() {
+                if let Some((lin, a_m, a_r)) = register(&verts[rep], &verts[c], cell) {
+                    // slot-local: lin·(p−a_m)+a_r − cmin[rep]
+                    //           = lin·p + (a_r − cmin[rep] − lin·a_m).
+                    slot_of[c] = slot_of[rep];
+                    remap[c] = SlotRemap {
+                        lin,
+                        trans: a_r - cmin[rep] - lin * a_m,
+                    };
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                reps.push(c); // new representative for this distance key
+            }
+        }
+        if !placed {
+            // Private slot, identity layout (already set in `remap`).
+            slot_of[c] = slot_sizes.len();
+            slot_sizes.push(csize[c]);
+        }
+    }
+    (slot_of, slot_sizes, remap)
+}
+
 /// The full pipeline; returns the chart id per output triangle alongside the result
 /// (used by tests). Output triangle order matches `chart_of` order.
 fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) {
@@ -590,33 +785,54 @@ fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) 
         .map(|c| (cmax[c] - cmin[c]).max(Vec2::splat(1e-6)))
         .collect();
 
-    // Choose density D so a `Medium` mesh lands near `target_atlas_px`. Total chart
-    // bbox area is the natural scale; √η accounts for packing slack (gutters + the gaps
-    // the skyline can't fill). `pack_pixels` then rescales D to fill the real atlas, so
-    // this only needs to be the right ballpark.
+    // Collapse congruent charts onto shared slots when overlap is requested. `slot_of`
+    // maps each chart to a packing slot, `slot_sizes` holds one box per slot, and `remap`
+    // re-frames a chart's local coords onto its slot representative. With overlap off this
+    // is a no-op: one slot per chart, identity remaps — the math below is unchanged.
+    let match_eps = ((max - min).length() * 1e-4).max(1e-6);
+    let (slot_of, slot_sizes, remap) = group_congruent_charts(
+        &proj,
+        &chart_of,
+        &cmin,
+        &csize,
+        num_charts,
+        match_eps,
+        opts.overlap_identical,
+    );
+
+    // Choose density D so a `Medium` mesh lands near `target_atlas_px`. Total *slot* bbox
+    // area is the natural scale (stacked charts share a slot, so they don't inflate it);
+    // √η accounts for packing slack (gutters + the gaps the skyline can't fill).
+    // `pack_pixels` then rescales D to fill the real atlas, so this only needs to be the
+    // right ballpark.
     const ETA: f32 = 0.65;
-    let a_world: f32 = csize.iter().map(|s| s.x * s.y).sum::<f32>().max(1e-6);
+    let a_world: f32 = slot_sizes.iter().map(|s| s.x * s.y).sum::<f32>().max(1e-6);
     let d_base = ETA.sqrt() * opts.target_atlas_px as f32 / a_world.sqrt();
     let d = d_base * opts.density.multiplier();
 
-    let (offsets, atlas, d, clamped) = pack_pixels(&csize, d, opts.gutter_px, opts.max_atlas);
+    let (offsets, atlas, d, clamped) = pack_pixels(&slot_sizes, d, opts.gutter_px, opts.max_atlas);
     let g = Vec2::splat(opts.gutter_px as f32);
     let inv_atlas = 1.0 / atlas as f32;
 
     let tris: Vec<_> = (0..tri_count)
         .map(|ti| {
             let c = chart_of[ti];
+            let rm = remap[c];
             let uv = proj[ti].map(|q| {
-                let mut local = (q - cmin[c]) * d;
-                // Snap each vertex to a whole texel. The chart's min corner sits at the
-                // origin and `offsets[c]`/`g` are integer pixels, so a rounded local
-                // pixel puts every vertex exactly on a texel corner and face edges land
-                // on the grid. Shared world positions project identically, so a seam
-                // edge snaps the same on both charts and stays watertight.
+                // Re-frame the chart's projected point into its slot (identity `q - cmin[c]`
+                // unless this chart is overlapped onto a representative), then scale to px.
+                let r = rm.lin * q + rm.trans;
+                let mut local = r * d;
+                // Snap each vertex to a whole texel. The slot's min corner sits at the
+                // origin and `offsets`/`g` are integer pixels, so a rounded local pixel
+                // puts every vertex exactly on a texel corner and face edges land on the
+                // grid. Shared world positions project identically, so a seam edge snaps
+                // the same on both charts and stays watertight; congruent charts re-framed
+                // onto one slot snap onto the same texels, so they overlap exactly.
                 if opts.snap_texels {
                     local = local.round();
                 }
-                let px = local + offsets[c] + g;
+                let px = local + offsets[slot_of[c]] + g;
                 px * inv_atlas
             });
             (positions[ti], normals[ti], uv)
@@ -670,11 +886,24 @@ mod tests {
     fn two_separate_quads() -> Mesh {
         let mut vertices = quad(0.0).to_vec();
         vertices.extend_from_slice(&quad(5.0)); // gap so no shared vertices/edges
+        mesh_of(vertices)
+    }
+
+    /// A split-vertex mesh (one index per vertex) from a flat vertex list.
+    fn mesh_of(vertices: Vec<Vertex>) -> Mesh {
         Mesh {
             indices: (0..vertices.len() as u32).collect(),
             vertices,
             needs_normals: false,
             needs_uvs: false,
+        }
+    }
+
+    /// Default options with the "overlap identical UVs" toggle on.
+    fn overlap_opts() -> UnwrapOptions {
+        UnwrapOptions {
+            overlap_identical: true,
+            ..Default::default()
         }
     }
 
@@ -760,6 +989,106 @@ mod tests {
             }
         }
         assert_uvs_in_unit(&r.mesh);
+    }
+
+    #[test]
+    fn overlap_stacks_identical_charts() {
+        // The exact opposite of the test above: with overlap on, the two congruent quads
+        // collapse onto the *same* slot instead of getting separate regions.
+        let opts = overlap_opts();
+        let r = auto_unwrap(&two_separate_quads(), &opts);
+        assert_uvs_in_unit(&r.mesh);
+        let bb = pixel_bboxes(&r.mesh, r.atlas_size);
+        for a in [0usize, 1] {
+            for b in [2usize, 3] {
+                assert!(
+                    !disjoint(bb[a], bb[b]),
+                    "stacked charts should overlap: {:?} {:?}",
+                    bb[a],
+                    bb[b]
+                );
+            }
+        }
+        // Corresponding triangles land on the same texels (exact overlap, not just same box).
+        assert!(
+            (bb[0].0 - bb[2].0).length() < 1.0 && (bb[0].1 - bb[2].1).length() < 1.0,
+            "quad A tri0 {:?} and quad B tri0 {:?} should coincide",
+            bb[0],
+            bb[2]
+        );
+        // Stacking two identical quads costs no more atlas than a single quad.
+        let single = auto_unwrap(&mesh_of(quad(0.0).to_vec()), &opts);
+        assert!(
+            r.atlas_size <= single.atlas_size,
+            "overlap atlas {} exceeds single-quad atlas {}",
+            r.atlas_size,
+            single.atlas_size
+        );
+    }
+
+    #[test]
+    fn overlap_collapses_cube_faces() {
+        // Every cube face is the same square, so with overlap on all six faces collapse
+        // onto one slot — every triangle's UV bbox is the same box. (Triangulation runs
+        // both diagonal directions across the faces, so this also exercises the D4
+        // rotation/reflection canonicalization.)
+        let r = auto_unwrap(&Mesh::cube(), &overlap_opts());
+        assert_uvs_in_unit(&r.mesh);
+        let bb = pixel_bboxes(&r.mesh, r.atlas_size);
+        let first = bb[0];
+        for (i, b) in bb.iter().enumerate() {
+            assert!(
+                (b.0 - first.0).length() < 1.0 && (b.1 - first.1).length() < 1.0,
+                "cube tri {i} bbox {b:?} differs from {first:?}; faces did not collapse"
+            );
+        }
+    }
+
+    #[test]
+    fn overlap_stacks_mirror_images() {
+        // Two chiral (right) triangles in the same plane, one the mirror of the other.
+        // Only a reflection maps one onto the other, so they stack *only* because D4
+        // includes reflections — without them they'd stay in separate slots.
+        let pv = |x: f32, y: f32| Vertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+        };
+        let mesh = mesh_of(vec![
+            pv(0.0, 0.0),
+            pv(2.0, 0.0),
+            pv(0.0, 1.0), // tri A (CCW, +Z)
+            pv(5.0, 0.0),
+            pv(5.0, -1.0),
+            pv(7.0, 0.0), // tri B: A mirrored across the X axis (still CCW, +Z)
+        ]);
+
+        // Off: the two mirror charts get separate, non-overlapping slots.
+        let off = auto_unwrap(&mesh, &UnwrapOptions::default());
+        let obb = pixel_bboxes(&off.mesh, off.atlas_size);
+        assert!(
+            disjoint(obb[0], obb[1]),
+            "without overlap, mirror charts must not stack: {:?} {:?}",
+            obb[0],
+            obb[1]
+        );
+
+        // On: they collapse onto the same slot.
+        let r = auto_unwrap(&mesh, &overlap_opts());
+        assert_uvs_in_unit(&r.mesh);
+        let bb = pixel_bboxes(&r.mesh, r.atlas_size);
+        assert!(
+            !disjoint(bb[0], bb[1]),
+            "mirror charts should stack: {:?} {:?}",
+            bb[0],
+            bb[1]
+        );
+        assert!(
+            (bb[0].0 - bb[1].0).length() < 1.5 && (bb[0].1 - bb[1].1).length() < 1.5,
+            "mirror charts didn't coincide: {:?} vs {:?}",
+            bb[0],
+            bb[1]
+        );
     }
 
     #[test]

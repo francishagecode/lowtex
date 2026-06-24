@@ -86,6 +86,8 @@ struct Args {
     /// density given by `--density` (low|medium|high; default medium).
     unwrap: bool,
     density: Option<String>,
+    /// With `--unwrap`: stack congruent (identical/mirrored) charts onto shared UV space.
+    overlap_uvs: bool,
     /// Headless verification: export an indexed PNG to this path (needs --quantize).
     export_indexed: Option<String>,
     /// Headless verification: fill the base layer with a material image (tiled).
@@ -136,6 +138,7 @@ fn parse_args() -> Args {
         fill_face: false,
         unwrap: false,
         density: None,
+        overlap_uvs: false,
         export_indexed: None,
         material: None,
         material_tile: 4.0,
@@ -182,6 +185,7 @@ fn parse_args() -> Args {
             "--fill-face" => args.fill_face = true,
             "--unwrap" => args.unwrap = true,
             "--density" => args.density = it.next(),
+            "--overlap-uvs" => args.overlap_uvs = true,
             "--export-indexed" => args.export_indexed = it.next(),
             "--material" => args.material = it.next(),
             "--material-tile" => {
@@ -265,7 +269,7 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
             Some("high") => unwrap::Density::High,
             _ => unwrap::Density::Medium,
         };
-        renderer.apply_unwrap(density);
+        renderer.apply_unwrap(density, args.overlap_uvs);
     }
 
     if let Some(path) = &args.material {

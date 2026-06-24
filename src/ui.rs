@@ -249,6 +249,9 @@ pub struct UiState {
     pub resolution: u32,
     /// Texel density requested for the next "Unwrap UVs" (remembers the last choice).
     pub unwrap_density: crate::unwrap::Density,
+    /// Stack congruent charts (identical/mirrored parts) onto shared UV space on the next
+    /// "Unwrap UVs". Remembers the last choice.
+    pub unwrap_overlap: bool,
     /// Whether the last unwrap had to reduce density to fit the GPU texture limit,
     /// so the resolution readout can flag it.
     pub last_atlas_clamped: bool,
@@ -331,6 +334,7 @@ impl Default for UiState {
             texture_filter: TextureFilter::default(),
             resolution: 128,
             unwrap_density: crate::unwrap::Density::default(),
+            unwrap_overlap: false,
             last_atlas_clamped: false,
             can_undo: false,
             can_redo: false,
@@ -536,6 +540,13 @@ fn menu_bar(ctx: &Context, state: &mut UiState) {
                     for d in crate::unwrap::Density::ALL {
                         ui.radio_value(&mut state.unwrap_density, d, d.name());
                     }
+                    ui.separator();
+                    ui.checkbox(&mut state.unwrap_overlap, "Overlap identical UVs")
+                        .on_hover_text(
+                            "Stack identical (and mirrored) islands onto the same texture \
+                             region: paint one, paint all. Shrinks the atlas on meshes with \
+                             repeated or symmetric parts.",
+                        );
                     if ui.button("Unwrap").clicked() {
                         state.actions.unwrap = Some(state.unwrap_density);
                         ui.close_menu();
@@ -824,7 +835,12 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.label(
-                    egui::RichText::new("LMB paint · RMB orbit · MMB pan · wheel zoom")
+                    egui::RichText::new("LMB paint · RMB+WASD fly · Alt+LMB orbit · MMB pan")
+                        .weak()
+                        .small(),
+                );
+                ui.label(
+                    egui::RichText::new("Fly: Q/E down/up · Shift faster · wheel speed")
                         .weak()
                         .small(),
                 );
