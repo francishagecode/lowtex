@@ -160,14 +160,16 @@ impl Palette {
     /// byte space — fine for chunky textures and keeps export WYSIWYG. Alpha is
     /// left untouched. `width` is needed to index the dither matrix per texel.
     pub fn quantize_rgba(&self, pixels: &mut [u8], width: u32, dither: bool, strength: f32) {
+        use rayon::prelude::*;
         if self.colors.is_empty() {
             return;
         }
-        for (i, px) in pixels.chunks_exact_mut(4).enumerate() {
+        let width = width as usize;
+        // Each texel quantizes independently (Bayer bias is a pure function of x,y),
+        // so fan the whole image out across cores.
+        pixels.par_chunks_exact_mut(4).enumerate().for_each(|(i, px)| {
             let bias = if dither {
-                let x = (i as u32 % width) as usize;
-                let y = (i as u32 / width) as usize;
-                (bayer4(x, y) - 0.5) * strength
+                (bayer4(i % width, i / width) - 0.5) * strength
             } else {
                 0.0
             };
@@ -175,7 +177,7 @@ impl Palette {
             px[0] = q[0];
             px[1] = q[1];
             px[2] = q[2];
-        }
+        });
     }
 
     /// Quantize only the texels inside `rect` of a full-size `width`-wide RGBA8 image,
@@ -190,22 +192,43 @@ impl Palette {
         dither: bool,
         strength: f32,
     ) {
+        use rayon::prelude::*;
         if self.colors.is_empty() {
             return;
         }
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                let i = ((y * width + x) * 4) as usize;
+        let width = width as usize;
+        let (x0, x1) = (rect.x0 as usize, rect.x1 as usize);
+        let (y0, y1) = (rect.y0 as usize, rect.y1 as usize);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        // Quantize in place, one task per affected row (disjoint slices). Small
+        // regions stay serial to dodge rayon's fork/join overhead.
+        let band = &mut pixels[y0 * width * 4..y1 * width * 4];
+        const PAR_MIN_TEXELS: usize = 1 << 14;
+        let quant_row = |j: usize, row: &mut [u8]| {
+            let y = y0 + j;
+            for x in x0..x1 {
+                let i = x * 4;
                 let bias = if dither {
-                    (bayer4(x as usize, y as usize) - 0.5) * strength
+                    (bayer4(x, y) - 0.5) * strength
                 } else {
                     0.0
                 };
-                let q = self.nearest_u8([pixels[i], pixels[i + 1], pixels[i + 2]], bias);
-                pixels[i] = q[0];
-                pixels[i + 1] = q[1];
-                pixels[i + 2] = q[2];
+                let q = self.nearest_u8([row[i], row[i + 1], row[i + 2]], bias);
+                row[i] = q[0];
+                row[i + 1] = q[1];
+                row[i + 2] = q[2];
             }
+        };
+        if (x1 - x0) * (y1 - y0) >= PAR_MIN_TEXELS {
+            band.par_chunks_mut(width * 4)
+                .enumerate()
+                .for_each(|(j, row)| quant_row(j, row));
+        } else {
+            band.chunks_mut(width * 4)
+                .enumerate()
+                .for_each(|(j, row)| quant_row(j, row));
         }
     }
 }

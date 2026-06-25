@@ -86,6 +86,32 @@ impl std::ops::Deref for Effected<'_> {
     }
 }
 
+/// Composite the visible layer stack at byte index `i` (into the full-texture layer
+/// buffers) and write the resulting RGBA8 texel into `out` (a 4-byte slice). The
+/// shared inner loop of `composite` and `composite_into_region`, so both stay
+/// byte-identical. `out.len()` must be 4.
+fn composite_texel(effs: &[(Effected<'_>, &[u8], f32, BlendMode)], i: usize, out: &mut [u8]) {
+    let mut acc = [0.0f32; 4]; // premultiplied-ish accumulator (0..1)
+    for (eff, mask, opacity, blend) in effs {
+        let px: &[u8] = eff;
+        // Mask (red channel) gates the layer's contribution: 0 hides, 255 reveals.
+        let m = mask[i] as f32 / 255.0;
+        let sa = (px[i + 3] as f32 / 255.0) * *opacity * m;
+        if sa <= 0.0 {
+            continue;
+        }
+        for c in 0..3 {
+            let dst = acc[c];
+            let src = blend.apply(dst, px[i + c] as f32 / 255.0);
+            acc[c] = dst * (1.0 - sa) + src * sa;
+        }
+        acc[3] = sa + acc[3] * (1.0 - sa);
+    }
+    for c in 0..4 {
+        out[c] = (acc[c].clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+}
+
 #[derive(Clone)]
 pub struct Layer {
     pub name: String,
@@ -255,6 +281,7 @@ impl Layers {
         self.layers[0].tex.width
     }
 
+    #[allow(dead_code)] // used by tests; the non-test paint path uses *_mut
     pub fn active_tex(&self) -> &Texture {
         &self.layers[self.active].tex
     }
@@ -267,6 +294,7 @@ impl Layers {
         &mut self.layers[a].tex
     }
 
+    #[allow(dead_code)] // symmetry with active_mask_mut; kept for callers/tests
     pub fn active_mask(&self) -> &Texture {
         &self.layers[self.active].mask
     }
@@ -385,38 +413,34 @@ impl Layers {
 
     /// Composite the stack bottom-up into a single RGBA8 image.
     pub fn composite(&self) -> Vec<u8> {
-        let size = self.size();
-        let count = (size * size) as usize;
-        let mut acc = vec![0.0f32; count * 4]; // premultiplied-ish accumulator (0..1)
+        use rayon::prelude::*;
+        let size = self.size() as usize;
+        // Snapshot each visible layer's effected pixels once (the effect cache stays
+        // warm), so the parallel row workers below only read shared immutable slices.
+        let effs = self.visible_effected();
 
-        for layer in &self.layers {
-            if !layer.visible || layer.opacity <= 0.0 {
-                continue;
-            }
-            // The layer's color after its non-destructive effect stack (G28).
-            let effected = layer.effected();
-            let px: &[u8] = &effected;
-            let mask = &layer.mask.pixels;
-            for t in 0..count {
-                let i = t * 4;
-                // Mask (red channel) gates the layer's contribution: 0 hides, 255
-                // reveals (G11).
-                let m = mask[i] as f32 / 255.0;
-                let sa = (px[i + 3] as f32 / 255.0) * layer.opacity * m;
-                if sa <= 0.0 {
-                    continue;
+        let mut out = vec![0u8; size * size * 4];
+        // One task per texture row — rows are disjoint, so compositing them in
+        // parallel needs no synchronization. Cost ∝ pixels / cores.
+        out.par_chunks_mut(size * 4)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..size {
+                    let i = (y * size + x) * 4;
+                    composite_texel(&effs, i, &mut row[x * 4..x * 4 + 4]);
                 }
-                for c in 0..3 {
-                    let dst = acc[i + c];
-                    let src = layer.blend.apply(dst, px[i + c] as f32 / 255.0);
-                    acc[i + c] = dst * (1.0 - sa) + src * sa;
-                }
-                acc[i + 3] = sa + acc[i + 3] * (1.0 - sa);
-            }
-        }
+            });
+        out
+    }
 
-        acc.iter()
-            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+    /// Snapshot the visible layers as `(effected pixels, mask, opacity, blend)` tuples
+    /// — one `effected()` call per layer (so the effect cache is hit at most once),
+    /// yielding immutable slices the rayon row workers can share across threads.
+    fn visible_effected(&self) -> Vec<(Effected<'_>, &[u8], f32, BlendMode)> {
+        self.layers
+            .iter()
+            .filter(|l| l.visible && l.opacity > 0.0)
+            .map(|l| (l.effected(), l.mask.pixels.as_slice(), l.opacity, l.blend))
             .collect()
     }
 
@@ -427,48 +451,37 @@ impl Layers {
     /// (over the whole layer, via `effected`), so this is cheap precisely when no
     /// effect is active — the common case while painting.
     pub fn composite_into_region(&self, out: &mut [u8], rect: TexRect) {
+        use rayon::prelude::*;
         let size = self.size() as usize;
-        let (rw, rh) = (rect.width() as usize, rect.height() as usize);
-        let mut acc = vec![0.0f32; rw * rh * 4]; // region-sized accumulator
-
-        for layer in &self.layers {
-            if !layer.visible || layer.opacity <= 0.0 {
-                continue;
-            }
-            let effected = layer.effected();
-            let px: &[u8] = &effected;
-            let mask = &layer.mask.pixels;
-            for ry in 0..rh {
-                let y = rect.y0 as usize + ry;
-                for rx in 0..rw {
-                    let x = rect.x0 as usize + rx;
-                    let i = (y * size + x) * 4;
-                    let ai = (ry * rw + rx) * 4;
-                    let m = mask[i] as f32 / 255.0;
-                    let sa = (px[i + 3] as f32 / 255.0) * layer.opacity * m;
-                    if sa <= 0.0 {
-                        continue;
-                    }
-                    for c in 0..3 {
-                        let dst = acc[ai + c];
-                        let src = layer.blend.apply(dst, px[i + c] as f32 / 255.0);
-                        acc[ai + c] = dst * (1.0 - sa) + src * sa;
-                    }
-                    acc[ai + 3] = sa + acc[ai + 3] * (1.0 - sa);
-                }
-            }
+        let (x0, x1) = (rect.x0 as usize, rect.x1 as usize);
+        let (y0, y1) = (rect.y0 as usize, rect.y1 as usize);
+        if x1 <= x0 || y1 <= y0 {
+            return;
         }
+        let effs = self.visible_effected();
 
-        for ry in 0..rh {
-            let y = rect.y0 as usize + ry;
-            for rx in 0..rw {
-                let x = rect.x0 as usize + rx;
-                let oi = (y * size + x) * 4;
-                let ai = (ry * rw + rx) * 4;
-                for c in 0..4 {
-                    out[oi + c] = (acc[ai + c].clamp(0.0, 1.0) * 255.0).round() as u8;
-                }
+        // Composite straight into `out`, one task per affected texture row. The rows
+        // are disjoint mutable slices, so no synchronization is needed; only the
+        // region's rows are visited, leaving the rest of `out` untouched (the
+        // dirty-rectangle contract). Small regions stay serial — rayon's fork/join
+        // overhead would dominate a sub-128² brush footprint.
+        let band = &mut out[y0 * size * 4..y1 * size * 4];
+        const PAR_MIN_TEXELS: usize = 1 << 14; // ~128×128
+        let composite_row = |j: usize, row: &mut [u8]| {
+            let y = y0 + j;
+            for x in x0..x1 {
+                let i = (y * size + x) * 4;
+                composite_texel(&effs, i, &mut row[x * 4..x * 4 + 4]);
             }
+        };
+        if (x1 - x0) * (y1 - y0) >= PAR_MIN_TEXELS {
+            band.par_chunks_mut(size * 4)
+                .enumerate()
+                .for_each(|(j, row)| composite_row(j, row));
+        } else {
+            band.chunks_mut(size * 4)
+                .enumerate()
+                .for_each(|(j, row)| composite_row(j, row));
         }
     }
 }

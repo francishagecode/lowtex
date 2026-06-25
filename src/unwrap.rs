@@ -105,6 +105,13 @@ pub struct UnwrapOptions {
     /// the rectify normalization, which is forced on whenever this is set. See
     /// `group_congruent_charts`.
     pub overlap_identical: bool,
+    /// Exact texels-per-world-unit to unwrap at, if the caller wants to pin the
+    /// density numerically (e.g. "128 texels per meter") rather than let `density`
+    /// pick it. When `Some`, the atlas is sized to *hold* the charts at this density
+    /// (rounded up to a power of two) instead of being filled — so the achieved
+    /// `density_d` equals this value, except when it would overflow `max_atlas`, in
+    /// which case it's trimmed and `clamped` is set. `None` uses the preset path.
+    pub target_density: Option<f32>,
 }
 
 impl Default for UnwrapOptions {
@@ -121,6 +128,7 @@ impl Default for UnwrapOptions {
             target_atlas_px: 128,
             snap_texels: true,
             overlap_identical: false,
+            target_density: None,
         }
     }
 }
@@ -489,6 +497,7 @@ fn pack_pixels(
     d: f32,
     gutter_px: u32,
     max_atlas: u32,
+    fill: bool,
 ) -> (Vec<Vec2>, u32, f32, bool) {
     if csize.is_empty() {
         return (Vec::new(), 8, d, false);
@@ -510,18 +519,22 @@ fn pack_pixels(
     // power-of-two slack blank: since we're paying for the texture either way, spend
     // the leftover room on more (still uniform) texels. The same loop shrinks density
     // when the content is too big for the GPU max. Fixed-pixel gutters make this
-    // non-linear, so we re-pack and converge (toward the atlas from below).
+    // non-linear, so we re-pack and converge (toward the atlas from below). Skipped
+    // when `fill` is off (an exact target density): the slack stays blank so the
+    // density isn't stretched away from what the caller asked for.
     let mut d = d;
-    for _ in 0..8 {
-        let cur = w.max(h).max(1.0);
-        if (atlas as f32 / cur - 1.0).abs() < 0.01 {
-            break;
+    if fill {
+        for _ in 0..8 {
+            let cur = w.max(h).max(1.0);
+            if (atlas as f32 / cur - 1.0).abs() < 0.01 {
+                break;
+            }
+            d *= atlas as f32 / cur;
+            let r = skyline_pack(csize, d, gutter_px);
+            offsets = r.0;
+            w = r.1;
+            h = r.2;
         }
-        d *= atlas as f32 / cur;
-        let r = skyline_pack(csize, d, gutter_px);
-        offsets = r.0;
-        w = r.1;
-        h = r.2;
     }
     // Never exceed the atlas (keep UVs ≤ 1) — trim density if a re-pack overshot.
     let mut guard = 0;
@@ -808,9 +821,16 @@ fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) 
     const ETA: f32 = 0.65;
     let a_world: f32 = slot_sizes.iter().map(|s| s.x * s.y).sum::<f32>().max(1e-6);
     let d_base = ETA.sqrt() * opts.target_atlas_px as f32 / a_world.sqrt();
-    let d = d_base * opts.density.multiplier();
+    // An explicit `target_density` pins texels-per-world-unit exactly, so the atlas is
+    // sized to hold the charts at it rather than stretched to fill (which would change
+    // the density). The preset path keeps the fill-to-atlas behaviour for sharpness.
+    let (d, fill) = match opts.target_density {
+        Some(td) if td > 0.0 => (td, false),
+        _ => (d_base * opts.density.multiplier(), true),
+    };
 
-    let (offsets, atlas, d, clamped) = pack_pixels(&slot_sizes, d, opts.gutter_px, opts.max_atlas);
+    let (offsets, atlas, d, clamped) =
+        pack_pixels(&slot_sizes, d, opts.gutter_px, opts.max_atlas, fill);
     let g = Vec2::splat(opts.gutter_px as f32);
     let inv_atlas = 1.0 / atlas as f32;
 
@@ -1145,6 +1165,42 @@ mod tests {
         let r = auto_unwrap(&Mesh::cube(), &opts);
         assert!(r.atlas_size <= 64, "atlas {} exceeded max", r.atlas_size);
         assert!(r.clamped, "expected density to be clamped");
+        assert_uvs_in_unit(&r.mesh);
+    }
+
+    #[test]
+    fn explicit_density_is_honored_exactly() {
+        // Pinning texels-per-world-unit must yield exactly that density: the atlas is
+        // sized to hold the charts rather than stretched to fill, so unlike the preset
+        // path the request isn't rescaled away.
+        let opts = UnwrapOptions {
+            target_density: Some(50.0),
+            ..Default::default()
+        };
+        let r = auto_unwrap(&Mesh::cube(), &opts);
+        assert!(!r.clamped, "50 texels/unit should fit the default max atlas");
+        assert!(
+            (r.density_d - 50.0).abs() < 1e-3,
+            "explicit density {} != requested 50",
+            r.density_d
+        );
+        assert!(r.atlas_size.is_power_of_two(), "atlas not a power of two");
+        assert_uvs_in_unit(&r.mesh);
+    }
+
+    #[test]
+    fn explicit_density_clamps_when_too_dense() {
+        // A density that would overflow the GPU limit is trimmed (and flagged), never
+        // exceeding the atlas cap.
+        let opts = UnwrapOptions {
+            target_density: Some(100_000.0),
+            max_atlas: 64,
+            ..Default::default()
+        };
+        let r = auto_unwrap(&Mesh::cube(), &opts);
+        assert!(r.clamped, "an impossible density should clamp");
+        assert!(r.atlas_size <= 64, "atlas {} exceeded max", r.atlas_size);
+        assert!(r.density_d < 100_000.0, "clamped density not reduced");
         assert_uvs_in_unit(&r.mesh);
     }
 

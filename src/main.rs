@@ -28,6 +28,7 @@ mod model;
 mod noise;
 mod paint;
 mod palette;
+mod perf;
 mod preset;
 mod project;
 mod renderer;
@@ -243,7 +244,11 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // On-demand rendering: sleep until an event (or a scheduled egui repaint) wakes
+    // us, instead of busy-polling and re-rendering every frame. `App::about_to_wait`
+    // updates the wait deadline each turn. Poll re-rendered a full frame every vsync
+    // even when idle, which pegged the GPU/CPU on Windows (DX12).
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = app::App::new(mesh);
     event_loop.run_app(&mut app).expect("event loop error");

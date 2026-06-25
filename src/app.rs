@@ -17,62 +17,24 @@ use egui::ViewportId;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::ActiveEventLoop,
+    event_loop::{ActiveEventLoop, ControlFlow},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowId},
 };
 
 use crate::mesh::Mesh;
-use crate::paint::Brush;
 use crate::renderer::{Renderer, UiPaint};
-use crate::tablet::Tablet;
 use crate::ui::{self, UiState};
 
-/// What the current mouse drag is doing (game-engine bindings). LMB paints;
-/// Alt+LMB orbits the model; RMB flies (mouse-look in place, WASD to move); MMB
-/// pans — so camera control and painting never fight over the same button.
+/// What the current mouse drag is doing. LMB paints; RMB orbits; MMB pans — so
+/// camera control and painting never fight over the same button.
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
     None,
     Paint,
     Orbit,
     Pan,
-    Fly,
 }
-
-/// Held state of the WASD/QE fly keys plus the Shift sprint, updated on key
-/// press/release. Applied per frame while the RMB fly drag is active.
-#[derive(Default)]
-struct FlyKeys {
-    forward: bool, // W
-    back: bool,    // S
-    left: bool,    // A
-    right: bool,   // D
-    up: bool,      // E
-    down: bool,    // Q
-    fast: bool,    // Shift
-}
-
-impl FlyKeys {
-    /// Whether any directional key is down (sprint alone doesn't move).
-    fn any(&self) -> bool {
-        self.forward || self.back || self.left || self.right || self.up || self.down
-    }
-
-    /// Drop all held keys — used when the fly drag ends or focus is lost, so a
-    /// key whose release we never saw can't keep the camera drifting.
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-}
-
-/// Fly speed in world units per second, the multiplier Shift applies, and the
-/// clamp the mouse-wheel speed adjustment stays within. The default suits the
-/// roughly unit-sized sample meshes; the wheel scales it while flying.
-const FLY_SPEED_DEFAULT: f32 = 2.5;
-const FLY_SPRINT: f32 = 4.0;
-const FLY_SPEED_MIN: f32 = 0.2;
-const FLY_SPEED_MAX: f32 = 40.0;
 
 /// How often a timed autosave fires, and how many rolling version files it keeps
 /// (G31). At PSX texture sizes each version is a few hundred KB, so a ring of ten
@@ -96,14 +58,6 @@ pub struct App {
     /// Latest keyboard modifier state, tracked for the undo/redo shortcuts.
     modifiers: ModifiersState,
 
-    /// Game-engine fly navigation: which WASD/QE keys are held, the current fly
-    /// speed (wheel-adjustable, units/sec), and the clock used to make movement
-    /// frame-rate independent. Movement is applied each `about_to_wait` while the
-    /// RMB fly drag is active.
-    fly_keys: FlyKeys,
-    fly_speed: f32,
-    last_frame: Instant,
-
     /// Save/exit/autosave state (G31). `project_path` is the `.lowtex` file the user
     /// is editing — `None` until they save or open one; quicksave writes here.
     /// `last_autosave` paces the timed recovery write; `autosave_counter` cycles the
@@ -123,10 +77,12 @@ pub struct App {
     /// Persistent app settings (e.g. the last texture folder), saved across launches.
     config: crate::config::Config,
 
-    /// Pen-tablet pressure source. On macOS this taps NSEvent for stylus pressure;
-    /// elsewhere it's a stub that reports full pressure. Read per dab to scale the
-    /// brush via [`Brush::with_pressure`].
-    tablet: Tablet,
+    /// On-demand rendering: the next time egui has asked to repaint itself (a
+    /// running animation, a blinking text cursor, a hover fade). `None` means the
+    /// UI is static and the loop can sleep until the next input event. We never
+    /// redraw on a fixed cadence — that idle full-frame loop pegged the GPU/CPU on
+    /// Windows.
+    repaint_at: Option<Instant>,
 }
 
 impl App {
@@ -152,9 +108,6 @@ impl App {
             last_pos: (0.0, 0.0),
             drag: Drag::None,
             modifiers: ModifiersState::empty(),
-            fly_keys: FlyKeys::default(),
-            fly_speed: FLY_SPEED_DEFAULT,
-            last_frame: Instant::now(),
             project_path: None,
             last_autosave: Instant::now(),
             autosave_counter: 0,
@@ -162,20 +115,8 @@ impl App {
             pending_quicksave: false,
             pending_save_as: false,
             config,
-            tablet: Tablet::new(),
+            repaint_at: None,
         }
-    }
-
-    /// The current brush with pen pressure folded in, per the UI's pressure toggles.
-    /// Used for every painting stroke; a plain mouse reports full pressure so this
-    /// is identical to `self.ui.brush` without a pen.
-    fn pressured_brush(&self) -> Brush {
-        self.ui.brush.with_pressure(
-            self.tablet.latest(),
-            self.ui.pressure_size,
-            self.ui.pressure_opacity,
-            self.ui.pen_min_size,
-        )
     }
 
     /// Run egui for this frame and render the scene + overlay.
@@ -221,6 +162,22 @@ impl App {
         let full_output = self
             .egui_ctx
             .run(raw_input, |ctx| ui::build(ctx, &mut self.ui));
+
+        // On-demand rendering: schedule the next frame only when egui asks for one.
+        // A zero delay means "keep animating" (draw again next turn); a finite delay
+        // (e.g. the text-cursor blink) becomes a timed wake; the steady-state
+        // Duration::MAX leaves the loop asleep until the next input event.
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay);
+        self.repaint_at = if repaint_delay.is_zero() {
+            window.request_redraw();
+            None
+        } else {
+            Instant::now().checked_add(repaint_delay)
+        };
+
         self.egui_state
             .as_mut()
             .unwrap()
@@ -245,8 +202,6 @@ impl App {
     /// Apply this frame's UI requests (file dialogs, resolution change). Runs
     /// outside the egui closure so native dialogs can block safely.
     fn handle_ui_actions(&mut self) {
-        // Fold pen pressure in now, before `renderer` takes a mutable borrow of self.
-        let pressured = self.pressured_brush();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -320,7 +275,7 @@ impl App {
             match *ev {
                 crate::ui::UvEvent::Begin => renderer.begin_stroke(),
                 crate::ui::UvEvent::Segment { from, to } => {
-                    renderer.paint_uv_segment(from, to, &pressured)
+                    renderer.paint_uv_segment(from, to, &self.ui.brush)
                 }
                 crate::ui::UvEvent::End => renderer.end_stroke(),
             }
@@ -403,16 +358,43 @@ impl App {
             }
         }
         if let Some(density) = actions.unwrap {
-            let (atlas, clamped) = renderer.apply_unwrap(density, self.ui.unwrap_overlap);
+            let (atlas, clamped, d) = renderer.apply_unwrap(density, self.ui.unwrap_overlap);
             self.ui.last_atlas_clamped = clamped;
+            self.ui.last_density_d = d;
             log::info!(
-                "unwrapped → {atlas}×{atlas}{}",
+                "unwrapped → {atlas}×{atlas} at {d:.1} texels/unit{}",
                 if clamped {
                     " (density clamped to GPU max)"
                 } else {
                     ""
                 }
             );
+        }
+        if let Some(texels_per_m) = actions.unwrap_at_density {
+            let (atlas, clamped, d) =
+                renderer.apply_unwrap_at_density(texels_per_m, self.ui.unwrap_overlap);
+            self.ui.last_atlas_clamped = clamped;
+            self.ui.last_density_d = d;
+            log::info!(
+                "unwrapped → {atlas}×{atlas} at {d:.1} texels/unit{}",
+                if clamped {
+                    " (density clamped to GPU max)"
+                } else {
+                    ""
+                }
+            );
+        }
+        if let Some(size) = actions.set_resolution {
+            // Manual override of the unwrap-derived size; resamples the paint into it.
+            // UVs are unchanged, so texels-per-unit scales with the atlas size — keep
+            // the readout honest by scaling it (using the actually-applied, clamped size).
+            let old = renderer.texture_resolution();
+            renderer.set_texture_resolution(size);
+            let new = renderer.texture_resolution();
+            if old > 0 {
+                self.ui.last_density_d *= new as f32 / old as f32;
+            }
+            log::info!("texture resolution → {new}×{new}");
         }
         if let Some(tile) = actions.fill_material {
             if let Some(path) = rfd::FileDialog::new()
@@ -493,18 +475,6 @@ impl App {
                     Ok(()) => {
                         log::info!("exported {} — {}", path.display(), preset.import_hint())
                     }
-                    Err(e) => log::error!("{e}"),
-                }
-            }
-        }
-        if actions.export_obj {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_file_name("model.obj")
-                .add_filter("OBJ", &["obj"])
-                .save_file()
-            {
-                match renderer.export_obj(&path.to_string_lossy()) {
-                    Ok(()) => log::info!("exported mesh {}", path.display()),
                     Err(e) => log::error!("{e}"),
                 }
             }
@@ -879,13 +849,15 @@ impl ApplicationHandler for App {
             None,
         );
 
-        // Tap the platform pen-pressure source now the app is up (no-op off macOS,
-        // and idempotent if `resumed` fires again).
-        self.tablet.install();
-
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.egui_state = Some(egui_state);
+
+        // Paint the first frame. Under on-demand rendering nothing else requests it
+        // until the user interacts, so the window would otherwise come up blank.
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
     }
 
     fn window_event(
@@ -899,11 +871,17 @@ impl ApplicationHandler for App {
         };
 
         // Feed every event to egui first; remember whether it claimed the event.
-        let egui_consumed = self
+        // `repaint` tells us egui itself needs to redraw (a slider drag, a hover
+        // fade, a focused widget) — under on-demand rendering nothing else would
+        // request that frame, so honor it here.
+        let egui_response = self
             .egui_state
             .as_mut()
-            .map(|s| s.on_window_event(&window, &event).consumed)
-            .unwrap_or(false);
+            .map(|s| s.on_window_event(&window, &event));
+        let egui_consumed = egui_response.as_ref().map_or(false, |r| r.consumed);
+        if egui_response.map_or(false, |r| r.repaint) {
+            window.request_redraw();
+        }
 
         // These need &mut self wholly, so handle them before borrowing renderer.
         match &event {
@@ -922,9 +900,6 @@ impl ApplicationHandler for App {
             _ => {}
         }
 
-        // Fold pen pressure in now (the tablet monitor has already recorded this
-        // event's pressure), before `renderer` takes a mutable borrow of self.
-        let pressured = self.pressured_brush();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -944,7 +919,7 @@ impl ApplicationHandler for App {
                 match self.drag {
                     Drag::Paint => {
                         // Interpolate from the previous sample so fast drags stay solid.
-                        renderer.paint_segment(prev, pos, &pressured);
+                        renderer.paint_segment(prev, pos, &self.ui.brush);
                         window.request_redraw();
                     }
                     Drag::Orbit => {
@@ -953,12 +928,6 @@ impl ApplicationHandler for App {
                     }
                     Drag::Pan => {
                         renderer.pan_camera(dx, dy);
-                        window.request_redraw();
-                    }
-                    Drag::Fly => {
-                        // Mouse-look in place (FPS yaw/pitch); WASD translation is
-                        // applied per frame in about_to_wait.
-                        renderer.look_camera(dx, dy);
                         window.request_redraw();
                     }
                     Drag::None => {}
@@ -974,12 +943,6 @@ impl ApplicationHandler for App {
                 }
                 match (button, pressed) {
                     (MouseButton::Left, true) => {
-                        // Alt+LMB orbits the model (game-engine convention), instead
-                        // of painting or hitting the compass.
-                        if self.modifiers.alt_key() {
-                            self.drag = Drag::Orbit;
-                            return;
-                        }
                         // A click on the orientation compass snaps the view down that
                         // axis instead of painting the mesh behind the gizmo.
                         if renderer.click_compass(self.mouse_pos) {
@@ -992,7 +955,7 @@ impl ApplicationHandler for App {
                             crate::ui::Tool::Brush => {
                                 self.drag = Drag::Paint;
                                 renderer.begin_stroke();
-                                renderer.paint_at(self.mouse_pos, &pressured);
+                                renderer.paint_at(self.mouse_pos, &self.ui.brush);
                             }
                             crate::ui::Tool::FillFace => {
                                 renderer.fill_face_at(self.mouse_pos, &self.ui.brush);
@@ -1006,16 +969,11 @@ impl ApplicationHandler for App {
                         }
                         window.request_redraw();
                     }
-                    (MouseButton::Right, true) => self.drag = Drag::Fly,
+                    (MouseButton::Right, true) => self.drag = Drag::Orbit,
                     (MouseButton::Middle, true) => self.drag = Drag::Pan,
                     (_, false) => {
                         if self.drag == Drag::Paint {
                             renderer.end_stroke();
-                        }
-                        // Leaving fly: drop held WASD/QE so the camera stops dead and
-                        // no key whose release we missed keeps it drifting.
-                        if self.drag == Drag::Fly {
-                            self.fly_keys.clear();
                         }
                         self.drag = Drag::None;
                     }
@@ -1028,41 +986,14 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event: key, .. } => {
-                // Let egui claim keys first (e.g. typing in a focused widget); only
-                // then do viewport shortcuts and fly navigation fire.
-                if egui_consumed {
+                // Let egui claim keys first (e.g. a focused widget); only then do
+                // viewport shortcuts fire. Ctrl/⌘+Z undo, Ctrl/⌘+Shift+Z or
+                // Ctrl/⌘+Y redo. Super covers macOS's Cmd.
+                if egui_consumed || key.state != ElementState::Pressed {
                     return;
                 }
                 let cmd = self.modifiers.control_key() || self.modifiers.super_key();
-
-                // Fly-navigation keys (no Ctrl/Cmd, so they don't shadow ⌘+S etc.):
-                // track WASD/QE + Shift sprint on both press and release for
-                // continuous movement, applied per frame in about_to_wait while the
-                // RMB fly drag is active. Returns so they never reach the shortcuts.
                 if !cmd {
-                    if let PhysicalKey::Code(code) = key.physical_key {
-                        let down = key.state == ElementState::Pressed;
-                        let handled = match code {
-                            KeyCode::KeyW => set(&mut self.fly_keys.forward, down),
-                            KeyCode::KeyS => set(&mut self.fly_keys.back, down),
-                            KeyCode::KeyA => set(&mut self.fly_keys.left, down),
-                            KeyCode::KeyD => set(&mut self.fly_keys.right, down),
-                            KeyCode::KeyE => set(&mut self.fly_keys.up, down),
-                            KeyCode::KeyQ => set(&mut self.fly_keys.down, down),
-                            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                                set(&mut self.fly_keys.fast, down)
-                            }
-                            _ => false,
-                        };
-                        if handled {
-                            return;
-                        }
-                    }
-                }
-
-                // Command shortcuts (press only): Ctrl/⌘+Z undo, Ctrl/⌘+Shift+Z or
-                // Ctrl/⌘+Y redo, Ctrl/⌘+S save. Super covers macOS's Cmd.
-                if key.state != ElementState::Pressed || !cmd {
                     return;
                 }
                 let shift = self.modifiers.shift_key();
@@ -1102,25 +1033,8 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05,
                 };
-                if self.drag == Drag::Fly {
-                    // While flying, the wheel tunes movement speed (game-engine
-                    // convention) rather than dollying the view.
-                    let factor = (1.0 + amount * 0.1).clamp(0.2, 5.0);
-                    self.fly_speed = (self.fly_speed * factor).clamp(FLY_SPEED_MIN, FLY_SPEED_MAX);
-                } else {
-                    renderer.zoom_camera(amount);
-                }
+                renderer.zoom_camera(amount);
                 window.request_redraw();
-            }
-
-            // Dropping focus (e.g. Alt+Tab) can swallow the key-release events, so
-            // forget any held fly keys and end a fly drag — otherwise the camera
-            // would keep gliding after the window comes back.
-            WindowEvent::Focused(false) => {
-                self.fly_keys.clear();
-                if self.drag == Drag::Fly {
-                    self.drag = Drag::None;
-                }
             }
 
             WindowEvent::RedrawRequested => self.redraw(),
@@ -1129,41 +1043,37 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Timed recovery write (G31): cheap clock check most wakes, a save only when
         // the interval has elapsed and the document actually changed.
         self.maybe_autosave();
 
-        // Advance the per-frame clock every wake (the loop polls continuously), and
-        // apply WASD/QE fly movement while the RMB fly drag is active. Scaling by dt
-        // keeps the speed frame-rate independent; the cap stops a stall from
-        // lurching the camera across the scene on the first frame back.
-        let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
-        self.last_frame = now;
-        if self.drag == Drag::Fly && self.fly_keys.any() {
-            if let Some(renderer) = self.renderer.as_mut() {
-                let speed = self.fly_speed * if self.fly_keys.fast { FLY_SPRINT } else { 1.0 };
-                let step = speed * dt;
-                let axis = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32 * step;
-                let forward = axis(self.fly_keys.forward, self.fly_keys.back);
-                let right = axis(self.fly_keys.right, self.fly_keys.left);
-                let up = axis(self.fly_keys.up, self.fly_keys.down);
-                renderer.fly_camera(forward, right, up);
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        // On-demand rendering. The loop sleeps (ControlFlow::WaitUntil) until there
+        // is a reason to wake, rather than rendering a full frame every vsync
+        // forever — that idle redraw loop is what pegged the GPU/CPU on Windows.
+        // Input handlers and `redraw()` request the frames that reflect real
+        // changes; here we only fire a due egui repaint and pick the next wake.
+        if let Some(deadline) = self.repaint_at {
+            if Instant::now() >= deadline {
+                self.repaint_at = None;
+                window.request_redraw();
             }
         }
 
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
-        }
+        // Wake at worst at the next autosave check, so idle-but-unsaved work still
+        // gets a recovery write without a busy loop (AUTOSAVE_INTERVAL is minutes,
+        // so this idle wake costs nothing).
+        let autosave_at = self.last_autosave + AUTOSAVE_INTERVAL;
+        let wake = match self.repaint_at {
+            Some(repaint) => repaint.min(autosave_at),
+            None => autosave_at,
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
-}
-
-/// Write `v` into a fly-key slot and report that the key was one we handle, so the
-/// keyboard match can both record the state and short-circuit in one arm.
-fn set(slot: &mut bool, v: bool) -> bool {
-    *slot = v;
-    true
 }
 
 /// Scan `dir` for image files and stage a small thumbnail for each, for the brush/

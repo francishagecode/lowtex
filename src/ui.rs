@@ -135,9 +135,6 @@ pub struct UiActions {
     pub apply_gradient: Option<(MapSource, Levels, [f32; 3], [f32; 3], Option<NoiseMod>)>,
     /// Export the texture (G23): `true` = true indexed PNG, `false` = RGBA8.
     pub export_png: Option<bool>,
-    /// Export the unwrapped mesh (positions + the new UVs) as a Wavefront OBJ, so the
-    /// painted texture has geometry to map onto outside lowtex.
-    pub export_obj: bool,
     /// Fill the active layer with a chosen material image, tiled this many times.
     pub fill_material: Option<f32>,
     /// Load an image for the brush to paint with (UV-tiled) instead of solid color.
@@ -152,6 +149,14 @@ pub struct UiActions {
     /// Re-unwrap the mesh's UVs at the chosen texel density (the atlas size is
     /// derived from it). Carries the density the user picked.
     pub unwrap: Option<crate::unwrap::Density>,
+    /// Set the paint texture resolution directly, resampling the existing paint into
+    /// it. Carries the square size in texels. Overrides the unwrap-derived size until
+    /// the next unwrap (a manual choice the user made in the Texture section).
+    pub set_resolution: Option<u32>,
+    /// Re-unwrap at an exact texel density (carries texels-per-world-unit, i.e. per
+    /// meter). Unlike `unwrap`, the atlas is sized to hold the mesh at this density
+    /// rather than filling a preset-sized atlas.
+    pub unwrap_at_density: Option<f32>,
     /// Paint events from the 2D UV editor this frame, in order. Replayed onto the
     /// renderer's `paint_uv_*` path by the App. Empty when the panel is closed or idle.
     pub uv_strokes: Vec<UvEvent>,
@@ -206,14 +211,6 @@ pub struct UiState {
     /// Face lock: when on, each dab stays inside the flat face it lands on instead
     /// of wrapping across an edge onto a neighbouring face.
     pub lock_face: bool,
-    /// Pen-tablet pressure mapping: when on, a pressure-sensitive stylus scales the
-    /// brush radius (`pressure_size`) and/or per-dab opacity (`pressure_opacity`).
-    /// A plain mouse reports full pressure, so these are no-ops without a pen.
-    /// `pen_min_size` is the radius fraction at zero pressure, so a light touch
-    /// still leaves a visible mark rather than vanishing to nothing.
-    pub pressure_size: bool,
-    pub pressure_opacity: bool,
-    pub pen_min_size: f32,
     /// Levels controls shared by every mesh effect: overall strength, mid-tone
     /// contrast, and invert. `effect_source` is which baked channel the generic
     /// "Tint layer" / "Mask layer" actions read from.
@@ -252,6 +249,12 @@ pub struct UiState {
     /// Stack congruent charts (identical/mirrored parts) onto shared UV space on the next
     /// "Unwrap UVs". Remembers the last choice.
     pub unwrap_overlap: bool,
+    /// Texels-per-world-unit (per meter) for the "Unwrap at density" action — an exact
+    /// density the user types, as an alternative to the Low/Medium/High presets.
+    pub unwrap_texels_per_m: f32,
+    /// Achieved texels-per-world-unit from the last unwrap (0 before any), shown in the
+    /// Texture readout so the user can confirm a requested density took effect.
+    pub last_density_d: f32,
     /// Whether the last unwrap had to reduce density to fit the GPU texture limit,
     /// so the resolution readout can flag it.
     pub last_atlas_clamped: bool,
@@ -312,9 +315,6 @@ impl Default for UiState {
             brush_folder_entries: Vec::new(),
             symmetry_on: false,
             lock_face: false,
-            pressure_size: true,
-            pressure_opacity: false,
-            pen_min_size: 0.1,
             symmetry_axis: SymmetryAxis::X,
             ao_strength: 0.75,
             effect_contrast: 0.0,
@@ -335,6 +335,8 @@ impl Default for UiState {
             resolution: 128,
             unwrap_density: crate::unwrap::Density::default(),
             unwrap_overlap: false,
+            unwrap_texels_per_m: 128.0,
+            last_density_d: 0.0,
             last_atlas_clamped: false,
             can_undo: false,
             can_redo: false,
@@ -480,14 +482,6 @@ fn menu_bar(ctx: &Context, state: &mut UiState) {
                     state.actions.export_png = Some(false);
                     ui.close_menu();
                 }
-                if ui
-                    .button("Export mesh (.obj)…")
-                    .on_hover_text("The unwrapped geometry + new UVs — pair it with the exported texture")
-                    .clicked()
-                {
-                    state.actions.export_obj = true;
-                    ui.close_menu();
-                }
                 ui.separator();
                 if ui
                     .button("Save project")
@@ -535,8 +529,9 @@ fn menu_bar(ctx: &Context, state: &mut UiState) {
                             .weak()
                             .small(),
                     );
-                    // Density only scales the texels-per-world-unit (and the derived
-                    // texture size); the constant-density invariant holds either way.
+                    // Preset density only scales the texels-per-world-unit (and the
+                    // derived texture size); the constant-density invariant holds either
+                    // way. The atlas is then filled for max sharpness.
                     for d in crate::unwrap::Density::ALL {
                         ui.radio_value(&mut state.unwrap_density, d, d.name());
                     }
@@ -547,8 +542,35 @@ fn menu_bar(ctx: &Context, state: &mut UiState) {
                              region: paint one, paint all. Shrinks the atlas on meshes with \
                              repeated or symmetric parts.",
                         );
-                    if ui.button("Unwrap").clicked() {
+                    if ui.button("Unwrap (preset)").clicked() {
                         state.actions.unwrap = Some(state.unwrap_density);
+                        ui.close_menu();
+                    }
+
+                    // Exact density: pin texels-per-world-unit numerically instead of a
+                    // preset. The atlas is sized to hold the mesh at this density rather
+                    // than filled, so e.g. 128 means 128 texels span one world unit.
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Or set an exact density")
+                            .weak()
+                            .small(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut state.unwrap_texels_per_m)
+                                .speed(1.0)
+                                .range(1.0..=4096.0),
+                        )
+                        .on_hover_text(
+                            "Texels per world unit (per meter): how many texels span one \
+                             unit of the model. The atlas is sized to fit the mesh at this \
+                             density.",
+                        );
+                        ui.label("texels / m");
+                    });
+                    if ui.button("Unwrap at this density").clicked() {
+                        state.actions.unwrap_at_density = Some(state.unwrap_texels_per_m);
                         ui.close_menu();
                     }
                 });
@@ -644,25 +666,21 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 let brush_active = matches!(state.tool, Tool::Brush);
                 if brush_active {
                     ui.add_space(2.0);
-                    ui.add(egui::Slider::new(&mut state.brush.radius, 1.0..=32.0).text("Size"));
+                    // Radius is in texels, so the useful max scales with the texture: at
+                    // least 256 (enough for the PSX sizes), and up to the full resolution
+                    // for the larger atlases the texture/density controls now allow. A
+                    // dab bigger than the texture just clamps to its bounds. Logarithmic
+                    // so the small radii you paint with most keep fine control.
+                    let brush_max = (state.resolution as f32).max(256.0);
+                    ui.add(
+                        egui::Slider::new(&mut state.brush.radius, 1.0..=brush_max)
+                            .logarithmic(true)
+                            .text("Size"),
+                    );
                     ui.add(egui::Slider::new(&mut state.brush.opacity, 0.0..=1.0).text("Opacity"));
                     ui.add(
                         egui::Slider::new(&mut state.brush.hardness, 0.0..=1.0).text("Hardness"),
                     );
-
-                    // Pen pressure: a pressure-sensitive stylus can drive the brush
-                    // size and/or opacity. A plain mouse reports full pressure, so
-                    // these do nothing without a pen — safe to leave Size on.
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut state.pressure_size, "Pressure → Size")
-                            .on_hover_text(
-                                "Stylus pressure scales the brush size (needs a pen tablet)",
-                            );
-                        ui.checkbox(&mut state.pressure_opacity, "Opacity")
-                            .on_hover_text(
-                                "Stylus pressure scales per-dab opacity (needs a pen tablet)",
-                            );
-                    });
 
                     // Eraser: the same brush, but it removes paint (lowers alpha toward
                     // transparent) instead of laying the swatch color, revealing whatever
@@ -835,12 +853,7 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.label(
-                    egui::RichText::new("LMB paint · RMB+WASD fly · Alt+LMB orbit · MMB pan")
-                        .weak()
-                        .small(),
-                );
-                ui.label(
-                    egui::RichText::new("Fly: Q/E down/up · Shift faster · wheel speed")
+                    egui::RichText::new("LMB paint · RMB orbit · MMB pan · wheel zoom")
                         .weak()
                         .small(),
                 );
@@ -1457,15 +1470,38 @@ fn material_section(ui: &mut egui::Ui, state: &mut UiState) {
 /// open/save/export *actions* themselves live in the File menu; this section holds
 /// only the persistent settings they read.
 fn export_section(ui: &mut egui::Ui, state: &mut UiState) {
-    // Resolution is derived by the unwrap (Mesh → Unwrap UVs) to hold a constant
-    // world-space texel size, so it's shown read-only here rather than picked.
-    ui.label(format!("Texture: {0}×{0}", state.resolution));
+    // The unwrap (Mesh → Unwrap UVs) derives this to hold a constant world-space
+    // texel size, but it can be overridden here — handy for a loaded OBJ whose
+    // unwrap-chosen size isn't what you want. Picking a size resamples the existing
+    // paint into it (undoable); the next unwrap reasserts the density-derived size.
+    const SIZES: [u32; 9] = [32, 64, 128, 256, 512, 1024, 2048, 3072, 4096];
+    egui::ComboBox::from_label("Texture")
+        .selected_text(format!("{0}×{0}", state.resolution))
+        .show_ui(ui, |ui| {
+            for size in SIZES {
+                if ui
+                    .selectable_label(size == state.resolution, format!("{size}×{size}"))
+                    .clicked()
+                {
+                    state.actions.set_resolution = Some(size);
+                }
+            }
+        });
     let hint = if state.last_atlas_clamped {
-        "Set by Unwrap density (clamped to GPU max)"
+        "Unwrap sets this (clamped to GPU max); override above"
     } else {
-        "Set by Unwrap density"
+        "Unwrap sets this; override above"
     };
     ui.label(egui::RichText::new(hint).weak().small());
+    // Achieved texel density from the last unwrap, so a requested "N texels/m" can be
+    // confirmed (0 before any unwrap this session).
+    if state.last_density_d > 0.0 {
+        ui.label(
+            egui::RichText::new(format!("≈ {:.0} texels / m", state.last_density_d))
+                .weak()
+                .small(),
+        );
+    }
 
     egui::ComboBox::from_label("Engine")
         .selected_text(state.export_preset.name())

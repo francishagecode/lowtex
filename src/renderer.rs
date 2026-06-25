@@ -353,10 +353,19 @@ pub struct Renderer {
     layers: Layers,
     tex_size: u32,
 
-    // Stroke accumulation (G6): the active-layer snapshot at stroke start +
-    // per-texel coverage, so overlapping stamps within one stroke don't double-darken.
+    // Stroke accumulation (G6): per-texel coverage so overlapping stamps within one
+    // stroke don't double-darken, plus `stroke_base` — the active-layer values a
+    // texel had *before* this stroke, which the max-coverage blend re-composites
+    // against. Both are lazily, per-texel scoped to the current stroke by a version
+    // stamp instead of being cleared/cloned wholesale each stroke: `stroke_stamp`
+    // records the `stroke_id` a texel was last written under, so `coverage`/`base`
+    // count only when the stamp matches the live id. `begin_stroke` (and any edit
+    // that changes the target outside a stroke) just bumps the id — O(1) — rather
+    // than zero-filling and cloning the whole (up to 2048²) texture every stroke.
     stroke_base: Vec<u8>,
     stroke_coverage: Vec<f32>,
+    stroke_stamp: Vec<u32>,
+    stroke_id: u32,
 
     // Dirty-rectangle paint refresh: a CPU-side mirror of the GPU paint texture (the
     // composited + quantized + gutter-bled display image) plus the texel rect touched
@@ -867,8 +876,13 @@ impl Renderer {
         // BVH over the mesh triangles for fast ray picking (G5).
         let bvh = Bvh::build(&mesh);
 
-        let stroke_base = layers.active_tex().pixels.clone();
-        let stroke_coverage = vec![0.0; (tex_size * tex_size) as usize];
+        // Stroke buffers sized to the texture; `stroke_base`/`stroke_coverage` start
+        // garbage and are validated per-texel by `stroke_stamp` against `stroke_id`
+        // (which begins at 1 so the zero-initialized stamps read as "not this stroke").
+        let texels = (tex_size * tex_size) as usize;
+        let stroke_base = vec![0u8; texels * 4];
+        let stroke_coverage = vec![0.0f32; texels];
+        let stroke_stamp = vec![0u32; texels];
 
         let mut r = Self {
             window: None,
@@ -911,6 +925,8 @@ impl Renderer {
             tex_size,
             stroke_base,
             stroke_coverage,
+            stroke_stamp,
+            stroke_id: 1,
             display_buf: Vec::new(),
             dirty_rect: None,
             paint_target: PaintTarget::Color,
@@ -1209,32 +1225,40 @@ impl Renderer {
         // Snapshot the processed region so the outer margin can be restored after dilate.
         let before = copy_region(&self.display_buf, size, proc);
 
-        self.layers
-            .composite_into_region(&mut self.display_buf, proc);
+        crate::perf::time("composite_region", || {
+            self.layers
+                .composite_into_region(&mut self.display_buf, proc);
+        });
         if self.palette_settings.enabled && !self.palette.colors.is_empty() {
-            self.palette.quantize_region(
-                &mut self.display_buf,
-                size,
-                proc,
-                self.palette_settings.dither,
-                self.palette_settings.dither_strength,
-            );
+            crate::perf::time("quantize_region", || {
+                self.palette.quantize_region(
+                    &mut self.display_buf,
+                    size,
+                    proc,
+                    self.palette_settings.dither,
+                    self.palette_settings.dither_strength,
+                );
+            });
         }
         self.ensure_coverage();
         if let Some(cov) = self.coverage.borrow().as_ref() {
-            crate::bleed::dilate_region(&mut self.display_buf, cov, size, pad, proc);
+            crate::perf::time("bleed_region", || {
+                crate::bleed::dilate_region(&mut self.display_buf, cov, size, pad, proc);
+            });
         }
         // Restore the margin (processed but not uploaded): unchanged by the stroke, but
         // possibly miscomputed by the region dilate.
         restore_margin(&mut self.display_buf, &before, size, proc, upload);
 
-        upload_region(
-            &self.queue,
-            &self.paint_texture_gpu,
-            &self.display_buf,
-            size,
-            upload,
-        );
+        crate::perf::time("upload_region", || {
+            upload_region(
+                &self.queue,
+                &self.paint_texture_gpu,
+                &self.display_buf,
+                size,
+                upload,
+            );
+        });
         self.paint_version = self.paint_version.wrapping_add(1);
     }
 
@@ -1379,24 +1403,40 @@ impl Renderer {
             self.fill_map = None; // rasterized at the previous resolution
             self.rebuild_paint_gpu();
         } else {
-            self.stroke_base = self.target_pixels().to_vec();
-            self.stroke_coverage = vec![0.0; (self.tex_size * self.tex_size) as usize];
+            self.resync_stroke_base();
             self.refresh_display_texture();
         }
     }
 
-    /// The pixels of the current paint target (active layer's color or mask).
-    fn target_pixels(&self) -> &[u8] {
-        match self.paint_target {
-            PaintTarget::Color => &self.layers.active_tex().pixels,
-            PaintTarget::Mask => &self.layers.active_mask().pixels,
+    /// Invalidate the lazily-captured stroke base + coverage without touching the
+    /// buffers: bump the stroke generation so every texel's stamp now reads as stale
+    /// and is re-captured from the live pixels on its next touch. O(1) — the cheap
+    /// replacement for cloning the whole paint target each time the active layer,
+    /// paint target, or pixels change outside a stroke.
+    fn resync_stroke_base(&mut self) {
+        self.bump_stroke_id();
+    }
+
+    /// Advance to a fresh stroke generation. On the rare u32 wrap, clear the stamps so
+    /// a stale stamp can't masquerade as the new (wrapped-to-1) generation.
+    fn bump_stroke_id(&mut self) {
+        self.stroke_id = self.stroke_id.wrapping_add(1);
+        if self.stroke_id == 0 {
+            self.stroke_stamp.fill(0);
+            self.stroke_id = 1;
         }
     }
 
-    /// Re-snapshot the stroke base from the current paint target (after the active
-    /// layer or paint target changes).
-    fn resync_stroke_base(&mut self) {
-        self.stroke_base = self.target_pixels().to_vec();
+    /// Resize the stroke buffers to the current texture and start a fresh generation.
+    /// Called after the paint texture is (re)created at a new resolution. The stamps
+    /// reset to 0 (≠ the id of 1), so base/coverage contents are treated as empty.
+    fn realloc_stroke_buffers(&mut self) {
+        let texels = (self.tex_size * self.tex_size) as usize;
+        self.stroke_base.resize(texels * 4, 0);
+        self.stroke_coverage.resize(texels, 0.0);
+        self.stroke_stamp.clear();
+        self.stroke_stamp.resize(texels, 0);
+        self.stroke_id = 1;
     }
 
     /// Switch between painting the layer's color and its reveal mask.
@@ -2049,18 +2089,6 @@ impl Renderer {
         self.update_uniforms();
     }
 
-    /// First-person mouse-look (RMB fly): turn the view in place and refresh.
-    pub fn look_camera(&mut self, dx: f32, dy: f32) {
-        self.camera.look(dx, dy);
-        self.update_uniforms();
-    }
-
-    /// Fly the camera by world-space forward/right/up amounts (WASD/QE) and refresh.
-    pub fn fly_camera(&mut self, forward: f32, right: f32, up: f32) {
-        self.camera.fly(forward, right, up);
-        self.update_uniforms();
-    }
-
     /// Zoom (dolly) the camera and refresh the uniform.
     pub fn zoom_camera(&mut self, delta: f32) {
         self.camera.zoom(delta);
@@ -2094,8 +2122,7 @@ impl Renderer {
             &self.sampler,
         );
         // The stroke buffers must track the (possibly resized) active layer.
-        self.stroke_base = self.target_pixels().to_vec();
-        self.stroke_coverage = vec![0.0; (self.tex_size * self.tex_size) as usize];
+        self.realloc_stroke_buffers();
         self.refresh_display_texture();
     }
 
@@ -2138,13 +2165,6 @@ impl Renderer {
         crate::export::export_png(path, &pixels, self.tex_size, self.tex_size, palette)
     }
 
-    /// Write the current mesh — including the UVs produced by the last unwrap — to a
-    /// Wavefront OBJ. Pair it with `export_png`: the texture only maps onto these UVs,
-    /// so an engine needs both files.
-    pub fn export_obj(&self, path: &str) -> Result<(), String> {
-        crate::export::export_obj(path, &self.mesh)
-    }
-
     /// Load a PNG into the paint buffer, resampling to the current resolution.
     pub fn load_texture_png(&mut self, path: &str) -> Result<(), String> {
         let img = image::open(path).map_err(|e| format!("failed to open image: {e}"))?;
@@ -2158,8 +2178,8 @@ impl Renderer {
         self.checkpoint(); // decode succeeded; the load is about to be applied
         *self.layers.active_tex_mut() = loaded.resampled(self.tex_size, self.tex_size);
         self.refresh_display_texture();
-        // Re-snapshot the stroke base since the active layer changed wholesale.
-        self.stroke_base = self.target_pixels().to_vec();
+        // Invalidate the stroke base since the active layer changed wholesale.
+        self.resync_stroke_base();
         Ok(())
     }
 
@@ -2611,16 +2631,41 @@ impl Renderer {
     /// BVH, and cached maps are rebuilt; the paint texture is resampled to the new
     /// atlas size and re-maps onto the new UVs. With `overlap`, congruent charts are
     /// stacked onto shared atlas slots (identical/mirrored parts share texels). Returns
-    /// `(atlas_size, clamped)` where `clamped` means density was reduced to stay within
-    /// the GPU texture limit.
-    pub fn apply_unwrap(&mut self, density: crate::unwrap::Density, overlap: bool) -> (u32, bool) {
-        self.checkpoint();
-        let opts = crate::unwrap::UnwrapOptions {
+    /// `(atlas_size, clamped, density)` where `clamped` means density was reduced to
+    /// stay within the GPU texture limit and `density` is the achieved texels-per-
+    /// world-unit (here derived to fill the atlas).
+    pub fn apply_unwrap(
+        &mut self,
+        density: crate::unwrap::Density,
+        overlap: bool,
+    ) -> (u32, bool, f32) {
+        self.apply_unwrap_opts(crate::unwrap::UnwrapOptions {
             density,
             max_atlas: self.max_texture_dim,
             overlap_identical: overlap,
             ..Default::default()
-        };
+        })
+    }
+
+    /// Re-unwrap at an *exact* texels-per-world-unit instead of a preset density: the
+    /// atlas is sized to hold the charts at `texels_per_unit` (rounded up to a power of
+    /// two) rather than stretched to fill it, so e.g. 128 means 128 texels span one
+    /// world unit everywhere. Returns `(atlas_size, clamped, density)`; `density`
+    /// equals the request unless it overflowed the GPU limit (then `clamped` is set
+    /// and it's trimmed). See `apply_unwrap`.
+    pub fn apply_unwrap_at_density(&mut self, texels_per_unit: f32, overlap: bool) -> (u32, bool, f32) {
+        self.apply_unwrap_opts(crate::unwrap::UnwrapOptions {
+            max_atlas: self.max_texture_dim,
+            overlap_identical: overlap,
+            target_density: Some(texels_per_unit),
+            ..Default::default()
+        })
+    }
+
+    /// Shared body of the unwrap entry points: re-unwrap with `opts`, resize the paint
+    /// layers to the new atlas, and rebuild the GPU buffers / BVH / cached maps.
+    fn apply_unwrap_opts(&mut self, opts: crate::unwrap::UnwrapOptions) -> (u32, bool, f32) {
+        self.checkpoint();
         let result = crate::unwrap::auto_unwrap(&self.mesh, &opts);
         log::debug!(
             "unwrap: {0} tris → {1}×{1} atlas at {2:.2} texels/unit{3}",
@@ -2663,7 +2708,7 @@ impl Renderer {
         self.mesh_maps = None;
         self.fill_map = None;
         *self.coverage.get_mut() = None;
-        (result.atlas_size, result.clamped)
+        (result.atlas_size, result.clamped, result.density_d)
     }
 
     /// Save the entire editing state to a `.lowtex` file (G24).
@@ -2849,11 +2894,12 @@ impl Renderer {
         Ok(())
     }
 
-    /// Begin a new stroke: snapshot the texture and clear stroke coverage, so
-    /// overlap within the stroke accumulates by max-coverage (no double-darken).
+    /// Begin a new stroke: open a fresh stroke generation, so overlap within the
+    /// stroke accumulates by max-coverage (no double-darken) while each touched
+    /// texel's pre-stroke value is captured lazily on first contact. O(1): no
+    /// full-texture clone or zero-fill (see the `stroke_*` fields).
     pub fn begin_stroke(&mut self) {
-        self.stroke_base = self.target_pixels().to_vec();
-        self.stroke_coverage.fill(0.0);
+        self.bump_stroke_id();
         // A fresh stroke hasn't fixed its locked face yet (the first dab will).
         self.stroke_lock_facets = None;
         // Snapshot the pre-stroke stack so the whole stroke is one undo step. Held
@@ -3047,23 +3093,25 @@ impl Renderer {
         // Distinct-field borrows (mesh/surface_adj immutable, splat_scratch mutable)
         // in one call — the reused flood scratch keeps the stroke allocation-free.
         let adj = self.surface_adj.as_ref().unwrap();
-        let mut splats = crate::surface::splat(
-            &self.mesh,
-            adj,
-            hit,
-            radius_world,
-            brush.opacity,
-            brush.hardness,
-            size,
-            &mut self.splat_scratch,
-        );
+        let mut splats = crate::perf::time("splat", || {
+            crate::surface::splat(
+                &self.mesh,
+                adj,
+                hit,
+                radius_world,
+                brush.opacity,
+                brush.hardness,
+                size,
+                &mut self.splat_scratch,
+            )
+        });
         // Face lock: drop every texel that isn't on the stroke's locked face, so
         // the dab stops at the face's edges instead of wrapping onto its neighbours.
         self.retain_locked(&mut splats);
         if splats.is_empty() {
             return false; // hit the mesh, but the dab covered no texels
         }
-        self.deposit(&splats, brush);
+        crate::perf::time("deposit", || self.deposit(&splats, brush));
         true
     }
 
@@ -3078,7 +3126,12 @@ impl Renderer {
             return;
         }
         let size = self.tex_size;
-        let base = &self.stroke_base;
+        // Version-stamped per-stroke state: a texel counts toward this stroke only when
+        // its stamp matches the live id; the first touch captures its pre-stroke value
+        // into `base` (lazy copy-on-write) so the blend re-composites against it.
+        let id = self.stroke_id;
+        let base = &mut self.stroke_base;
+        let stamp = &mut self.stroke_stamp;
         let coverage = &mut self.stroke_coverage;
         // Touched texels can be scattered across the atlas (one cluster per face a
         // surface dab wrapped onto), so accumulate their bounding box rather than
@@ -3088,23 +3141,31 @@ impl Renderer {
         // only — a mask's reveal/hide already covers the "remove" case). Max-coverage
         // discipline still holds: more coverage = more erased, monotonic either way.
         let erase = brush.erase && matches!(self.paint_target, PaintTarget::Color);
-        let mut mark =
-            |texel: usize, coverage: &mut [f32], a: f32, src: [u8; 3], pixels: &mut [u8]| {
-                if a <= coverage[texel] {
-                    return; // already at least this covered this stroke
-                }
-                coverage[texel] = a;
-                if erase {
-                    crate::paint::erase_texel(pixels, base, texel, a);
-                } else {
-                    crate::paint::blend_texel(pixels, base, texel, src, a);
-                }
-                let (tx, ty) = (texel as u32 % size, texel as u32 / size);
-                x0 = x0.min(tx);
-                y0 = y0.min(ty);
-                x1 = x1.max(tx + 1);
-                y1 = y1.max(ty + 1);
-            };
+        let mut mark = |texel: usize, a: f32, src: [u8; 3], pixels: &mut [u8]| {
+            let first = stamp[texel] != id;
+            let cur = if first { 0.0 } else { coverage[texel] };
+            if a <= cur {
+                return; // already at least this covered this stroke
+            }
+            if first {
+                // First touch this stroke: snapshot the pre-stroke value before we
+                // overwrite it, and adopt this stroke's stamp.
+                stamp[texel] = id;
+                let i = texel * 4;
+                base[i..i + 4].copy_from_slice(&pixels[i..i + 4]);
+            }
+            coverage[texel] = a;
+            if erase {
+                crate::paint::erase_texel(pixels, base, texel, a);
+            } else {
+                crate::paint::blend_texel(pixels, base, texel, src, a);
+            }
+            let (tx, ty) = (texel as u32 % size, texel as u32 / size);
+            x0 = x0.min(tx);
+            y0 = y0.min(ty);
+            x1 = x1.max(tx + 1);
+            y1 = y1.max(ty + 1);
+        };
         match self.paint_target {
             PaintTarget::Color => {
                 // A brush image reveals itself (UV-tiled) per texel; otherwise the
@@ -3123,7 +3184,7 @@ impl Renderer {
                         }
                         None => solid,
                     };
-                    mark(texel, coverage, a, src, &mut tex.pixels);
+                    mark(texel, a, src, &mut tex.pixels);
                 }
             }
             PaintTarget::Mask => {
@@ -3131,7 +3192,7 @@ impl Renderer {
                 let src = if self.mask_reveal { [255; 3] } else { [0; 3] };
                 let tex = self.layers.active_mask_mut();
                 for &(texel, a) in splats {
-                    mark(texel, coverage, a, src, &mut tex.pixels);
+                    mark(texel, a, src, &mut tex.pixels);
                 }
             }
         }
@@ -3155,13 +3216,22 @@ impl Renderer {
             return;
         }
         let size = self.tex_size;
-        let base = &self.stroke_base;
+        let id = self.stroke_id;
+        let base = &mut self.stroke_base;
+        let stamp = &mut self.stroke_stamp;
         let coverage = &mut self.stroke_coverage;
         let tex = self.layers.active_tex_mut();
         let (mut x0, mut y0, mut x1, mut y1) = (size, size, 0u32, 0u32);
         for &(texel, (a, rgb)) in splats {
-            if a <= coverage[texel] {
+            let first = stamp[texel] != id;
+            let cur = if first { 0.0 } else { coverage[texel] };
+            if a <= cur {
                 continue; // already at least this covered this stroke
+            }
+            if first {
+                stamp[texel] = id;
+                let i = texel * 4;
+                base[i..i + 4].copy_from_slice(&tex.pixels[i..i + 4]);
             }
             coverage[texel] = a;
             crate::paint::blend_texel(&mut tex.pixels, base, texel, rgb, a);
