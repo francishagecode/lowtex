@@ -412,6 +412,7 @@ mod tests {
             indices,
             needs_normals: false,
             needs_uvs: false,
+            source_transform: crate::mesh::SourceTransform::IDENTITY,
         }
     }
 

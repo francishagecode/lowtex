@@ -69,6 +69,10 @@ pub struct ProjectDoc {
     /// reopens the same brush browser. Absent in v1/v2 files → `None`.
     #[serde(default)]
     pub texture_folder: Option<String>,
+    /// The import recenter/rescale, so OBJ export after reopening still restores the
+    /// source's original coordinates. Absent in older files → `None` (identity).
+    #[serde(default)]
+    pub source_transform: Option<crate::mesh::SourceTransform>,
 }
 
 impl ProjectDoc {
@@ -128,6 +132,10 @@ mod tests {
             uvs: vec![[0.0, 0.0], [1.0, 1.0]],
             indices: vec![0, 1, 0],
             texture_folder: Some("/tmp/textures".into()),
+            source_transform: Some(crate::mesh::SourceTransform {
+                center: [1.0, 2.0, 3.0],
+                scale: 0.5,
+            }),
             layers: vec![LayerDoc {
                 name: "Base".into(),
                 blend: 0,

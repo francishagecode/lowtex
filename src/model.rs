@@ -149,6 +149,7 @@ fn load_gltf(path: &str) -> Result<Mesh, String> {
         indices,
         needs_normals: !had_normals,
         needs_uvs: !had_uvs,
+        source_transform: crate::mesh::SourceTransform::IDENTITY,
     })
 }
 
@@ -210,6 +211,7 @@ fn load_obj(path: &str) -> Result<Mesh, String> {
         indices,
         needs_normals: !had_normals,
         needs_uvs: !had_uvs,
+        source_transform: crate::mesh::SourceTransform::IDENTITY,
     })
 }
 

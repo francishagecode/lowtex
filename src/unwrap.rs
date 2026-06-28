@@ -149,7 +149,11 @@ pub struct UnwrapResult {
 /// Unwrap `mesh` into connectivity-based charts at a constant world-space texel
 /// density, deriving the atlas size from `opts.density`.
 pub fn auto_unwrap(mesh: &Mesh, opts: &UnwrapOptions) -> UnwrapResult {
-    unwrap_impl(mesh, opts).0
+    let mut result = unwrap_impl(mesh, opts).0;
+    // Unwrap rebuilds UVs and splits vertices but leaves positions in place, so the
+    // source import transform carries over unchanged — keep it for export.
+    result.mesh.source_transform = mesh.source_transform;
+    result
 }
 
 /// The geometric normal of a triangle (zero for a degenerate triangle).
@@ -228,14 +232,16 @@ fn chart_rectify(proj: &[[Vec2; 3]], chart_of: &[usize], num_charts: usize) -> V
     rot
 }
 
-/// Build a split-vertex mesh from per-triangle (positions, normal, uvs).
-fn build_split(tris: &[([Vec3; 3], Vec3, [Vec2; 3])]) -> Mesh {
+/// Build a split-vertex mesh from per-triangle (positions, per-vertex normals, uvs).
+/// Normals are carried per vertex (not a single face normal) so the unwrap preserves
+/// the source's smooth shading — a flat face normal would export a faceted model.
+fn build_split(tris: &[([Vec3; 3], [Vec3; 3], [Vec2; 3])]) -> Mesh {
     let mut vertices = Vec::with_capacity(tris.len() * 3);
     for (p, n, uv) in tris {
         for i in 0..3 {
             vertices.push(Vertex {
                 position: p[i].to_array(),
-                normal: n.to_array(),
+                normal: n[i].to_array(),
                 uv: uv[i].to_array(),
             });
         }
@@ -246,6 +252,9 @@ fn build_split(tris: &[([Vec3; 3], Vec3, [Vec2; 3])]) -> Mesh {
         indices,
         needs_normals: false,
         needs_uvs: false,
+        // auto_unwrap copies the source mesh's transform onto the result; unwrap leaves
+        // positions untouched, so the import transform still maps them back to source coords.
+        source_transform: crate::mesh::SourceTransform::IDENTITY,
     }
 }
 
@@ -753,6 +762,19 @@ fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) 
     let positions: Vec<[Vec3; 3]> = tri_positions(mesh).collect();
     let normals: Vec<Vec3> = positions.iter().map(|p| face_normal(*p)).collect();
     let areas: Vec<f32> = positions.iter().map(|p| tri_area(*p)).collect();
+    // The source's per-vertex normals, kept for the split output so smooth shading
+    // survives the unwrap. The face `normals` above drive chart projection only.
+    let vert_normals: Vec<[Vec3; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            [
+                Vec3::from(mesh.vertices[t[0] as usize].normal),
+                Vec3::from(mesh.vertices[t[1] as usize].normal),
+                Vec3::from(mesh.vertices[t[2] as usize].normal),
+            ]
+        })
+        .collect();
 
     let (min, max) = mesh.bounds();
     let eps = ((max - min).length() * 1e-5).max(1e-6);
@@ -855,7 +877,7 @@ fn unwrap_impl(mesh: &Mesh, opts: &UnwrapOptions) -> (UnwrapResult, Vec<usize>) 
                 let px = local + offsets[slot_of[c]] + g;
                 px * inv_atlas
             });
-            (positions[ti], normals[ti], uv)
+            (positions[ti], vert_normals[ti], uv)
         })
         .collect();
 
@@ -880,6 +902,41 @@ mod tests {
                 (-1e-4..=1.0 + 1e-4).contains(&v.uv[0]) && (-1e-4..=1.0 + 1e-4).contains(&v.uv[1]),
                 "uv out of range: {:?}",
                 v.uv
+            );
+        }
+    }
+
+    #[test]
+    fn unwrap_preserves_smooth_vertex_normals() {
+        // A triangle whose vertex normals are NOT its face normal (+Z): the unwrap must
+        // carry the smooth per-vertex normals through to the split output, not flatten
+        // them to the face normal (which would export a faceted model).
+        let n = [
+            Vec3::new(0.0, 0.6, 0.8).normalize(),
+            Vec3::new(0.6, 0.0, 0.8).normalize(),
+            Vec3::new(-0.4, -0.4, 0.82).normalize(),
+        ];
+        let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mesh = Mesh {
+            vertices: (0..3)
+                .map(|i| Vertex {
+                    position: pos[i],
+                    normal: n[i].to_array(),
+                    uv: [0.0, 0.0],
+                })
+                .collect(),
+            indices: vec![0, 1, 2],
+            needs_normals: false,
+            needs_uvs: false,
+            source_transform: Default::default(),
+        };
+        let r = auto_unwrap(&mesh, &UnwrapOptions::default());
+        assert_eq!(r.mesh.vertices.len(), 3);
+        for (out, want) in r.mesh.vertices.iter().zip(n) {
+            let got = Vec3::from(out.normal);
+            assert!(
+                got.distance(want) < 1e-5,
+                "normal {got} should match the source smooth normal {want}, not the face normal"
             );
         }
     }
@@ -916,6 +973,7 @@ mod tests {
             vertices,
             needs_normals: false,
             needs_uvs: false,
+            source_transform: crate::mesh::SourceTransform::IDENTITY,
         }
     }
 
@@ -1227,6 +1285,7 @@ mod tests {
             indices: vec![0, 1, 2],
             needs_normals: false,
             needs_uvs: false,
+            source_transform: crate::mesh::SourceTransform::IDENTITY,
         };
         let r = auto_unwrap(&tri, &UnwrapOptions::default());
         assert_eq!(r.mesh.vertices.len(), 3);
@@ -1237,6 +1296,7 @@ mod tests {
             indices: vec![],
             needs_normals: false,
             needs_uvs: false,
+            source_transform: crate::mesh::SourceTransform::IDENTITY,
         };
         let r = auto_unwrap(&empty, &UnwrapOptions::default());
         assert_eq!(r.mesh.vertices.len(), 0);

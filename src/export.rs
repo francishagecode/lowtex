@@ -143,11 +143,12 @@ pub fn export_obj(path: &str, mesh: &Mesh) -> Result<(), String> {
         mesh.vertices.len(),
         mesh.indices.len() / 3
     ))?;
+    // Undo lowtex's import recenter/rescale so the geometry leaves in the source's
+    // original coordinates (an engine expects the model where it originally sat, not at
+    // lowtex's camera-framing scale). Identity for the cube / procedural meshes.
     for v in &mesh.vertices {
-        write(format_args!(
-            "v {} {} {}",
-            v.position[0], v.position[1], v.position[2]
-        ))?;
+        let p = mesh.source_transform.to_source(v.position);
+        write(format_args!("v {} {} {}", p[0], p[1], p[2]))?;
     }
     for v in &mesh.vertices {
         write(format_args!("vt {} {}", v.uv[0], 1.0 - v.uv[1]))?;
@@ -224,6 +225,59 @@ mod tests {
         // model::load recenters/normalizes positions, so compare UVs (untouched).
         for (a, b) in reloaded.vertices.iter().zip(&unwrapped.vertices) {
             assert!((a.uv[0] - b.uv[0]).abs() < 1e-4 && (a.uv[1] - b.uv[1]).abs() < 1e-4);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exported_obj_restores_source_coordinates() {
+        // A model that sat off-origin at a large scale: lowtex recenters+rescales it on
+        // import (recenter_and_normalize), but export must write the ORIGINAL coordinates
+        // back — otherwise the geometry lands at the wrong place/size in an engine.
+        use crate::mesh::{Mesh, Vertex};
+        let source_positions = [
+            [10.0f32, 20.0, 30.0],
+            [14.0, 20.0, 30.0],
+            [10.0, 28.0, 30.0],
+        ];
+        let mut mesh = Mesh {
+            vertices: source_positions
+                .iter()
+                .map(|&p| Vertex {
+                    position: p,
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                })
+                .collect(),
+            indices: vec![0, 1, 2],
+            needs_normals: false,
+            needs_uvs: false,
+            source_transform: Default::default(),
+        };
+        mesh.recenter_and_normalize(1.6); // mutates positions, records the transform
+
+        let path = std::env::temp_dir().join("lowtex_obj_src_test.obj");
+        let p = path.to_string_lossy();
+        export_obj(&p, &mesh).unwrap();
+
+        // Parse the `v` lines straight out of the file and compare to the source.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let verts: Vec<[f32; 3]> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("v "))
+            .map(|rest| {
+                let c: Vec<f32> = rest.split_whitespace().map(|s| s.parse().unwrap()).collect();
+                [c[0], c[1], c[2]]
+            })
+            .collect();
+        assert_eq!(verts.len(), source_positions.len());
+        for (got, want) in verts.iter().zip(&source_positions) {
+            for k in 0..3 {
+                assert!(
+                    (got[k] - want[k]).abs() < 1e-3,
+                    "exported {got:?} should match source {want:?}"
+                );
+            }
         }
         let _ = std::fs::remove_file(&path);
     }

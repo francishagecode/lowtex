@@ -50,6 +50,40 @@ impl Vertex {
     }
 }
 
+/// The recenter+rescale lowtex applies on import so any model is framed by the
+/// camera (`recenter_and_normalize`). Stored so export can undo it and write the
+/// geometry back in the source's original coordinates: `original = p / scale + center`.
+/// The identity (`center = 0`, `scale = 1`) means "no transform applied" — used by
+/// the built-in cube and any procedurally-built mesh.
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceTransform {
+    pub center: [f32; 3],
+    pub scale: f32,
+}
+
+impl SourceTransform {
+    pub const IDENTITY: SourceTransform = SourceTransform {
+        center: [0.0, 0.0, 0.0],
+        scale: 1.0,
+    };
+
+    /// Map a normalized (in-lowtex) position back to the source's coordinates.
+    pub fn to_source(&self, p: [f32; 3]) -> [f32; 3] {
+        let inv = 1.0 / self.scale;
+        [
+            p[0] * inv + self.center[0],
+            p[1] * inv + self.center[1],
+            p[2] * inv + self.center[2],
+        ]
+    }
+}
+
+impl Default for SourceTransform {
+    fn default() -> Self {
+        SourceTransform::IDENTITY
+    }
+}
+
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
@@ -57,6 +91,8 @@ pub struct Mesh {
     pub needs_normals: bool,
     /// True if the source had no UVs and a projection fallback is (or must be) used.
     pub needs_uvs: bool,
+    /// The import recenter/rescale, kept so OBJ export can restore original coordinates.
+    pub source_transform: SourceTransform,
 }
 
 impl Mesh {
@@ -175,6 +211,7 @@ impl Mesh {
             indices,
             needs_normals: false,
             needs_uvs: false,
+            source_transform: SourceTransform::IDENTITY,
         }
     }
 
@@ -206,6 +243,13 @@ impl Mesh {
             let p = (Vec3::from(v.position) - center) * scale;
             v.position = p.to_array();
         }
+        // Remember the transform so export can map positions back to the source's
+        // original placement and scale (the painter brings the texture *and* geometry
+        // into an engine, and the geometry must land where the original did).
+        self.source_transform = SourceTransform {
+            center: center.to_array(),
+            scale,
+        };
     }
 
     /// Recompute smooth (area-weighted) vertex normals from the triangle faces.
