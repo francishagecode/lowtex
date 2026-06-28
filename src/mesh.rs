@@ -84,6 +84,18 @@ impl Default for SourceTransform {
     }
 }
 
+/// One named object/group from the source file (OBJ `o`/`g`, glTF mesh/primitive),
+/// as a contiguous run of triangles. lowtex merges everything into one paintable mesh,
+/// but keeps these so export can re-emit the original `o <name>` split. Triangle indices
+/// are stable across unwrap (it preserves triangle order), so the ranges stay valid.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MeshGroup {
+    pub name: String,
+    /// First triangle (0-based) and triangle count in the mesh's triangle list.
+    pub start_tri: usize,
+    pub tri_count: usize,
+}
+
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
@@ -93,6 +105,9 @@ pub struct Mesh {
     pub needs_uvs: bool,
     /// The import recenter/rescale, kept so OBJ export can restore original coordinates.
     pub source_transform: SourceTransform,
+    /// The source file's object/group split, kept so export can re-emit it. Empty when
+    /// the source had no named groups (or for procedural/built-in meshes).
+    pub groups: Vec<MeshGroup>,
 }
 
 impl Mesh {
@@ -212,6 +227,7 @@ impl Mesh {
             needs_normals: false,
             needs_uvs: false,
             source_transform: SourceTransform::IDENTITY,
+            groups: Vec::new(),
         }
     }
 

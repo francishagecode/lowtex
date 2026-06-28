@@ -159,11 +159,29 @@ pub fn export_obj(path: &str, mesh: &Mesh) -> Result<(), String> {
             v.normal[0], v.normal[1], v.normal[2]
         ))?;
     }
-    for t in mesh.indices.chunks_exact(3) {
-        // OBJ indices are 1-based; position/texcoord/normal share one index here
-        // because the unwrap emits a flat, split-vertex mesh.
+    // One face per triangle. OBJ indices are 1-based; position/texcoord/normal share one
+    // index because the (unwrapped) mesh is a flat, split-vertex mesh.
+    let face = |w: &mut dyn std::io::Write, ti: usize| -> Result<(), String> {
+        let t = &mesh.indices[ti * 3..ti * 3 + 3];
         let (a, b, c) = (t[0] + 1, t[1] + 1, t[2] + 1);
-        write(format_args!("f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}"))?;
+        writeln!(w, "f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}")
+            .map_err(|e| format!("failed to write {path}: {e}"))
+    };
+    let tri_count = mesh.indices.len() / 3;
+    if mesh.groups.is_empty() {
+        for ti in 0..tri_count {
+            face(&mut w, ti)?;
+        }
+    } else {
+        // Re-emit the source's object split: `o <name>` then that group's faces. Clamp the
+        // ranges defensively so a stale group can't index past the triangle list.
+        for grp in &mesh.groups {
+            writeln!(w, "o {}", grp.name).map_err(|e| format!("failed to write {path}: {e}"))?;
+            let end = grp.start_tri.saturating_add(grp.tri_count).min(tri_count);
+            for ti in grp.start_tri.min(tri_count)..end {
+                face(&mut w, ti)?;
+            }
+        }
     }
     w.flush().map_err(|e| format!("failed to write {path}: {e}"))
 }
@@ -253,6 +271,7 @@ mod tests {
             needs_normals: false,
             needs_uvs: false,
             source_transform: Default::default(),
+            groups: Vec::new(),
         };
         mesh.recenter_and_normalize(1.6); // mutates positions, records the transform
 
@@ -279,6 +298,45 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exported_obj_re_emits_object_groups() {
+        // Two triangles in two named groups: export must write an `o <name>` header for
+        // each, with that group's faces under it.
+        use crate::mesh::{Mesh, MeshGroup, Vertex};
+        let vert = |x: f32| Vertex {
+            position: [x, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+        };
+        let mesh = Mesh {
+            vertices: (0..6).map(|i| vert(i as f32)).collect(),
+            indices: vec![0, 1, 2, 3, 4, 5],
+            needs_normals: false,
+            needs_uvs: false,
+            source_transform: Default::default(),
+            groups: vec![
+                MeshGroup { name: "alpha".into(), start_tri: 0, tri_count: 1 },
+                MeshGroup { name: "beta".into(), start_tri: 1, tri_count: 1 },
+            ],
+        };
+        let path = std::env::temp_dir().join("lowtex_obj_groups_test.obj");
+        let p = path.to_string_lossy();
+        export_obj(&p, &mesh).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        let objs: Vec<&str> = text.lines().filter(|l| l.starts_with("o ")).collect();
+        assert_eq!(objs, ["o alpha", "o beta"]);
+        // Each group's single face sits under its own `o` header, in order.
+        let order: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("o ") || l.starts_with("f "))
+            .collect();
+        assert_eq!(order.len(), 4); // 2 headers + 2 faces
+        assert!(order[0] == "o alpha" && order[1].starts_with("f "));
+        assert!(order[2] == "o beta" && order[3].starts_with("f "));
         let _ = std::fs::remove_file(&path);
     }
 

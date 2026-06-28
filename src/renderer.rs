@@ -3162,6 +3162,7 @@ impl Renderer {
             layers,
             texture_folder: self.texture_folder.clone(),
             source_transform: Some(self.mesh.source_transform),
+            groups: self.mesh.groups.clone(),
         };
         doc.save(path)
     }
@@ -3195,6 +3196,7 @@ impl Renderer {
             needs_normals: false,
             needs_uvs: false,
             source_transform: doc.source_transform.unwrap_or_default(),
+            groups: doc.groups.clone(),
         };
         self.vertex_buffer = self
             .device

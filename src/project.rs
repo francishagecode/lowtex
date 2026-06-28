@@ -73,6 +73,10 @@ pub struct ProjectDoc {
     /// source's original coordinates. Absent in older files → `None` (identity).
     #[serde(default)]
     pub source_transform: Option<crate::mesh::SourceTransform>,
+    /// The source file's object/group split, so OBJ export after reopening re-emits the
+    /// named groups. Absent in older files → empty (one merged object on export).
+    #[serde(default)]
+    pub groups: Vec<crate::mesh::MeshGroup>,
 }
 
 impl ProjectDoc {
@@ -136,6 +140,11 @@ mod tests {
                 center: [1.0, 2.0, 3.0],
                 scale: 0.5,
             }),
+            groups: vec![crate::mesh::MeshGroup {
+                name: "part".into(),
+                start_tri: 0,
+                tri_count: 1,
+            }],
             layers: vec![LayerDoc {
                 name: "Base".into(),
                 blend: 0,

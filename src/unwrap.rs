@@ -150,9 +150,10 @@ pub struct UnwrapResult {
 /// density, deriving the atlas size from `opts.density`.
 pub fn auto_unwrap(mesh: &Mesh, opts: &UnwrapOptions) -> UnwrapResult {
     let mut result = unwrap_impl(mesh, opts).0;
-    // Unwrap rebuilds UVs and splits vertices but leaves positions in place, so the
-    // source import transform carries over unchanged — keep it for export.
+    // Unwrap rebuilds UVs and splits vertices but leaves positions and triangle order in
+    // place, so the source import transform and the group ranges carry over unchanged.
     result.mesh.source_transform = mesh.source_transform;
+    result.mesh.groups = mesh.groups.clone();
     result
 }
 
@@ -252,9 +253,10 @@ fn build_split(tris: &[([Vec3; 3], [Vec3; 3], [Vec2; 3])]) -> Mesh {
         indices,
         needs_normals: false,
         needs_uvs: false,
-        // auto_unwrap copies the source mesh's transform onto the result; unwrap leaves
-        // positions untouched, so the import transform still maps them back to source coords.
+        // auto_unwrap copies the source mesh's transform + groups onto the result; unwrap
+        // leaves positions and triangle order untouched, so both stay valid.
         source_transform: crate::mesh::SourceTransform::IDENTITY,
+        groups: Vec::new(),
     }
 }
 
@@ -929,6 +931,7 @@ mod tests {
             needs_normals: false,
             needs_uvs: false,
             source_transform: Default::default(),
+            groups: Vec::new(),
         };
         let r = auto_unwrap(&mesh, &UnwrapOptions::default());
         assert_eq!(r.mesh.vertices.len(), 3);
@@ -974,6 +977,7 @@ mod tests {
             needs_normals: false,
             needs_uvs: false,
             source_transform: crate::mesh::SourceTransform::IDENTITY,
+            groups: Vec::new(),
         }
     }
 
@@ -1286,6 +1290,7 @@ mod tests {
             needs_normals: false,
             needs_uvs: false,
             source_transform: crate::mesh::SourceTransform::IDENTITY,
+            groups: Vec::new(),
         };
         let r = auto_unwrap(&tri, &UnwrapOptions::default());
         assert_eq!(r.mesh.vertices.len(), 3);
@@ -1297,6 +1302,7 @@ mod tests {
             needs_normals: false,
             needs_uvs: false,
             source_transform: crate::mesh::SourceTransform::IDENTITY,
+            groups: Vec::new(),
         };
         let r = auto_unwrap(&empty, &UnwrapOptions::default());
         assert_eq!(r.mesh.vertices.len(), 0);

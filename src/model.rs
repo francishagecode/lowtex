@@ -106,14 +106,17 @@ fn load_gltf(path: &str) -> Result<Mesh, String> {
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let mut groups = Vec::new();
     let mut had_normals = true;
     let mut had_uvs = true;
 
     for mesh in doc.meshes() {
+        let mesh_name = format!("mesh{}", mesh.index());
         for prim in mesh.primitives() {
             if prim.mode() != gltf::mesh::Mode::Triangles {
                 continue; // we only paint triangles
             }
+            let start_tri = indices.len() / 3;
             let reader = prim.reader(|b| Some(&buffers[b.index()]));
 
             let positions: Vec<[f32; 3]> = match reader.read_positions() {
@@ -141,6 +144,15 @@ fn load_gltf(path: &str) -> Result<Mesh, String> {
                 // No index buffer: vertices are in sequential triangle order.
                 None => indices.extend(base..base + positions.len() as u32),
             }
+            // One group per primitive, named for its mesh, as a contiguous triangle run.
+            let tri_count = indices.len() / 3 - start_tri;
+            if tri_count > 0 {
+                groups.push(crate::mesh::MeshGroup {
+                    name: mesh_name.clone(),
+                    start_tri,
+                    tri_count,
+                });
+            }
         }
     }
 
@@ -150,6 +162,7 @@ fn load_gltf(path: &str) -> Result<Mesh, String> {
         needs_normals: !had_normals,
         needs_uvs: !had_uvs,
         source_transform: crate::mesh::SourceTransform::IDENTITY,
+        groups,
     })
 }
 
@@ -164,6 +177,7 @@ fn load_obj(path: &str) -> Result<Mesh, String> {
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let mut groups = Vec::new();
     let mut had_normals = true;
     let mut had_uvs = true;
 
@@ -203,7 +217,17 @@ fn load_obj(path: &str) -> Result<Mesh, String> {
                 uv,
             });
         }
+        // Record this object/group as a contiguous triangle run (tobj splits models by
+        // o/g/material), so export can re-emit the named split. `start_tri` is where this
+        // model's triangles begin in the merged list.
+        let model_tris = m.indices.len() / 3;
+        let start_tri = indices.len() / 3;
         indices.extend(m.indices.iter().map(|i| base + i));
+        groups.push(crate::mesh::MeshGroup {
+            name: model.name.clone(),
+            start_tri,
+            tri_count: model_tris,
+        });
     }
 
     Ok(Mesh {
@@ -212,6 +236,7 @@ fn load_obj(path: &str) -> Result<Mesh, String> {
         needs_normals: !had_normals,
         needs_uvs: !had_uvs,
         source_transform: crate::mesh::SourceTransform::IDENTITY,
+        groups,
     })
 }
 
@@ -222,6 +247,36 @@ mod tests {
     #[test]
     fn valid_mesh_passes() {
         assert!(validate(&Mesh::cube()).is_ok());
+    }
+
+    #[test]
+    fn obj_objects_become_groups_and_survive_unwrap() {
+        // A two-object OBJ: import must record one group per object (in order), and the
+        // groups must survive an unwrap (which preserves triangle order).
+        let obj = "\
+o first
+v 0 0 0
+v 1 0 0
+v 0 1 0
+f 1 2 3
+o second
+v 2 0 0
+v 3 0 0
+v 2 1 0
+f 4 5 6
+";
+        let path = std::env::temp_dir().join("lowtex_groups_import_test.obj");
+        std::fs::write(&path, obj).unwrap();
+        let mesh = load(&path.to_string_lossy()).unwrap();
+        let names: Vec<&str> = mesh.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
+        assert_eq!(mesh.groups[0].tri_count, 1);
+        assert_eq!(mesh.groups[1].start_tri, 1);
+
+        let unwrapped = crate::unwrap::auto_unwrap(&mesh, &Default::default()).mesh;
+        let names2: Vec<&str> = unwrapped.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names2, ["first", "second"], "groups must survive unwrap");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
