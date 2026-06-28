@@ -20,6 +20,9 @@ mod config;
 mod effects;
 mod export;
 mod fill;
+mod gpu_bake;
+mod gpu_dab;
+mod gpu_layers;
 mod history;
 mod layers;
 mod material;
@@ -100,6 +103,8 @@ struct Args {
     /// Headless verification: material on a NEW layer, masked by AO (Cavities) —
     /// the "moss in the crevices" workflow.
     material_crevice: bool,
+    /// Region-aware one-time seam cleanup: fill island-rim "teeth" from same-facet paint.
+    clean_seams: bool,
     /// Headless verification: open a .lowtex first / save one after edits.
     open_project: Option<String>,
     save_project: Option<String>,
@@ -119,6 +124,7 @@ fn parse_args() -> Args {
         paint: false,
         stroke: false,
         paint_uv: false,
+        clean_seams: false,
         orbit_deg: 0.0,
         ui: false,
         brush_color: None,
@@ -196,6 +202,7 @@ fn parse_args() -> Args {
             }
             "--texture-brush" => args.texture_brush = it.next(),
             "--material-crevice" => args.material_crevice = true,
+            "--clean-seams" => args.clean_seams = true,
             "--open-project" => args.open_project = it.next(),
             "--save-project" => args.save_project = it.next(),
             "--preset" => args.preset = it.next(),
@@ -461,6 +468,11 @@ fn run_screenshot(out: &str, mesh: Mesh, args: &Args) {
             Ok(()) => log::info!("saved preset {path}"),
             Err(e) => log::error!("{e}"),
         }
+    }
+
+    if args.clean_seams {
+        renderer.clean_seams();
+        log::info!("cleaned island-rim seams (region-aware)");
     }
 
     if let Some(path) = &args.save_texture {

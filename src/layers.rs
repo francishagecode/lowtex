@@ -70,8 +70,9 @@ type EffectCache = RefCell<Option<Arc<Vec<u8>>>>;
 
 /// A layer's pixels after its effect stack: borrowed straight from `tex` when no
 /// effect is active (the common case, zero-copy) or a shared handle to the memoized
-/// effect output.
-enum Effected<'a> {
+/// effect output. `Deref`s to the RGBA8 bytes, so callers (the CPU compositor, the GPU
+/// layer mirror) read it like a slice.
+pub enum Effected<'a> {
     Raw(&'a [u8]),
     Cached(Arc<Vec<u8>>),
 }
@@ -216,7 +217,7 @@ impl Layer {
     /// `invalidate` is called — so a paint drag (or an undo/redo restore) re-runs
     /// effects for the changed layer only, not every layer. The stored `tex.pixels`
     /// are left untouched — effects stay non-destructive.
-    fn effected(&self) -> Effected<'_> {
+    pub fn effected(&self) -> Effected<'_> {
         if self.effects.iter().all(Effect::is_identity) {
             return Effected::Raw(&self.tex.pixels);
         }

@@ -96,6 +96,12 @@ impl App {
             ui.brush_folder_entries = scan_brush_folder(dir);
             ui.brush_folder = Some(dir.clone());
         }
+        // Likewise restore the last-used alpha-tip folder so the tip browser reopens
+        // where the user left off (the renderer reloads the chosen tip on click).
+        if let Some(dir) = config.last_alpha_folder.as_ref().filter(|d| d.is_dir()) {
+            ui.alpha_folder_entries = scan_brush_folder(dir);
+            ui.alpha_folder = Some(dir.clone());
+        }
 
         Self {
             window: None,
@@ -245,6 +251,10 @@ impl App {
         });
         renderer.set_brush_tile(self.ui.brush_tile);
         renderer.set_stamp_options(self.ui.stamp_angle_deg.to_radians(), self.ui.stamp_tint);
+
+        // Brush alpha tip: the invert toggle (the tip itself + its angle are loaded/pushed
+        // via the actions below and the shared stamp angle above).
+        renderer.set_brush_alpha_invert(self.ui.alpha_invert);
 
         // Push mirror-painting state: the chosen axis when enabled, else off.
         renderer.set_symmetry(self.ui.symmetry_on.then_some(self.ui.symmetry_axis));
@@ -464,6 +474,44 @@ impl App {
                 Err(e) => log::error!("{e}"),
             }
         }
+        // Open a folder of grayscale tips and stage a thumbnail for each, for the
+        // brush-tip browser (same scan as the texture folder).
+        if actions.open_alpha_folder {
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(prev) = self.ui.alpha_folder.as_ref().filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(prev);
+            }
+            if let Some(dir) = dialog.pick_folder() {
+                self.ui.alpha_folder_entries = scan_brush_folder(&dir);
+                log::info!(
+                    "alpha-tip folder {} — {} tips",
+                    dir.display(),
+                    self.ui.alpha_folder_entries.len()
+                );
+                self.config.last_alpha_folder = Some(dir.clone());
+                self.config.save();
+                self.ui.alpha_folder = Some(dir);
+            }
+        }
+        // Use a folder image as the brush alpha tip (shapes the dab in place of the circle).
+        if let Some(path) = actions.use_alpha_entry {
+            match renderer.load_brush_alpha(&path.to_string_lossy()) {
+                Ok(()) => {
+                    self.ui.alpha_loaded = true;
+                    self.ui.alpha_thumb = renderer.brush_alpha_thumbnail(64);
+                    self.ui.alpha_thumb_tex = None;
+                    log::info!("brush alpha tip {}", path.display());
+                }
+                Err(e) => log::error!("{e}"),
+            }
+        }
+        // Clear the tip, reverting to the circular falloff.
+        if actions.clear_alpha {
+            renderer.clear_brush_alpha();
+            self.ui.alpha_loaded = false;
+            self.ui.alpha_thumb = None;
+            self.ui.alpha_thumb_tex = None;
+        }
         if let Some(indexed) = actions.export_png {
             let preset = self.ui.export_preset;
             if let Some(path) = rfd::FileDialog::new()
@@ -531,6 +579,9 @@ impl App {
         }
         if actions.checkpoint {
             renderer.checkpoint();
+        }
+        if actions.clean_seams {
+            renderer.clean_seams();
         }
 
         // Layer ops (G10).

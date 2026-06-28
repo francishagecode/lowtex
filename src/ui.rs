@@ -96,6 +96,8 @@ pub struct UiActions {
     pub select_builtin_palette: Option<usize>,
     /// Generate a palette from a chosen image with this many colors.
     pub generate_palette: Option<usize>,
+    /// Region-aware one-time seam cleanup: fill island-rim "teeth" from same-facet paint.
+    pub clean_seams: bool,
     // Layer ops (G10).
     pub add_layer: bool,
     pub remove_layer: bool,
@@ -146,6 +148,13 @@ pub struct UiActions {
     pub open_brush_folder: bool,
     /// Use a texture from the folder browser as the brush image (carries its path).
     pub use_brush_entry: Option<std::path::PathBuf>,
+    /// Open a native folder picker for brush alpha tips; the App scans it for images and
+    /// stages their thumbnails into `alpha_folder_entries` for the tip browser.
+    pub open_alpha_folder: bool,
+    /// Use an image from the tip browser as the brush alpha tip (carries its path).
+    pub use_alpha_entry: Option<std::path::PathBuf>,
+    /// Drop the loaded alpha tip, reverting the brush to the circular falloff.
+    pub clear_alpha: bool,
     /// Re-unwrap the mesh's UVs at the chosen texel density (the atlas size is
     /// derived from it). Carries the density the user picked.
     pub unwrap: Option<crate::unwrap::Density>,
@@ -204,6 +213,19 @@ pub struct UiState {
     /// it, each usable as a tiled brush or a stamp. Empty until a folder is opened.
     pub brush_folder: Option<std::path::PathBuf>,
     pub brush_folder_entries: Vec<BrushEntry>,
+    /// Brush alpha tips: an optional grayscale image that shapes the dab in place of the
+    /// circle. `alpha_folder`/`alpha_folder_entries` are the chosen folder + its swatches
+    /// (same browser as the texture folder); `alpha_loaded` mirrors whether the renderer
+    /// has a tip set; `alpha_invert` flips dark/light for black-on-white tip packs. The
+    /// tip's rotation reuses `stamp_angle_deg`.
+    pub alpha_folder: Option<std::path::PathBuf>,
+    pub alpha_folder_entries: Vec<BrushEntry>,
+    pub alpha_loaded: bool,
+    pub alpha_invert: bool,
+    /// Staged thumbnail of the active tip (uploaded to `alpha_thumb_tex` once, then taken
+    /// back to None), mirroring `brush_thumb`/`brush_thumb_tex` for the brush image.
+    pub alpha_thumb: Option<(u32, u32, Vec<u8>)>,
+    pub alpha_thumb_tex: Option<egui::TextureHandle>,
     /// Mirror painting: when on, every dab is also painted at its reflection across
     /// the model-symmetry plane for `symmetry_axis` (through the mesh center).
     pub symmetry_on: bool,
@@ -313,6 +335,12 @@ impl Default for UiState {
             stamp_tint: false,
             brush_folder: None,
             brush_folder_entries: Vec::new(),
+            alpha_folder: None,
+            alpha_folder_entries: Vec::new(),
+            alpha_loaded: false,
+            alpha_invert: false,
+            alpha_thumb: None,
+            alpha_thumb_tex: None,
             symmetry_on: false,
             lock_face: false,
             symmetry_axis: SymmetryAxis::X,
@@ -519,6 +547,18 @@ fn menu_bar(ctx: &Context, state: &mut UiState) {
                     .clicked()
                 {
                     state.actions.redo = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui
+                    .button("Clean Seams")
+                    .on_hover_text(
+                        "Fill dark island-edge 'teeth' left by older GPU paint, from each \
+                         island's own colour. Undoable; only repairs unpainted edge texels.",
+                    )
+                    .clicked()
+                {
+                    state.actions.clean_seams = true;
                     ui.close_menu();
                 }
             });
@@ -827,6 +867,71 @@ pub fn build(ctx: &Context, state: &mut UiState) {
                         }
                     });
                     brush_folder_grid(ui, state);
+
+                    // Brush tip (alpha): point at a folder of grayscale tip images, then
+                    // click one to shape the dab with it instead of the circle. Brightness
+                    // (white) paints; Invert flips that; Angle rotates the tip. Clear goes
+                    // back to the round brush.
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Brush Tip (Alpha)").strong());
+                    if state.alpha_loaded {
+                        // Upload a newly-staged tip preview once; the handle persists until
+                        // the tip is cleared/replaced (mirrors the brush-image swatch).
+                        if let Some((w, h, px)) = state.alpha_thumb.take() {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                &px,
+                            );
+                            state.alpha_thumb_tex = Some(ui.ctx().load_texture(
+                                "alpha-thumb",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                        let swatch = state.alpha_thumb_tex.as_ref().map(|tex| {
+                            let [tw, th] = tex.size();
+                            let scale = 48.0 / tw.max(th) as f32;
+                            let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+                            egui::load::SizedTexture::new(tex.id(), size)
+                        });
+                        ui.horizontal(|ui| {
+                            if let Some(swatch) = swatch {
+                                ui.add(egui::Image::new(swatch));
+                            }
+                            if ui.button("Clear (circle)").clicked() {
+                                state.actions.clear_alpha = true;
+                            }
+                            ui.checkbox(&mut state.alpha_invert, "Invert")
+                                .on_hover_text("Paint dark pixels instead of light");
+                        });
+                        ui.add(
+                            egui::Slider::new(&mut state.stamp_angle_deg, 0.0..=360.0)
+                                .text("Angle")
+                                .suffix("°"),
+                        )
+                        .on_hover_text("Rotate the tip in the surface plane");
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Pick a tip below to shape the brush.")
+                                .weak()
+                                .small(),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Alpha tips folder…").clicked() {
+                            state.actions.open_alpha_folder = true;
+                        }
+                        if let Some(name) = state
+                            .alpha_folder
+                            .as_ref()
+                            .and_then(|f| f.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                        {
+                            ui.label(egui::RichText::new(name).weak().small());
+                        }
+                    });
+                    alpha_folder_grid(ui, state);
                 }
 
                 ui.add_space(6.0);
@@ -1407,16 +1512,36 @@ fn mesh_effects_section(ui: &mut egui::Ui, state: &mut UiState) {
 }
 
 /// A wrapping grid of swatches for the textures found in the chosen brush folder.
-/// Each freshly-staged thumbnail is uploaded to a GPU texture once; clicking a swatch
-/// loads that image as the brush (the App reads `use_brush_entry`).
+/// Clicking a swatch loads that image as the brush (the App reads `use_brush_entry`).
 fn brush_folder_grid(ui: &mut egui::Ui, state: &mut UiState) {
-    if state.brush_folder_entries.is_empty() {
-        return;
+    if let Some(p) = folder_grid(ui, &mut state.brush_folder_entries, "brush-folder") {
+        state.actions.use_brush_entry = Some(p);
     }
-    let entries = &mut state.brush_folder_entries;
+}
+
+/// A wrapping grid of swatches for the alpha tips found in the chosen tip folder.
+/// Clicking a swatch loads that image as the brush tip (the App reads `use_alpha_entry`).
+fn alpha_folder_grid(ui: &mut egui::Ui, state: &mut UiState) {
+    if let Some(p) = folder_grid(ui, &mut state.alpha_folder_entries, "alpha-folder") {
+        state.actions.use_alpha_entry = Some(p);
+    }
+}
+
+/// Shared wrapping grid of folder swatches. Each freshly-staged thumbnail is uploaded to
+/// a GPU texture once (`key_prefix` namespaces the handle so the two browsers don't
+/// collide); returns the path of the swatch clicked this frame, if any.
+fn folder_grid(
+    ui: &mut egui::Ui,
+    entries: &mut [BrushEntry],
+    key_prefix: &str,
+) -> Option<std::path::PathBuf> {
+    if entries.is_empty() {
+        return None;
+    }
     let mut clicked: Option<std::path::PathBuf> = None;
     egui::ScrollArea::vertical()
         .max_height(160.0)
+        .id_salt(key_prefix)
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for entry in entries.iter_mut() {
@@ -1425,7 +1550,7 @@ fn brush_folder_grid(ui: &mut egui::Ui, state: &mut UiState) {
                         let img =
                             egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px);
                         entry.tex = Some(ui.ctx().load_texture(
-                            format!("brush-folder-{}", entry.name),
+                            format!("{key_prefix}-{}", entry.name),
                             img,
                             egui::TextureOptions::LINEAR,
                         ));
@@ -1446,9 +1571,7 @@ fn brush_folder_grid(ui: &mut egui::Ui, state: &mut UiState) {
                 }
             });
         });
-    if let Some(p) = clicked {
-        state.actions.use_brush_entry = Some(p);
-    }
+    clicked
 }
 
 /// Fill the active layer with a tiled material image (brick, moss…).

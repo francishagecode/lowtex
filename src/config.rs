@@ -14,6 +14,9 @@ pub struct Config {
     /// The texture folder the user last opened in the brush browser.
     #[serde(default)]
     pub last_texture_folder: Option<PathBuf>,
+    /// The alpha-tip folder the user last opened in the brush-tip browser.
+    #[serde(default)]
+    pub last_alpha_folder: Option<PathBuf>,
 }
 
 impl Config {

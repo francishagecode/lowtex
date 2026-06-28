@@ -249,6 +249,54 @@ pub fn splat_world(
     out
 }
 
+/// Option (B) of the GPU dab plan: the *set of faces* (triangle indices) the surface
+/// flood reaches within `radius_world` of the hit — the cheap, face-granular core of
+/// [`splat`] with the per-texel rasterization dropped. The GPU dab pass rasterizes exactly
+/// these faces with a per-fragment falloff, so the cross-seam / geodesic reach is preserved
+/// at face resolution while the (former ~95 %) per-texel cost moves to the GPU.
+///
+/// Uses the identical adjacency walk and closest-point frontier as `splat`, so it visits
+/// the same triangles; it returns every face whose closest point is within the radius (the
+/// root always included). That is a *superset* of the faces `splat` actually emits texels
+/// on — a face can be near the brush yet have all its texel centres fall past the radius —
+/// but the GPU fragment shader re-applies the exact falloff and discards zero-coverage
+/// texels, so the extra faces contribute nothing. `&mut` only to reuse the flood scratch.
+pub fn splat_faces(
+    mesh: &Mesh,
+    adj: &Adjacency,
+    hit: &Hit,
+    radius_world: f32,
+    scratch: &mut SplatScratch,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    let tri_count = mesh.indices.len() / 3;
+    if radius_world <= 0.0 || hit.tri as usize >= tri_count {
+        return out;
+    }
+    let r = radius_world;
+    let gen = scratch.begin(tri_count);
+    scratch.stack.push(hit.tri as usize);
+    scratch.seen[hit.tri as usize] = gen;
+
+    while let Some(ti) = scratch.stack.pop() {
+        let (p, _uv) = tri_data(mesh, ti as u32);
+        // Same frontier test as `splat`: descend only into triangles whose closest point
+        // is within the radius (the root is always in).
+        let near = ti == hit.tri as usize || point_tri_dist(hit.pos, &p) <= r;
+        if !near {
+            continue;
+        }
+        out.push(ti as u32);
+        for &nb in &adj.neighbors[ti] {
+            if nb >= 0 && scratch.seen[nb as usize] != gen {
+                scratch.seen[nb as usize] = gen;
+                scratch.stack.push(nb as usize);
+            }
+        }
+    }
+    out
+}
+
 /// Scan-fill a triangle's UV footprint at `size`, calling `f(texel, [w0, w1, w2])`
 /// for each covered texel with its barycentric weights (`w_i` is the weight of
 /// vertex `i`). Same edge-function rasterizer as `fill.rs` / `bake.rs`.
@@ -526,6 +574,45 @@ mod tests {
             "a dab wider than a face must cross onto its neighbours (got {} islands)",
             islands.len()
         );
+    }
+
+    #[test]
+    fn splat_faces_cover_every_texel_splat_emits() {
+        // Option (B) safety: rasterizing the face set `splat_faces` returns must cover
+        // every texel the per-texel `splat` emits, for a range of dabs (small to
+        // cross-face). This is what lets the GPU dab pass — which rasterizes exactly these
+        // faces — reproduce the CPU brush's reach without enumerating texels on the CPU.
+        let size = 64;
+        let mesh = Mesh::cube();
+        let adj = Adjacency::build(&mesh);
+        for (tri, r) in [(0u32, 0.15f32), (0, 0.5), (3, 0.3), (7, 1.5)] {
+            let (p, _) = tri_data(&mesh, tri);
+            let centroid = (p[0] + p[1] + p[2]) / 3.0;
+            let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+            let hit = Hit {
+                uv: Vec2::ZERO,
+                tri,
+                pos: centroid,
+                normal,
+            };
+            let texels = splat(&mesh, &adj, &hit, r, 1.0, 1.0, size, &mut SplatScratch::new());
+            let faces = splat_faces(&mesh, &adj, &hit, r, &mut SplatScratch::new());
+            // Rasterize every emitted face into a covered-texel set.
+            let mut covered = std::collections::HashSet::new();
+            for &f in &faces {
+                let (_, uv) = tri_data(&mesh, f);
+                rasterize(&uv, size, |texel, _| {
+                    covered.insert(texel);
+                });
+            }
+            for (texel, _) in &texels {
+                assert!(
+                    covered.contains(texel),
+                    "splat texel {texel} not covered by splat_faces (tri {tri}, r {r})"
+                );
+            }
+            assert!(faces.contains(&tri), "the hit face is always in the set");
+        }
     }
 
     #[test]

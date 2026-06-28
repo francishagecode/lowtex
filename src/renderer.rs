@@ -111,8 +111,16 @@ impl TextureFilter {
     }
 }
 
+/// The pre-stroke colour + mask of the one layer a stroke touches — the resolve/deposit
+/// base and the single-layer undo snapshot (see `Renderer::pending`).
+struct StrokeBackup {
+    active: usize,
+    tex: PaintTexture,
+    mask: PaintTexture,
+}
+
 /// What the brush paints into (G11).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaintTarget {
     /// The active layer's color.
     Color,
@@ -209,6 +217,12 @@ const BRUSH_RING_SEGMENTS: u32 = 48;
 /// How opaque the brush stamp *preview* ghost is, as a fraction of the dab's own
 /// per-texel coverage. Low enough to read as a preview, high enough to see the color.
 const BRUSH_PREVIEW_ALPHA: f32 = 0.5;
+
+/// Skip the per-texel hover ghost once a dab's UV footprint exceeds this many texels.
+/// The ghost re-runs the CPU `splat` on every cursor move, so for a large brush it costs
+/// as much as a real dab (tens of ms/frame) — the dominant idle-frame cost. Past this the
+/// cursor ring alone conveys the brush size; smaller brushes keep the live colour ghost.
+const PREVIEW_MAX_TEXELS: usize = 30_000;
 
 /// A vertex of the thick-line compass. Each axis segment is a quad (6 of these),
 /// so a vertex carries the *whole* segment (`start`, `end`) plus its corner in
@@ -392,6 +406,14 @@ pub struct Renderer {
     brush_image_mode: BrushImageMode,
     stamp_angle: f32,
     stamp_tint: bool,
+    // Brush alpha tip: an optional grayscale image that shapes the dab in place of the
+    // built-in circular falloff. When set, each dab projects every covered texel into the
+    // same oriented tangent frame the decal stamp uses (`decal_frame`, world-up aligned +
+    // `stamp_angle`) and reads the image's brightness (× its alpha) as coverage — so a
+    // star/square/grain tip paints the brush colour in that shape. `invert` flips it for
+    // black-on-white tip packs. The image is an RGBA8 `Material` (same loader/thumbnail).
+    brush_alpha: Option<crate::material::Material>,
+    brush_alpha_invert: bool,
 
     // Mirror painting (symmetry): when `Some`, each dab is also stamped at its
     // reflection across the model-symmetry plane for this axis (through the mesh
@@ -411,9 +433,12 @@ pub struct Renderer {
     // Undo/redo over the layer stack. A stroke records one entry on release (via
     // `pending` + `stroke_dirty`); discrete layer ops record one each.
     history: History,
-    // The layer stack as it was when the in-progress stroke began; committed to
-    // history on `end_stroke` only if the stroke actually painted anything.
-    pending: Option<Layers>,
+    // The *active layer* as it was when the in-progress stroke began — the immutable base
+    // the per-frame resolve/deposit blends over, and the single-layer undo snapshot
+    // committed to history on `end_stroke` (only if the stroke painted). Just the touched
+    // layer, not the whole stack: a stroke can't change any other layer, and the full-stack
+    // clone was a ~quarter-second freeze at every stroke start at 4K.
+    pending: Option<StrokeBackup>,
     stroke_dirty: bool,
 
     // --- Dirty tracking for save / autosave (G31) ---
@@ -457,6 +482,64 @@ pub struct Renderer {
     // Cached baked mesh maps (AO/edge) at the current resolution; invalidated on
     // model load or resolution change.
     mesh_maps: Option<crate::bake::MeshMaps>,
+    // GPU mesh-map baker (Phase 2.5): ray-traces AO + sun against the BVH on the GPU,
+    // so AO scales to 2K/4K and the sun is an interactive slider. The CPU rasterization
+    // still feeds it pos/nrm/mask; `bake::bake`/`compute_light` stay the parity oracle.
+    gpu_baker: crate::gpu_bake::GpuBaker,
+
+    // GPU dab stamping (Phase 1, LOWTEX_GPU_PAINT). When `gpu_paint` is on, the core
+    // solid-colour surface brush stamps its dabs into a GPU coverage texture
+    // (`surface::splat_faces` → `gpu_dab`) instead of the CPU `splat` + `deposit`; the
+    // accumulated coverage is resolved into the active layer once per frame. Mask / erase
+    // / image / decal strokes stay on the CPU path. The CPU `splat`+`deposit` remain the
+    // default and the parity oracle (`real_stroke_flush_matches_full`, gpu_dab tests).
+    gpu_dab: crate::gpu_dab::GpuDab,
+    gpu_paint: bool,
+    // GPU display compositing (Phase 1–3, LOWTEX_GPU_DISPLAY). When on, the layer stack is
+    // composited + palette-quantized + gutter-bled on the GPU into `gpu_layers`' atlas, and
+    // the model samples that atlas (`gpu_bind_group`) instead of the CPU `paint_texture_gpu`.
+    // Off by default; the CPU `composite_display` stays the export path + parity oracle.
+    gpu_layers: crate::gpu_layers::GpuLayers,
+    gpu_display: bool,
+    gpu_bind_group: Option<wgpu::BindGroup>,
+    // For a resolve stroke painting a tiled material brush: the tile factor (the material
+    // texture is mirrored to the GPU on demand, keyed on `gpu_material_gen`). `None` = solid
+    // colour / eraser.
+    gpu_stroke_material: Option<f32>,
+    gpu_material_gen: Option<u64>,
+    // True for the current stroke when it takes the fully-GPU resolve path (no in-stroke
+    // readback): coverage resolves straight into the active layer's GPU slice, the display
+    // composites from the slices, and the CPU `Layers` is reconciled once at `end_stroke`.
+    // Only solid-colour / eraser surface strokes with GPU display on; everything else keeps
+    // the readback path. Decided at the stroke's first dab (`gpu_surface_dab`).
+    gpu_stroke_resolve: bool,
+    // The (resolution, topology) the static UV coverage currently on `gpu_layers` was built
+    // for. The gutter mask depends on both, so re-push when either changes — a same-resolution
+    // mesh swap (different UVs) must NOT keep bleeding with the old gutters.
+    gpu_coverage_gen: Option<(u32, u64)>,
+    // The texel region stamped since the last resolve (the per-frame dirty rect for the
+    // GPU stroke), the stroke's solid colour to blend the coverage with at resolve, and
+    // whether the stroke erases (lowers alpha toward transparent) rather than lays colour.
+    gpu_stroke_rect: Option<TexRect>,
+    // The union of every texel a stroke painted, accumulated across the whole stroke (not
+    // consumed per frame like `dirty_rect`/`gpu_stroke_rect`). Under GPU display the in-stroke
+    // paint paths leave the CPU display mirror (`display_buf`/`paint_texture_gpu`) stale — the
+    // model samples the GPU atlas, but the 2D UV editor, brush preview and export read the CPU
+    // mirror — so `end_stroke` re-syncs exactly this region once the layers are reconciled.
+    stroke_paint_rect: Option<TexRect>,
+    // True while the active stroke is a 2D UV-editor stroke (flat discs painted straight in
+    // texel space). The user watches the 2D panel (the CPU `display_buf` mirror) as they paint,
+    // so under GPU display this keeps the cheap CPU display path live each frame — otherwise the
+    // panel wouldn't refresh until `end_stroke`, looking like the stroke never lands. A 3D model
+    // stroke leaves this false: the model samples the GPU atlas live; the panel waits for the
+    // end-of-stroke re-sync.
+    uv_stroke: bool,
+    gpu_stroke_color: [u8; 3],
+    gpu_stroke_erase: bool,
+    // Which target this GPU stroke resolves into — the layer's colour or its reveal mask
+    // (captured per dab; `gpu_stroke_color` carries the solid colour, or white/black for
+    // mask reveal/hide).
+    gpu_stroke_target: PaintTarget,
     // Cached UV-island map at the current resolution, driving the fill tools.
     // Invalidated alongside mesh_maps (geometry or resolution change).
     fill_map: Option<crate::fill::FillMap>,
@@ -555,7 +638,20 @@ impl Renderer {
         });
         let adapter = request_adapter(&instance, None).await;
         let (device, queue) = request_device(&adapter).await;
+        Self::build_headless(device, queue, width, height, mesh)
+    }
 
+    /// Build a headless renderer onto an already-acquired device/queue (sync). Split
+    /// out of `new_headless` so the test suite can share one device across many renderers
+    /// — each test creating its own `wgpu::Device` exhausts the driver (OutOfMemory) once
+    /// enough run in parallel. Production still calls `new_headless`, which owns its device.
+    pub(crate) fn build_headless(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        width: u32,
+        height: u32,
+        mesh: Mesh,
+    ) -> Self {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: OFFSCREEN_FORMAT,
@@ -884,6 +980,13 @@ impl Renderer {
         let stroke_coverage = vec![0.0f32; texels];
         let stroke_stamp = vec![0u32; texels];
 
+        // GPU mesh-map baker (built once; uploads its mesh on the first map/AO/sun use).
+        let gpu_baker = crate::gpu_bake::GpuBaker::new(&device);
+        // GPU dab stamper (built once; its stroke target is created on the first stroke).
+        let gpu_dab = crate::gpu_dab::GpuDab::new(&device);
+        // GPU layer compositor (built once; residency created on the first display sync).
+        let gpu_layers = crate::gpu_layers::GpuLayers::new(&device);
+
         let mut r = Self {
             window: None,
             surface: None,
@@ -936,6 +1039,8 @@ impl Renderer {
             brush_image_mode: BrushImageMode::Tiled,
             stamp_angle: 0.0,
             stamp_tint: false,
+            brush_alpha: None,
+            brush_alpha_invert: false,
             symmetry: None,
             lock_face: false,
             stroke_lock_facets: None,
@@ -956,6 +1061,22 @@ impl Renderer {
             mesh,
             bvh,
             mesh_maps: None,
+            gpu_baker,
+            gpu_dab,
+            gpu_paint: force_gpu_paint(),
+            gpu_layers,
+            gpu_display: force_gpu_display(),
+            gpu_bind_group: None,
+            gpu_stroke_material: None,
+            gpu_material_gen: None,
+            gpu_stroke_resolve: false,
+            gpu_coverage_gen: None,
+            gpu_stroke_rect: None,
+            stroke_paint_rect: None,
+            uv_stroke: false,
+            gpu_stroke_color: [0, 0, 0],
+            gpu_stroke_erase: false,
+            gpu_stroke_target: PaintTarget::Color,
             fill_map: None,
             surface_adj: None,
             splat_scratch: crate::surface::SplatScratch::new(),
@@ -1189,6 +1310,7 @@ impl Renderer {
         // here) changed under the cursor, so rebuild the ghost and ring next frame.
         self.last_preview = None;
         self.last_ring = None;
+        self.update_gpu_display();
     }
 
     /// Recompute just the texels a stroke touched (the dirty-rectangle path). Produces
@@ -1262,12 +1384,94 @@ impl Renderer {
         self.paint_version = self.paint_version.wrapping_add(1);
     }
 
+    /// (Re)build the GPU composite atlas (composite + palette quantize + gutter bleed on
+    /// the GPU) from the current CPU layer stack, and point the model at it. No-op unless
+    /// `LOWTEX_GPU_DISPLAY` is on. The CPU `display_buf` / `paint_texture_gpu` still feed the
+    /// 2D UV editor + brush preview (export composites fresh); they're kept in sync by the
+    /// CPU refreshes here and by `end_stroke`'s per-region re-sync after a GPU-display stroke.
+    /// The GPU pipeline is the byte-parity twin of `composite_display` (see gpu_layers tests).
+    fn update_gpu_display(&mut self) {
+        if !self.gpu_display {
+            return;
+        }
+        self.gpu_sync_layers();
+        self.gpu_compose();
+    }
+
+    /// Mirror the CPU layer stack into the GPU layer arrays. The expensive part of a GPU
+    /// display refresh; skipped during a resolve stroke (the active slice runs ahead on the
+    /// GPU, so re-uploading the stale CPU pixels would clobber it).
+    fn gpu_sync_layers(&mut self) {
+        self.gpu_layers.upload(&self.device, &self.queue, &self.layers);
+    }
+
+    /// Composite the GPU layer arrays → atlas (palette quantize + gutter bleed folded in)
+    /// and point the model at the result. Reads whatever is currently in the layer slices,
+    /// so it's correct both after a `gpu_sync_layers` (display refresh) and after a paint
+    /// `resolve_active` (resolve stroke).
+    fn gpu_compose(&mut self) {
+        let ps = self.palette_settings;
+        self.gpu_layers.set_quantize(
+            &self.queue,
+            &self.palette,
+            ps.enabled && !self.palette.colors.is_empty(),
+            ps.dither,
+            ps.dither_strength,
+        );
+        // Push the static UV coverage for the gutter bleed. Keyed on (resolution, topology):
+        // `topo_version` bumps on every mesh load / re-unwrap — exactly when the UV layout (and
+        // so the gutter mask) changes — so a same-resolution mesh swap re-pushes instead of
+        // bleeding the new atlas with the previous mesh's gutters (jagged seams on the model).
+        let cov_gen = (self.tex_size, self.topo_version);
+        if self.gpu_coverage_gen != Some(cov_gen) {
+            self.ensure_coverage();
+            if let Some(cov) = self.coverage.borrow().as_ref() {
+                self.gpu_layers.set_coverage(&self.queue, cov);
+                self.gpu_coverage_gen = Some(cov_gen);
+            }
+        }
+        self.gpu_layers.composite(&self.device, &self.queue);
+        self.gpu_layers.bleed(&self.device, &self.queue, self.bleed_pad());
+        // Point the model's bind group at the freshly composited atlas.
+        if let Some(view) = self.gpu_layers.atlas_srgb_view() {
+            self.gpu_bind_group = Some(make_paint_bind_group_view(
+                &self.device,
+                &self.bind_group_layout,
+                &self.uniform_buffer,
+                view,
+                &self.sampler,
+            ));
+        }
+    }
+
     /// Apply any pending stroke dirty-rect to the GPU, once per frame. Cheap no-op when
     /// nothing was painted since the last call. Called from the app's redraw and before
     /// headless `capture`.
     pub fn flush_paint(&mut self) {
+        // GPU paint: pick up the previous frame's coverage readback and apply it, issue this
+        // frame's (async, no stall), and grow `dirty_rect`. No-op on the CPU path.
+        self.pump_gpu_stroke();
         if let Some(rect) = self.dirty_rect.take() {
-            self.refresh_display_region(rect);
+            if self.gpu_display {
+                // A 2D UV-editor stroke paints into the very panel it's drawn on (the CPU
+                // `display_buf` mirror), so keep that path live each frame — it's a cheap flat
+                // disc, and `refresh_display_region` bumps `paint_version` so the panel
+                // re-uploads. (Without this the panel wouldn't refresh until `end_stroke`,
+                // looking like the stroke never lands.)
+                if self.uv_stroke {
+                    self.refresh_display_region(rect);
+                }
+                // 3D-model stroke (readback path: mask / decal stamp / effected layer): the model
+                // samples the atlas, so the CPU composite/quantize/bleed/upload would be wasted
+                // work — mirror only the changed active layer and recomposite on the GPU. (The 2D
+                // panel re-syncs once at `end_stroke`.) For a UV stroke this also keeps the model
+                // in step with the panel.
+                self.gpu_layers
+                    .upload_active(&self.device, &self.queue, &self.layers);
+                self.gpu_compose();
+            } else {
+                self.refresh_display_region(rect);
+            }
         }
     }
 
@@ -1349,16 +1553,35 @@ impl Renderer {
     /// opacity-slider drag) checkpoint once at drag start via the UI, and strokes
     /// use the `begin_stroke`/`end_stroke` pair instead.
     pub fn checkpoint(&mut self) {
-        let before = self.layers.clone();
-        self.history.record(before);
+        // A discrete edit can change the stack structure, so snapshot the whole stack.
+        self.history
+            .record(crate::history::Snapshot::Stack(self.layers.clone()));
         self.mark_edited();
+    }
+
+    /// One-time, opt-in seam cleanup for art painted *before* the conservative-dab fix: fill the
+    /// dark under-coverage "teeth" at island edges from neighbouring paint of the **same UV facet**,
+    /// only on the island rim. Region-aware (`fill_map.texel_facet`) so it can't smear an adjacent
+    /// island's colour across a seam, and rim-bounded so interior transparency is untouched — see
+    /// `bleed::fill_island_rim_teeth`. One undo step; a no-op on fully-opaque layers. New painting no
+    /// longer needs this (the GPU dab is conservative); it just repairs old files without a repaint.
+    pub fn clean_seams(&mut self) {
+        self.checkpoint();
+        self.ensure_fill_map();
+        let size = self.tex_size;
+        let pad = self.bleed_pad();
+        {
+            let tf = &self.fill_map.as_ref().unwrap().texel_facet;
+            for layer in &mut self.layers.layers {
+                crate::bleed::fill_island_rim_teeth(&mut layer.tex.pixels, tf, size, pad);
+            }
+        }
+        self.refresh_display_texture();
     }
 
     /// Step back to the previous layer state, if any.
     pub fn undo(&mut self) {
-        let current = self.layers.clone();
-        if let Some(prev) = self.history.undo(current) {
-            self.layers = prev;
+        if self.history.undo(&mut self.layers) {
             self.restore_after_history();
             self.mark_edited();
         }
@@ -1366,9 +1589,7 @@ impl Renderer {
 
     /// Step forward to the next layer state, if any.
     pub fn redo(&mut self) {
-        let current = self.layers.clone();
-        if let Some(next) = self.history.redo(current) {
-            self.layers = next;
+        if self.history.redo(&mut self.layers) {
             self.restore_after_history();
             self.mark_edited();
         }
@@ -1691,16 +1912,18 @@ impl Renderer {
     fn dab_splats(&mut self, hit: &Hit, brush: &Brush) -> Vec<(usize, f32)> {
         let radius_world = self.world_brush_radius(hit.tri, brush.radius);
         let adj = self.surface_adj.as_ref().unwrap();
-        crate::surface::splat(
-            &self.mesh,
-            adj,
-            hit,
-            radius_world,
-            brush.opacity,
-            brush.hardness,
-            self.tex_size,
-            &mut self.splat_scratch,
-        )
+        crate::perf::time("preview_splat", || {
+            crate::surface::splat(
+                &self.mesh,
+                adj,
+                hit,
+                radius_world,
+                brush.opacity,
+                brush.hardness,
+                self.tex_size,
+                &mut self.splat_scratch,
+            )
+        })
     }
 
     /// Refresh the brush stamp preview for this frame: a translucent ghost of the dab
@@ -1742,6 +1965,16 @@ impl Renderer {
                 size,
                 rect,
             );
+            // Under GPU display the model samples the atlas, so the ghost also lives there —
+            // revert that region too. `display_buf` mirrors the committed atlas (kept in sync
+            // by every refresh / `end_stroke`), so it's the correct restore source. During a
+            // stroke the per-frame `gpu_compose` rebuilds the whole atlas anyway, so this is at
+            // worst redundant, never wrong.
+            if self.gpu_display {
+                if let Some(atlas) = self.gpu_layers.atlas_texture() {
+                    upload_region(&self.queue, atlas, &self.display_buf, size, rect);
+                }
+            }
         }
         let Some((x, y)) = cursor else { return };
         // A real stroke already shows the truth; a mask ghost (white/black) isn't
@@ -1757,6 +1990,22 @@ impl Renderer {
         };
         self.ensure_surface_adj();
 
+        // Bound the ghost: the per-texel preview re-runs the CPU `splat` on every cursor
+        // move, so for a large brush it costs as much as a real dab (tens of ms/frame —
+        // the dominant idle-frame lag). Flood the *cheap* face set first and skip the ghost
+        // when its UV footprint is large; the cursor ring still shows the size.
+        let radius_world = self.world_brush_radius(hit.tri, brush.radius);
+        let faces = {
+            let adj = self.surface_adj.as_ref().unwrap();
+            crate::surface::splat_faces(&self.mesh, adj, &hit, radius_world, &mut self.splat_scratch)
+        };
+        if self
+            .faces_uv_rect(&faces)
+            .is_some_and(|r| r.width() as usize * r.height() as usize > PREVIEW_MAX_TEXELS)
+        {
+            return; // large brush — ring only, no ghost (the previous ghost is already reverted)
+        }
+
         // The dab's footprint, plus the symmetric dab's, exactly as a click would lay
         // it — as `(texel, coverage, rgb)` so the stamp (per-texel decal color) and the
         // tiled/solid brush (one color, sampled or flat) share one ghost render below.
@@ -1770,10 +2019,22 @@ impl Renderer {
             }
             s.into_iter().map(|(t, (a, rgb))| (t, a, rgb)).collect()
         } else {
-            let mut s = self.dab_splats(&hit, brush);
-            if let Some(m) = &mirror {
-                s.extend(self.dab_splats(m, brush));
-            }
+            // Coverage comes from the alpha tip (its shape) when one is loaded, else the
+            // circular falloff — matching `surface_dab`. The colour laid is the same either
+            // way (tiled material or flat swatch), so only the coverage source differs.
+            let mut s = if self.alpha_tip_active() {
+                let mut s = self.alpha_tip_splats(&hit, brush);
+                if let Some(m) = &mirror {
+                    s.extend(self.alpha_tip_splats(m, brush));
+                }
+                s
+            } else {
+                let mut s = self.dab_splats(&hit, brush);
+                if let Some(m) = &mirror {
+                    s.extend(self.dab_splats(m, brush));
+                }
+                s
+            };
             // Tiled brush: the image sampled UV-anchored; else the flat brush color.
             let tile = self.brush_tile;
             let solid = brush.color_u8();
@@ -1830,6 +2091,15 @@ impl Renderer {
             }
         }
         upload_packed(&self.queue, &self.paint_texture_gpu, &packed, rect);
+        // Mirror the ghost into the GPU atlas so it shows on the model under GPU display (the
+        // model samples the atlas, not `paint_texture_gpu`). Only reached while hovering
+        // (`pending` is `None` here — a mid-stroke ghost already returned above), so this never
+        // races the in-stroke compose.
+        if self.gpu_display {
+            if let Some(atlas) = self.gpu_layers.atlas_texture() {
+                upload_packed(&self.queue, atlas, &packed, rect);
+            }
+        }
         self.preview_rect = Some(rect);
     }
 
@@ -1844,6 +2114,35 @@ impl Renderer {
     pub fn clear_brush_material(&mut self) {
         self.brush_material = None;
         self.brush_material_gen = self.brush_material_gen.wrapping_add(1);
+    }
+
+    /// Load a grayscale alpha tip that shapes the brush in place of the circle.
+    pub fn load_brush_alpha(&mut self, path: &str) -> Result<(), String> {
+        self.brush_alpha = Some(crate::material::Material::load(path)?);
+        Ok(())
+    }
+
+    /// Drop the loaded alpha tip; the brush reverts to the built-in circular falloff.
+    pub fn clear_brush_alpha(&mut self) {
+        self.brush_alpha = None;
+    }
+
+    /// Invert the alpha tip (treat dark instead of light pixels as paint), for
+    /// black-on-white tip packs.
+    pub fn set_brush_alpha_invert(&mut self, invert: bool) {
+        self.brush_alpha_invert = invert;
+    }
+
+    /// True when an alpha tip is loaded — the surface dab then shapes coverage from the
+    /// tip image instead of the radial falloff.
+    fn alpha_tip_active(&self) -> bool {
+        self.brush_alpha.is_some()
+    }
+
+    /// A small antialiased preview (≤`max`×`max`, RGBA8) of the loaded alpha tip, for the
+    /// UI swatch; `None` when no tip is loaded.
+    pub fn brush_alpha_thumbnail(&self, max: u32) -> Option<(u32, u32, Vec<u8>)> {
+        self.brush_alpha.as_ref().map(|m| m.thumbnail(max))
     }
 
     /// How the loaded brush image is applied — tiled "Brush" paint or an oriented "Stamp".
@@ -1937,6 +2236,60 @@ impl Renderer {
             if a > 0.0 {
                 let rgb = if tint { solid } else { [c[0], c[1], c[2]] };
                 out.push((texel, (a, rgb)));
+            }
+        }
+        out
+    }
+
+    /// The texels one alpha-tip dab at `hit` would cover, as `(texel, coverage)`. Like
+    /// `decal_splats` it floods the surface to the dab's square reach and projects each
+    /// texel into the oriented tangent frame (`decal_frame`: world-up aligned, rotated by
+    /// `stamp_angle`), but the sample drives *coverage* — the caller's `deposit` then lays
+    /// the brush colour (or erases / tiles a material) in that shape. Coverage is the tip
+    /// image's brightness × its alpha (× `brush.opacity`), inverted when `brush_alpha_invert`.
+    /// Texels outside the tip's [0,1]² footprint are dropped. `ensure_surface_adj` must run
+    /// first.
+    fn alpha_tip_splats(&mut self, hit: &Hit, brush: &Brush) -> Vec<(usize, f32)> {
+        let Some(tip) = self.brush_alpha.as_ref() else {
+            return Vec::new();
+        };
+        // The tip fills the brush-radius footprint: half-side = the world radius, so the
+        // square's corners reach radius·√2. Flood that far (plus a hair) then clip to [0,1]².
+        let half = self.world_brush_radius(hit.tri, brush.radius);
+        if half <= 0.0 {
+            return Vec::new();
+        }
+        let reach = half * std::f32::consts::SQRT_2 * 1.02;
+        let (center, t, b) = self.decal_frame(hit);
+        let inv = 1.0 / (2.0 * half);
+        let invert = self.brush_alpha_invert;
+        let opacity = brush.opacity;
+
+        let adj = self.surface_adj.as_ref().unwrap();
+        let pts = crate::surface::splat_world(
+            &self.mesh,
+            adj,
+            hit,
+            reach,
+            self.tex_size,
+            &mut self.splat_scratch,
+        );
+        let mut out = Vec::with_capacity(pts.len());
+        for (texel, wp) in pts {
+            let d = wp - center;
+            let u = d.dot(t) * inv + 0.5;
+            let v = d.dot(b) * inv + 0.5;
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                continue;
+            }
+            let c = tip.sample(u, v, 1.0); // tile=1: one placement, no repeat
+            // Perceptual luma (grayscale tips have r=g=b, so this is just their value),
+            // gated by the image's own alpha so cutout PNGs work too.
+            let lum = (0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32) / 255.0;
+            let lum = if invert { 1.0 - lum } else { lum };
+            let a = opacity * lum * (c[3] as f32 / 255.0);
+            if a > 0.0 {
+                out.push((texel, a));
             }
         }
         out
@@ -2206,7 +2559,9 @@ impl Renderer {
         self.sun_shadow = shadow;
     }
 
-    /// Bake the mesh maps for the current resolution if not already cached.
+    /// Bake the mesh maps for the current resolution if not already cached. The CPU
+    /// rasterizes the geometry maps (cheap, BVH-free); the GPU ray-traces AO (the heavy
+    /// part, which scales to 2K/4K), then uploads the residency the sun bake reuses.
     fn ensure_mesh_maps(&mut self) {
         let stale = self
             .mesh_maps
@@ -2214,7 +2569,26 @@ impl Renderer {
             .is_none_or(|m| m.size != self.tex_size);
         if stale {
             log::info!("baking mesh maps at {}²…", self.tex_size);
-            self.mesh_maps = Some(crate::bake::bake(&self.mesh, &self.bvh, self.tex_size));
+            if force_cpu_bake() {
+                // CPU reference path (LOWTEX_CPU_BAKE): the full rayon bake, no GPU — the
+                // oracle the GPU bake is diffed against, and a field escape hatch.
+                self.mesh_maps = Some(crate::bake::bake(&self.mesh, &self.bvh, self.tex_size));
+                return;
+            }
+            let mut maps = crate::bake::bake_geometry(&self.mesh, self.tex_size);
+            // Upload the BVH + rasterized pos/nrm/mask, then ray-trace AO on the GPU.
+            // Disjoint field borrows: &mut gpu_baker with &device/&bvh, then a read of
+            // the just-built `maps` channels.
+            self.gpu_baker.upload(
+                &self.device,
+                &self.bvh,
+                &maps.pos,
+                &maps.nrm,
+                &maps.mask,
+                maps.diag,
+            );
+            maps.ao = self.gpu_baker.ao(&self.device, &self.queue);
+            self.mesh_maps = Some(maps);
         }
     }
 
@@ -2238,10 +2612,22 @@ impl Renderer {
             .as_ref()
             .is_none_or(|m| m.light_params != Some((dir, shadow)));
         if need {
-            // Disjoint field borrows: &self.bvh while &mut self.mesh_maps.
-            let bvh = &self.bvh;
+            if force_cpu_bake() {
+                // CPU reference path (LOWTEX_CPU_BAKE): no GPU residency was uploaded, so
+                // recompute the sun on the CPU. Disjoint borrows: &self.bvh, &mut maps.
+                let bvh = &self.bvh;
+                if let Some(m) = self.mesh_maps.as_mut() {
+                    m.compute_light(bvh, dir, shadow);
+                }
+                return;
+            }
+            // GPU sun bake against the residency `ensure_mesh_maps` just uploaded — a
+            // params write + dispatch + readback, so dragging the sun re-bakes live even
+            // at 2K. The CPU `compute_light` stays the parity oracle (gpu_bake tests).
+            let light = self.gpu_baker.sun(&self.device, &self.queue, dir, shadow);
             if let Some(m) = self.mesh_maps.as_mut() {
-                m.compute_light(bvh, dir, shadow);
+                m.light = light;
+                m.light_params = Some((dir, shadow));
             }
         }
     }
@@ -2904,20 +3290,74 @@ impl Renderer {
         self.stroke_lock_facets = None;
         // Snapshot the pre-stroke stack so the whole stroke is one undo step. Held
         // until release, then committed only if the stroke actually painted.
-        self.pending = Some(self.layers.clone());
+        self.pending = Some(crate::perf::time("stroke_snapshot", || {
+            let a = self.layers.active;
+            StrokeBackup {
+                active: a,
+                tex: self.layers.layers[a].tex.clone(),
+                mask: self.layers.layers[a].mask.clone(),
+            }
+        }));
         self.stroke_dirty = false;
         // The hover ghost must be reverted now the stroke is taking over; force the
         // preview path to run (and clear it) next frame rather than skip on a match.
         self.last_preview = None;
+        // GPU paint: open a fresh per-stroke coverage target. Always done when the flag is
+        // on (a cheap clear) — even if this stroke turns out to be a CPU-path variant, the
+        // unused target is harmless.
+        if self.gpu_paint {
+            self.gpu_dab
+                .begin_stroke(&self.device, &self.queue, self.tex_size);
+            // Fully-GPU display: make sure the active layer's slice is current (only it can
+            // change during a stroke), then snapshot it as the resolve base. Non-active
+            // slices stay current from the last display refresh, so no full re-upload.
+            if self.gpu_display {
+                self.gpu_layers
+                    .upload_active(&self.device, &self.queue, &self.layers);
+                self.gpu_layers
+                    .begin_stroke_resolve(&self.device, &self.queue, self.layers.active as u32);
+                // Mirror the brush material to the GPU for the material resolve path, but
+                // only when it changed (keyed on the brush's material generation).
+                if let Some(mat) = self.brush_material.as_ref() {
+                    if self.gpu_material_gen != Some(self.brush_material_gen) {
+                        self.gpu_layers.set_material(&self.device, &self.queue, mat);
+                        self.gpu_material_gen = Some(self.brush_material_gen);
+                    }
+                }
+            }
+        }
+        self.gpu_stroke_rect = None;
+        self.gpu_stroke_resolve = false;
+        self.gpu_stroke_material = None;
+        self.stroke_paint_rect = None;
+        self.uv_stroke = false;
+    }
+
+    /// Grow the whole-stroke painted region by one dab's texel footprint. Unlike
+    /// `dirty_rect` (consumed every frame by `flush_paint`), this survives until
+    /// `end_stroke` so the CPU display mirror can be re-synced over exactly the painted area.
+    fn grow_stroke_paint_rect(&mut self, r: TexRect) {
+        self.stroke_paint_rect = Some(match self.stroke_paint_rect {
+            Some(prev) => prev.union(r),
+            None => r,
+        });
     }
 
     /// End the current stroke, committing it to history as a single undo step.
     /// A stroke that never hit the mesh (`stroke_dirty` false) records nothing,
     /// so an errant click off the model doesn't leave an empty undo entry.
     pub fn end_stroke(&mut self) {
+        // Drain the pipelined GPU coverage into the active layer first — it reads the
+        // pre-stroke base from `pending`, which the commit below consumes — so the in-flight
+        // and just-stamped regions aren't lost. One blocking sync, on release only.
+        self.finish_gpu_stroke();
         if let Some(before) = self.pending.take() {
             if self.stroke_dirty {
-                self.history.record(before);
+                self.history.record(crate::history::Snapshot::Layer {
+                    index: before.active,
+                    tex: before.tex,
+                    mask: before.mask,
+                });
                 self.mark_edited();
                 // Auto-name the layer from the stroke (color only — mask painting
                 // shapes *where* a layer shows, not its content, so it adds no token).
@@ -2932,6 +3372,20 @@ impl Renderer {
             }
         }
         self.stroke_dirty = false;
+        // Under GPU display the in-stroke paths recomposited the GPU atlas (which the model
+        // samples) but left the CPU display mirror stale, since the per-frame CPU
+        // composite/upload would be wasted work off the model's path. The 2D UV editor, brush
+        // preview and export still read that mirror, so re-sync it here over just the painted
+        // region from the now-reconciled CPU layers — brush-area bounded, once per stroke, off
+        // the paint hot path. `refresh_display_region` also bumps `paint_version`, which is how
+        // the UV editor learns to re-upload. (The CPU path keeps the mirror live each frame in
+        // `flush_paint`, so this is a no-op there.)
+        let painted = self.stroke_paint_rect.take();
+        if self.gpu_display {
+            if let Some(rect) = painted {
+                self.refresh_display_region(rect);
+            }
+        }
         // The stroke is committed; re-show the hover ghost over the new pixels.
         self.last_preview = None;
     }
@@ -3088,8 +3542,28 @@ impl Renderer {
             self.deposit_rgb(&splats);
             return true;
         }
+        // Alpha tip: shape this dab's coverage from the loaded tip image instead of the
+        // circular falloff, then deposit the brush colour (or erase / tiled material) in
+        // that shape. Works for colour and mask targets and for the eraser, and takes
+        // precedence over the circular GPU/CPU paths below.
+        if self.alpha_tip_active() {
+            self.ensure_surface_adj();
+            let mut splats = self.alpha_tip_splats(hit, brush);
+            self.retain_locked(&mut splats);
+            if splats.is_empty() {
+                return false;
+            }
+            self.deposit(&splats, brush);
+            return true;
+        }
         let size = self.tex_size;
         let radius_world = self.world_brush_radius(hit.tri, brush.radius);
+        // GPU dab path: stamp the face set into the GPU coverage target instead of the
+        // CPU splat + deposit. Eligible only for the plain solid-colour surface brush
+        // (see `gpu_paint_eligible`); everything else falls through to the CPU path.
+        if self.gpu_paint_eligible(brush) {
+            return self.gpu_surface_dab(hit, radius_world, brush);
+        }
         // Distinct-field borrows (mesh/surface_adj immutable, splat_scratch mutable)
         // in one call — the reused flood scratch keeps the stroke allocation-free.
         let adj = self.surface_adj.as_ref().unwrap();
@@ -3113,6 +3587,323 @@ impl Renderer {
         }
         crate::perf::time("deposit", || self.deposit(&splats, brush));
         true
+    }
+
+    /// Whether this dab takes the GPU stamping path (Phase 1). Covered: the solid-colour
+    /// surface brush, the eraser, the *tiled image* brush, and mask painting (reveal/hide)
+    /// — all reduce to one coverage map that `resolve_gpu_stroke` applies (blend the solid
+    /// colour or the per-texel material sample, subtract alpha, or blend white/black into
+    /// the mask). Only the oriented decal *stamp* keeps its CPU `deposit_rgb` path, which a
+    /// single-channel coverage map can't model (it needs a per-texel projected colour).
+    fn gpu_paint_eligible(&self, _brush: &Brush) -> bool {
+        // An alpha tip shapes coverage on the CPU (like the decal stamp), so it rides the
+        // readback path — never the GPU circle resolve. `surface_dab` already returns before
+        // reaching here when a tip is active; this keeps the intent explicit and safe.
+        self.gpu_paint
+            && !self.alpha_tip_active()
+            && match self.paint_target {
+                // Colour: anything but the oriented decal stamp (the tiled material brush
+                // is fine — its colour is sampled per texel at resolve). The decal-paint
+                // case has already returned via `surface_dab`'s stamp branch above.
+                PaintTarget::Color => !self.stamp_active(),
+                // Mask: reveal/hide ignores any brush image, so always eligible.
+                PaintTarget::Mask => true,
+            }
+    }
+
+    /// Stamp one solid-colour dab on the GPU: flood the face set (`splat_faces`), confine
+    /// it to the locked facet(s), and `Max`-accumulate its coverage into the per-stroke GPU
+    /// target. No CPU per-texel work and no readback here — the coverage is resolved into
+    /// the layer once per frame by `resolve_gpu_stroke`. Grows `gpu_stroke_rect` by the
+    /// faces' UV footprint (the region to resolve). Returns whether it stamped anything.
+    fn gpu_surface_dab(&mut self, hit: &Hit, radius_world: f32, brush: &Brush) -> bool {
+        self.ensure_surface_adj();
+        let mut faces = {
+            let adj = self.surface_adj.as_ref().unwrap();
+            crate::surface::splat_faces(
+                &self.mesh,
+                adj,
+                hit,
+                radius_world,
+                &mut self.splat_scratch,
+            )
+        };
+        self.retain_locked_faces(&mut faces);
+        let Some(rect) = self.faces_uv_rect(&faces) else {
+            return false;
+        };
+        crate::perf::time("gpu_stamp", || {
+            self.gpu_dab.stamp(
+                &self.mesh,
+                &faces,
+                hit.pos,
+                radius_world,
+                brush.opacity,
+                brush.hardness,
+                self.tex_size,
+            );
+        });
+        // Capture how this dab resolves: paint the solid colour / erase (colour target), or
+        // blend white(reveal)/black(hide) into the mask (mask target).
+        self.gpu_stroke_target = self.paint_target;
+        match self.paint_target {
+            PaintTarget::Color => {
+                self.gpu_stroke_color = brush.color_u8();
+                self.gpu_stroke_erase = brush.erase;
+            }
+            PaintTarget::Mask => {
+                self.gpu_stroke_color = if self.mask_reveal { [255; 3] } else { [0; 3] };
+                self.gpu_stroke_erase = false;
+            }
+        }
+        self.gpu_stroke_rect = Some(match self.gpu_stroke_rect {
+            Some(prev) => prev.union(rect),
+            None => rect,
+        });
+        self.grow_stroke_paint_rect(rect);
+        // Take the no-readback resolve path for the solid-colour brush, the eraser, AND the
+        // tiled material brush under GPU display: the resolve shader samples the material per
+        // texel (resolve.wgsl mode 2), so it needs no GPU→CPU readback or CPU per-texel blend —
+        // the win for the material brush from the lag report. The mask target and the oriented
+        // decal stamp keep the readback path (a single coverage channel can't carry the mask's
+        // separate target or the stamp's per-texel projected colour). Excluded too when the
+        // active layer carries effects: the GPU slice holds its *effected* pixels, so resolving
+        // + reconciling into the stored pixels would bake the (non-destructive) effect in.
+        // (The deferred-bleed regression that first forced material onto the readback path is
+        // gone — the resolve path now does a full compose+bleed every frame, like the readback
+        // path, so seam gutters stay filled live.)
+        let active_clean = self.layers.layers[self.layers.active]
+            .effects
+            .iter()
+            .all(crate::effects::Effect::is_identity);
+        self.gpu_stroke_resolve = self.gpu_display
+            && self.paint_target == PaintTarget::Color
+            && !self.stamp_active()
+            && active_clean;
+        // Carry the tile factor when this resolve stroke paints a material (the shader keys
+        // `ResolveKind::Material` off it); `None` falls through to the solid-colour resolve.
+        self.gpu_stroke_material = (self.gpu_stroke_resolve && self.brush_material.is_some())
+            .then_some(self.brush_tile);
+        self.stroke_dirty = true;
+        true
+    }
+
+    /// Face-lock for the GPU path: drop every face not on one of the stroke's locked
+    /// facets, the face-set analogue of `retain_locked` (a facet *is* a set of faces, so
+    /// this confines the dab exactly). No-op when the lock is off or unset.
+    fn retain_locked_faces(&self, faces: &mut Vec<u32>) {
+        if !self.lock_face {
+            return;
+        }
+        let Some(locked) = self.stroke_lock_facets.as_deref() else {
+            return;
+        };
+        if locked.is_empty() {
+            return; // the first dab resolved no facet — paint freely
+        }
+        let Some(map) = self.fill_map.as_ref() else {
+            return;
+        };
+        faces.retain(|&f| {
+            map.facet_for_tri(f)
+                .is_some_and(|fc| locked.contains(&(fc as i32)))
+        });
+    }
+
+    /// The texel bounding box of a face set's UV footprint, matching the rasterizer's
+    /// `floor(min)..ceil(max)` bounds, clamped to the atlas — the region the GPU dab can
+    /// touch and the renderer must resolve. `None` if empty/degenerate.
+    fn faces_uv_rect(&self, faces: &[u32]) -> Option<TexRect> {
+        if faces.is_empty() {
+            return None;
+        }
+        let size = self.tex_size as f32;
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &f in faces {
+            let (_, uv) = crate::surface::tri_data(&self.mesh, f);
+            for c in uv {
+                minx = minx.min(c.x);
+                maxx = maxx.max(c.x);
+                miny = miny.min(c.y);
+                maxy = maxy.max(c.y);
+            }
+        }
+        let x0 = (minx * size).floor().max(0.0) as u32;
+        let y0 = (miny * size).floor().max(0.0) as u32;
+        let x1 = ((maxx * size).ceil().max(0.0) as u32).min(self.tex_size);
+        let y1 = ((maxy * size).ceil().max(0.0) as u32).min(self.tex_size);
+        (x1 > x0 && y1 > y0).then_some(TexRect { x0, y0, x1, y1 })
+    }
+
+    /// Blend the GPU stroke's accumulated coverage (since the last resolve) into the active
+    /// layer, then reset the per-frame rect. The coverage texture holds the per-stroke max
+    /// coverage; `pending` holds the pre-stroke pixels (the immutable base), so every
+    /// resolve re-blends `base·(1-cov) + colour·cov` for the dirty region — idempotent and
+    /// re-entrant across frames. Disjoint field borrows: `base` from `pending`, target from
+    /// `layers`. No-op on the CPU path (`gpu_stroke_rect` stays `None`).
+    /// Pipelined GPU-stroke resolve (per frame): pick up the *previous* frame's coverage
+    /// readback (already finished on the GPU, so no stall) and apply it, then submit an
+    /// asynchronous readback for this frame's freshly-stamped region. One frame of latency,
+    /// but the CPU never blocks on the GPU mid-stroke — the fix for the `poll(Wait)` stall
+    /// that dominated paint cost. A new readback is only issued once the prior one is
+    /// consumed, so `gpu_stroke_rect` accumulates while a copy is in flight (no region lost).
+    fn pump_gpu_stroke(&mut self) {
+        // Rasterize this frame's accumulated dabs in one submit before reading anything back.
+        self.gpu_dab.flush_dabs(&self.device, &self.queue);
+        // No-readback path: resolve coverage straight into the active GPU slice and
+        // recomposite — no GPU→CPU stall, no CPU per-texel blend.
+        if self.gpu_stroke_resolve {
+            self.resolve_gpu_stroke_frame();
+            return;
+        }
+        if let Some((cov, rect)) =
+            crate::perf::time("gpu_resolve", || self.gpu_dab.try_take_readback(&self.device))
+        {
+            crate::perf::time("gpu_apply", || self.apply_gpu_coverage(&cov, rect));
+        }
+        if !self.gpu_dab.has_pending() {
+            if let Some(rect) = self.gpu_stroke_rect.take() {
+                self.gpu_dab.issue_readback(&self.device, &self.queue, rect);
+            }
+        }
+    }
+
+    /// One frame of the no-readback resolve stroke: blend the accumulated coverage into the
+    /// active layer's GPU slice over the immutable pre-stroke base (idempotent, so
+    /// re-resolving the whole accumulated rect each frame is correct), then recomposite the
+    /// display. `gpu_stroke_rect` keeps accumulating (no `take`) — there's no readback to
+    /// bound. The CPU `Layers` is left stale until `end_stroke` reconciles it.
+    /// How this stroke resolves coverage onto the base: erase, tiled material, or solid colour.
+    fn gpu_resolve_kind(&self) -> crate::gpu_layers::ResolveKind {
+        use crate::gpu_layers::ResolveKind;
+        if self.gpu_stroke_erase {
+            ResolveKind::Erase
+        } else if let Some(tile) = self.gpu_stroke_material {
+            ResolveKind::Material(tile)
+        } else {
+            ResolveKind::Color([
+                self.gpu_stroke_color[0] as f32 / 255.0,
+                self.gpu_stroke_color[1] as f32 / 255.0,
+                self.gpu_stroke_color[2] as f32 / 255.0,
+            ])
+        }
+    }
+
+    fn resolve_gpu_stroke_frame(&mut self) {
+        let active = self.layers.active as u32;
+        let kind = self.gpu_resolve_kind();
+        if let (Some(cov), Some(rect)) = (self.gpu_dab.coverage_view(), self.gpu_stroke_rect) {
+            let sc = Some((rect.x0, rect.y0, rect.width(), rect.height()));
+            crate::perf::time("gpu_resolve", || {
+                self.gpu_layers
+                    .resolve_active(&self.device, &self.queue, cov, active, kind, sc);
+            });
+        }
+        // Full composite + gutter bleed every frame, so UV-seam gutters stay filled live (a
+        // deferred bleed left visible un-painted edges at seams mid-stroke). Matches the
+        // readback path's per-frame compose; cheap enough at PSX/2K, and the headline win
+        // (no GPU→CPU readback, no CPU per-texel blend) is already in the resolve itself.
+        self.gpu_compose();
+    }
+
+    /// Flush the GPU stroke synchronously at stroke end: drain the in-flight readback, then
+    /// issue + drain the remaining accumulated region, applying both. Must run before the
+    /// history commit consumes `pending` (the base). One blocking sync, on release only.
+    fn finish_gpu_stroke(&mut self) {
+        // Flush any dabs stamped since the last frame's pump, so the final reconcile sees them.
+        self.gpu_dab.flush_dabs(&self.device, &self.queue);
+        if self.gpu_stroke_resolve {
+            self.finish_gpu_resolve_stroke();
+            return;
+        }
+        if let Some((cov, rect)) = self.gpu_dab.drain_readback(&self.device) {
+            self.apply_gpu_coverage(&cov, rect);
+        }
+        if let Some(rect) = self.gpu_stroke_rect.take() {
+            self.gpu_dab.issue_readback(&self.device, &self.queue, rect);
+            if let Some((cov, rect)) = self.gpu_dab.drain_readback(&self.device) {
+                self.apply_gpu_coverage(&cov, rect);
+            }
+        }
+    }
+
+    /// Finish a no-readback resolve stroke: do the final resolve + recomposite, then read
+    /// the active GPU slice back **once** into the authoritative CPU `Layers` so undo, save and
+    /// export see the painted result. A single blocking readback, on release only — off the
+    /// paint hot path. `end_stroke` then re-syncs the CPU display mirror (`display_buf` +
+    /// `paint_texture_gpu`) over the painted region for the 2D UV editor / brush preview.
+    fn finish_gpu_resolve_stroke(&mut self) {
+        // Final resolve of the accumulated coverage, then a single full composite + gutter
+        // bleed so the displayed atlas is fully correct (seams bled) for the finished stroke.
+        let active_u = self.layers.active as u32;
+        let kind = self.gpu_resolve_kind();
+        if let (Some(cov), Some(rect)) = (self.gpu_dab.coverage_view(), self.gpu_stroke_rect) {
+            let sc = Some((rect.x0, rect.y0, rect.width(), rect.height()));
+            self.gpu_layers
+                .resolve_active(&self.device, &self.queue, cov, active_u, kind, sc);
+        }
+        self.gpu_compose();
+        // Reconcile only the painted region back into the authoritative CPU layer (not the
+        // whole slice) — the readback then scales with brush area, not atlas size.
+        let active = self.layers.active;
+        let size = self.tex_size as usize;
+        if let Some(rect) = self.gpu_stroke_rect {
+            if let Some(px) =
+                self.gpu_layers
+                    .read_layer_rect(&self.device, &self.queue, active as u32, rect)
+            {
+                let (rw, rh) = (rect.width() as usize, rect.height() as usize);
+                let tex = self.layers.active_tex_mut();
+                for ry in 0..rh {
+                    let gy = rect.y0 as usize + ry;
+                    let src = ry * rw * 4;
+                    let dst = (gy * size + rect.x0 as usize) * 4;
+                    tex.pixels[dst..dst + rw * 4].copy_from_slice(&px[src..src + rw * 4]);
+                }
+            }
+        }
+        self.gpu_stroke_rect = None;
+        // The model already samples the GPU atlas (correct), and export composites fresh from
+        // the now-reconciled CPU layers — so no full CPU recomposite here (that was a per-stroke,
+        // resolution-scaled hitch). `end_stroke` re-syncs the CPU `display_buf` mirror over just
+        // the painted region for the 2D UV editor / brush preview (brush-area bounded).
+    }
+
+    /// Blend a coverage region (from a GPU readback) into the active layer/mask against the
+    /// immutable pre-stroke base in `pending`. Idempotent (re-applying a region from the
+    /// base is a no-op-after-first), so the 1-frame-late, possibly-overlapping regions a
+    /// pipelined readback produces compose correctly.
+    fn apply_gpu_coverage(&mut self, cov: &[f32], rect: TexRect) {
+        if self.pending.is_none() {
+            return;
+        }
+        let color = self.gpu_stroke_color;
+        let erase = self.gpu_stroke_erase;
+        let size = self.tex_size;
+        // Tiled image brush: the colour is the material sampled per texel (UV-anchored,
+        // tiled), matching the CPU `deposit`. Only for colour paint (not erase / mask).
+        // Disjoint field borrow (`brush_material`) vs. the `pending`/`layers` borrows below.
+        let material = (self.gpu_stroke_target == PaintTarget::Color && !erase)
+            .then(|| self.brush_material.as_ref().map(|m| (m, self.brush_tile)))
+            .flatten();
+        match self.gpu_stroke_target {
+            PaintTarget::Color => {
+                let base = &self.pending.as_ref().unwrap().tex.pixels;
+                let tex = self.layers.active_tex_mut();
+                apply_coverage(&mut tex.pixels, base, cov, rect, size, color, erase, material);
+            }
+            PaintTarget::Mask => {
+                let base = &self.pending.as_ref().unwrap().mask.pixels;
+                let tex = self.layers.active_mask_mut();
+                apply_coverage(&mut tex.pixels, base, cov, rect, size, color, false, None);
+            }
+        }
+        self.dirty_rect = Some(match self.dirty_rect {
+            Some(prev) => prev.union(rect),
+            None => rect,
+        });
+        self.grow_stroke_paint_rect(rect);
+        self.stroke_dirty = true;
     }
 
     /// Composite a set of `(texel, coverage)` splats into the active paint target
@@ -3203,6 +3994,7 @@ impl Renderer {
                 Some(prev) => prev.union(r),
                 None => r,
             });
+            self.grow_stroke_paint_rect(r);
         }
         self.stroke_dirty = true;
     }
@@ -3247,6 +4039,7 @@ impl Renderer {
                 Some(prev) => prev.union(r),
                 None => r,
             });
+            self.grow_stroke_paint_rect(r);
         }
         self.stroke_dirty = true;
     }
@@ -3299,6 +4092,10 @@ impl Renderer {
         };
         let splats = uv_disc(uv, brush, self.tex_size);
         self.deposit(&splats, brush);
+        // Mark this as a 2D-editor stroke so `flush_paint` keeps the CPU display mirror live
+        // (the panel the user is painting on reads it). Set per stamp — `begin_stroke` can't
+        // know whether the stroke will be 3D or UV (both share the same begin/end bracket).
+        self.uv_stroke = true;
     }
 
     /// Paint a continuous stroke segment between two UV points, interpolating discs so
@@ -3398,7 +4195,14 @@ impl Renderer {
         rpass.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
 
         rpass.set_pipeline(&self.pipeline);
-        rpass.set_bind_group(0, &self.bind_group, &[]);
+        // When GPU display is on, sample the GPU composite atlas instead of the CPU paint
+        // texture (falls back to the CPU bind group until the first composite).
+        let model_bind = self
+            .gpu_bind_group
+            .as_ref()
+            .filter(|_| self.gpu_display)
+            .unwrap_or(&self.bind_group);
+        rpass.set_bind_group(0, model_bind, &[]);
         rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         rpass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         rpass.draw_indexed(0..self.index_count, 0, 0..1);
@@ -3664,21 +4468,71 @@ async fn request_adapter(
         .expect("no suitable GPU adapter")
 }
 
+/// A fresh GPU device/queue for a test (`wgpu::Device` isn't `Clone` in wgpu 22, so the
+/// suite can't share one). Routes through the retrying `request_device`, which absorbs
+/// the transient OOM that `cargo test`'s many concurrent device creations provoke.
+#[cfg(test)]
+pub(crate) fn new_test_device() -> (wgpu::Device, wgpu::Queue) {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..Default::default()
+    });
+    let adapter = pollster::block_on(request_adapter(&instance, None));
+    pollster::block_on(request_device(&adapter))
+}
+
+/// Whether `LOWTEX_CPU_BAKE` forces the CPU mesh-map bake over the GPU path (read once).
+/// The escape hatch for diagnosing GPU/CPU divergence and the reason the CPU `bake` /
+/// `compute_light` stay reachable in release, not just from the parity tests.
+fn force_cpu_bake() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LOWTEX_CPU_BAKE").is_some_and(|v| !v.is_empty()))
+}
+
+/// Whether `LOWTEX_GPU_PAINT` opts the core surface brush into GPU dab stamping (read
+/// once, the renderer's `gpu_paint` default). Off by default — the CPU `splat`+`deposit`
+/// path stays the shipping default until the GPU path is proven on more hardware.
+fn force_gpu_paint() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LOWTEX_GPU_PAINT").is_some_and(|v| !v.is_empty()))
+}
+
+/// Whether `LOWTEX_GPU_DISPLAY` routes the model's texture through the GPU composite
+/// (composite + palette quantize + gutter bleed on the GPU; see `gpu_layers`). Off by
+/// default — the CPU `composite_display` stays the shipping default + parity oracle.
+fn force_gpu_display() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LOWTEX_GPU_DISPLAY").is_some_and(|v| !v.is_empty()))
+}
+
 async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
-    adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("lowtex device"),
-                required_features: wgpu::Features::empty(),
-                // Use the adapter's real limits (downlevel_defaults caps textures
-                // at 2048, which a HiDPI window surface can exceed).
-                required_limits: adapter.limits(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        )
-        .await
-        .expect("failed to request device")
+    let desc = wgpu::DeviceDescriptor {
+        label: Some("lowtex device"),
+        required_features: wgpu::Features::empty(),
+        // Use the adapter's real limits (downlevel_defaults caps textures
+        // at 2048, which a HiDPI window surface can exceed).
+        required_limits: adapter.limits(),
+        memory_hints: wgpu::MemoryHints::Performance,
+    };
+    // Retry on transient OutOfMemory. `cargo test` fans the suite across threads, each
+    // creating its own device; past a dozen-or-so coexisting the driver briefly refuses
+    // one. Siblings finish and free theirs, so a short backoff lets the queued device
+    // through. In production exactly one device is created and the first attempt succeeds.
+    let mut last_err = None;
+    for attempt in 0u32..40 {
+        match adapter.request_device(&desc, None).await {
+            Ok(dq) => return dq,
+            Err(e) => {
+                last_err = Some(e);
+                let ms = 25 * (attempt + 1).min(8) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+    }
+    panic!("failed to request device: {:?}", last_err.unwrap());
 }
 
 /// Create the GPU paint texture sized to match a CPU texture.
@@ -3724,6 +4578,18 @@ fn make_paint_bind_group(
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     let view = paint_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    make_paint_bind_group_view(device, layout, uniform_buffer, &view, sampler)
+}
+
+/// Same as [`make_paint_bind_group`] but from an already-built texture view — used to
+/// bind the GPU composite atlas's sRGB view in place of the single paint texture.
+fn make_paint_bind_group_view(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform_buffer: &wgpu::Buffer,
+    view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("bind group"),
         layout,
@@ -3734,7 +4600,7 @@ fn make_paint_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&view),
+                resource: wgpu::BindingResource::TextureView(view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -3939,6 +4805,70 @@ fn uv_disc(uv: Vec2, brush: &Brush, size: u32) -> Vec<(usize, f32)> {
     out
 }
 
+/// Apply a GPU dab `cov` map (row-major within `rect`, one f32 per texel) onto a full
+/// `size`-wide RGBA8 buffer, against the immutable `base`: erase lowers alpha, otherwise
+/// blend the source colour — the per-texel `material` sample (UV-anchored, tiled) when
+/// given, else the solid `color`. The shared inner loop of `resolve_gpu_stroke`'s
+/// colour/mask arms, taking plain slices so the colour/mask/base borrows stay disjoint at
+/// the call site. This is the only CPU per-texel paint work left on the GPU path, and it
+/// runs once per frame over the dirty region — not per dab.
+fn apply_coverage(
+    pixels: &mut [u8],
+    base: &[u8],
+    cov: &[f32],
+    rect: TexRect,
+    size: u32,
+    color: [u8; 3],
+    erase: bool,
+    material: Option<(&crate::material::Material, f32)>,
+) {
+    use rayon::prelude::*;
+    let (rw, rh) = (rect.width() as usize, rect.height() as usize);
+    let size_us = size as usize;
+    let size_f = size as f32;
+    let (x0, y0) = (rect.x0 as usize, rect.y0 as usize);
+    // Each row writes disjoint texels, so fan the region across cores — the big-brush
+    // resolve was tens of ms single-threaded. Slice `pixels` to the region's row band; each
+    // worker gets one full texture row and writes only columns x0..x1, reading the matching
+    // row of the (separate) `base`. blend4/erase4 are the exact per-dab `blend_texel` math.
+    let band = &mut pixels[y0 * size_us * 4..(y0 + rh) * size_us * 4];
+    let apply_row = |ry: usize, row: &mut [u8]| {
+        let ty = y0 + ry;
+        for rx in 0..rw {
+            let a = cov[ry * rw + rx];
+            if a <= 0.0 {
+                continue;
+            }
+            let tx = x0 + rx;
+            let di = tx * 4;
+            let bi = (ty * size_us + tx) * 4;
+            if erase {
+                crate::paint::erase4(&mut row[di..di + 4], &base[bi..bi + 4], a);
+            } else {
+                let src = match material {
+                    Some((m, tile)) => {
+                        let c = m.sample(tx as f32 / size_f, ty as f32 / size_f, tile);
+                        [c[0], c[1], c[2]]
+                    }
+                    None => color,
+                };
+                crate::paint::blend4(&mut row[di..di + 4], &base[bi..bi + 4], src, a);
+            }
+        }
+    };
+    // Small regions stay serial — rayon's fork/join would dominate a sub-128² footprint.
+    const PAR_MIN_TEXELS: usize = 1 << 14;
+    if rw * rh >= PAR_MIN_TEXELS {
+        band.par_chunks_mut(size_us * 4)
+            .enumerate()
+            .for_each(|(ry, row)| apply_row(ry, row));
+    } else {
+        band.chunks_mut(size_us * 4)
+            .enumerate()
+            .for_each(|(ry, row)| apply_row(ry, row));
+    }
+}
+
 fn copy_region(buf: &[u8], width: u32, rect: TexRect) -> Vec<u8> {
     let (rw, rh) = (rect.width() as usize, rect.height() as usize);
     let mut out = vec![0u8; rw * rh * 4];
@@ -4053,7 +4983,69 @@ mod tests {
     use crate::mesh::Mesh;
 
     fn headless() -> Renderer {
-        pollster::block_on(Renderer::new_headless(64, 64, Mesh::cube()))
+        headless_sized(64, 64)
+    }
+
+    /// A headless cube renderer at the given surface size. Its device comes through the
+    /// retrying `request_device`, so the suite's concurrent device creations don't OOM.
+    fn headless_sized(width: u32, height: u32) -> Renderer {
+        pollster::block_on(Renderer::new_headless(width, height, Mesh::cube()))
+    }
+
+    /// Wall-clock per stroke (begin → 10 segments, flushing each frame → end) at a paint
+    /// resolution, for each path: pure CPU, GPU-paint (readback), GPU-paint+display
+    /// (no-readback resolve). Ignored by default — run for numbers:
+    ///   LOWTEX_BENCH_SIZE=2048 cargo test --release bench_stroke_paths -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_stroke_paths() {
+        use std::time::Instant;
+        let size = std::env::var("LOWTEX_BENCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024u32);
+        let (sw, sh) = (640u32, 640u32);
+        let brush = Brush {
+            color: [0.85, 0.2, 0.3],
+            radius: (size as f32 / 32.0).max(8.0), // ~constant visual size across resolutions
+            opacity: 1.0,
+            hardness: 0.6,
+            ..Brush::default()
+        };
+
+        let run = |label: &str, gpu_display: bool, gpu_paint: bool| {
+            let mut r = headless_sized(sw, sh);
+            r.set_texture_resolution(size);
+            r.gpu_display = gpu_display;
+            r.gpu_paint = gpu_paint;
+            let (cx, cy) = (sw as f32 / 2.0, sh as f32 / 2.0);
+            let stroke = |r: &mut Renderer| {
+                r.begin_stroke();
+                let mut p = (cx - 80.0, cy - 60.0);
+                for k in 0..10 {
+                    let np = (p.0 + 16.0, p.1 + 12.0 * ((k % 3) as f32 - 1.0));
+                    r.paint_segment(p, np, &brush);
+                    r.flush_paint();
+                    p = np;
+                }
+                r.end_stroke();
+                r.flush_paint();
+            };
+            stroke(&mut r); // warm
+            const ITERS: u32 = 10;
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                stroke(&mut r);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / ITERS as f64;
+            println!("  {label:28} {ms:8.2} ms/stroke");
+        };
+
+        println!("\nStroke cost @ {size}² (10 segments, per-frame flush):");
+        run("CPU (splat+deposit)", false, false);
+        run("GPU paint (readback)", false, true);
+        run("GPU paint + display (resolve)", true, true);
+        println!();
     }
 
     /// The save/autosave dirty machine (G31): a mutation dirties the document for
@@ -4152,6 +5144,53 @@ mod tests {
         assert_region_matches_full(&mut r);
     }
 
+    /// End-to-end GPU display parity: with `gpu_display` on, the composite atlas the
+    /// model samples (composite + palette quantize + Bayer dither + gutter bleed, all on
+    /// the GPU) must match the CPU `composite_display` on all but a tiny fraction of
+    /// texels (palette-on is byte-exact bar rare argmin flips; bleed is exact).
+    #[test]
+    fn gpu_display_matches_cpu_composite_display() {
+        let mut r = headless();
+        r.gpu_display = true;
+        let size = r.tex_size;
+
+        // A two-layer stack (Multiply on top, partial alpha) over the base.
+        r.layers.add_layer();
+        r.layers.layers[1].blend = crate::layers::BlendMode::Multiply;
+        for (t, px) in r.layers.active_tex_mut().pixels.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[(t % 256) as u8, 100, 255u8.wrapping_sub(t as u8), 200]);
+        }
+        // Palette + dither on, so the whole quantize+bleed path is exercised.
+        r.palette = crate::palette::Palette::builtins().remove(0); // PICO-8
+        r.palette_settings = PaletteSettings {
+            enabled: true,
+            dither: true,
+            dither_strength: 0.06,
+        };
+
+        r.refresh_display_texture(); // composites on CPU *and* GPU (update_gpu_display)
+        let cpu = r.composite_display();
+        let gpu = r.gpu_layers.read_atlas(&r.device, &r.queue);
+        assert_eq!(gpu.len(), cpu.len());
+
+        let n = (size * size) as usize;
+        let mut diff = 0u32;
+        for t in 0..n {
+            let i = t * 4;
+            let d = (0..3)
+                .map(|c| (gpu[i + c] as i32 - cpu[i + c] as i32).abs())
+                .max()
+                .unwrap();
+            if d > 1 {
+                diff += 1;
+            }
+        }
+        assert!(
+            (diff as f32) < 0.02 * n as f32,
+            "GPU display diverges from CPU at {diff} of {n} texels"
+        );
+    }
+
     #[test]
     fn region_matches_full_multiply_layer_and_mask() {
         let mut r = headless();
@@ -4176,7 +5215,7 @@ mod tests {
         // entry point). The resulting GPU mirror must still equal a full composite.
         // A viewport that frames the cube at screen centre (same as the screenshot path).
         let (w, h) = (256u32, 256u32);
-        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        let mut r = headless_sized(w, h);
         r.palette_settings = PaletteSettings {
             enabled: true,
             dither: true,
@@ -4224,7 +5263,7 @@ mod tests {
 
         // The set of texels a single dab changes, for a given symmetry setting.
         let changed = |axis: Option<SymmetryAxis>| -> std::collections::HashSet<usize> {
-            let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+            let mut r = headless_sized(w, h);
             r.set_symmetry(axis);
             let before = r.layers.active_tex().pixels.clone();
             r.begin_stroke();
@@ -4257,6 +5296,53 @@ mod tests {
         );
     }
 
+    /// A loaded alpha tip shapes the dab from the tip image instead of the circular
+    /// falloff: a fully-white tip paints its footprint, and inverting that same tip
+    /// (white → no coverage) paints nothing — proving the tip drives coverage and the
+    /// `alpha_invert` flag is honoured end to end.
+    #[test]
+    fn alpha_tip_shapes_and_inverts_the_dab() {
+        let (w, h) = (256u32, 256u32);
+        let brush = Brush {
+            color: [0.1, 0.7, 0.3],
+            radius: 8.0,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        // A small fully-white, fully-opaque tip: every texel in the footprint gets full
+        // coverage (luma 1 × alpha 1).
+        let white_tip = || crate::material::Material {
+            width: 2,
+            height: 2,
+            pixels: vec![255u8; 16],
+        };
+
+        let painted = |invert: bool| -> usize {
+            let mut r = headless_sized(w, h);
+            r.brush_alpha = Some(white_tip());
+            r.brush_alpha_invert = invert;
+            let before = r.layers.active_tex().pixels.clone();
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.end_stroke();
+            before
+                .chunks_exact(4)
+                .zip(r.layers.active_tex().pixels.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+
+        assert!(
+            painted(false) > 0,
+            "a fully-white alpha tip must paint its footprint"
+        );
+        assert_eq!(
+            painted(true),
+            0,
+            "inverting a fully-white tip drops coverage to zero — nothing should paint"
+        );
+    }
+
     #[test]
     fn lock_face_keeps_the_dab_on_one_face() {
         // A dab at a cube face's centre with a radius wider than the face wraps onto
@@ -4272,7 +5358,7 @@ mod tests {
 
         // The set of facets a single dab touches, for a given lock setting.
         let facets_touched = |lock: bool| -> std::collections::HashSet<i32> {
-            let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+            let mut r = headless_sized(w, h);
             r.set_lock_face(lock);
             let before = r.layers.active_tex().pixels.clone();
             r.begin_stroke();
@@ -4317,7 +5403,7 @@ mod tests {
         // With the lock off, nothing is outlined.
         let (w, h) = (256u32, 256u32);
         let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        let mut r = headless_sized(w, h);
 
         r.set_lock_face(false);
         r.set_face_outline(Some((cx, cy)));
@@ -4348,7 +5434,7 @@ mod tests {
             radius: 8.0,
             ..Brush::default()
         };
-        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        let mut r = headless_sized(w, h);
 
         r.set_brush_cursor(Some((cx, cy)), &brush);
         assert_eq!(
@@ -4376,7 +5462,7 @@ mod tests {
             radius: 8.0,
             ..Brush::default()
         };
-        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        let mut r = headless_sized(w, h);
         let layer_before = r.layers.active_tex().pixels.clone();
         let display_before = r.display_buf.clone();
 
@@ -4406,6 +5492,43 @@ mod tests {
         );
     }
 
+    /// Under GPU display the model samples the GPU atlas, so the hover ghost must be written
+    /// into the atlas (not just the unused CPU `paint_texture_gpu`) — otherwise the preview is
+    /// invisible on the model. Hovering must change the atlas in the ghost footprint; pointing
+    /// off the mesh must restore it to the committed composite.
+    #[test]
+    fn brush_preview_ghost_visible_in_atlas_under_gpu_display() {
+        let (w, h) = (256u32, 256u32);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let brush = Brush {
+            color: [0.9, 0.1, 0.1],
+            radius: 8.0,
+            ..Brush::default()
+        };
+        let mut r = headless_sized(w, h);
+        r.gpu_display = true;
+        r.gpu_paint = true;
+        r.update_gpu_display(); // build the atlas the model samples
+        let committed = r.gpu_layers.read_atlas(&r.device, &r.queue);
+
+        r.set_brush_preview(Some((cx, cy)), &brush);
+        assert!(r.preview_rect.is_some(), "hovering the mesh should arm a preview");
+        let hovered = r.gpu_layers.read_atlas(&r.device, &r.queue);
+        assert_ne!(
+            hovered, committed,
+            "ghost not written into the atlas — invisible on the model under GPU display"
+        );
+
+        // Pointing off the mesh reverts the ghost; the atlas returns to the committed image.
+        r.set_brush_preview(Some((1.0, 1.0)), &brush);
+        assert!(r.preview_rect.is_none(), "pointing off the mesh clears the preview");
+        let reverted = r.gpu_layers.read_atlas(&r.device, &r.queue);
+        assert_eq!(
+            reverted, committed,
+            "reverting the ghost must restore the committed atlas"
+        );
+    }
+
     #[test]
     fn region_matches_full_with_blur_effect() {
         let mut r = headless();
@@ -4424,7 +5547,7 @@ mod tests {
         // observe the skip by clearing `preview_rect` ourselves: a skipped call returns
         // before touching it (stays cleared); a recompute sets it again.
         let (w, h) = (256u32, 256u32);
-        let mut r = pollster::block_on(Renderer::new_headless(w, h, Mesh::cube()));
+        let mut r = headless_sized(w, h);
         r.refresh_display_texture();
         let brush = Brush {
             color: [0.1, 0.7, 0.3],
@@ -4480,5 +5603,754 @@ mod tests {
             r.last_preview.is_none(),
             "end_stroke must force a fresh ghost"
         );
+    }
+
+    #[test]
+    fn gpu_baked_maps_drive_layers_and_interactive_sun() {
+        // End-to-end through the renderer's GPU mesh-map path (Phase 2.5): applying an
+        // AO layer bakes the geometry maps + GPU AO; a Light layer bakes the GPU sun; and
+        // moving the sun re-bakes the light channel live. Exercises the wiring/borrows in
+        // `ensure_mesh_maps`/`ensure_light` and the baker's residency reuse — the per-texel
+        // value parity itself is pinned by the gpu_bake tests.
+        let mut r = headless();
+
+        // AO layer → ensure_mesh_maps → GPU AO bake.
+        r.apply_ao_layer(Levels::amount(1.0), None);
+        assert_eq!(r.layers().layers.len(), 2, "AO added a layer");
+        let maps = r.mesh_maps.as_ref().expect("AO bake populated mesh maps");
+        assert_eq!(maps.ao.len(), (r.tex_size * r.tex_size) as usize);
+
+        // Light layer with a near-overhead sun → ensure_light → GPU sun bake. A white
+        // Normal layer whose alpha is N·L visibly lights the up-facing faces, so the
+        // composite must change.
+        let before = r.display_pixels();
+        r.set_sun([0.3, 0.9, 0.2], true);
+        r.add_map_layer(
+            "Sun",
+            MapSource::Light,
+            Levels::amount(1.0),
+            [255, 255, 255],
+            crate::layers::BlendMode::Normal,
+            None,
+        );
+        assert_eq!(r.layers().layers.len(), 3, "Light added a layer");
+        assert_ne!(before, r.display_pixels(), "the sun light changed the composite");
+        let light_a = r.mesh_maps.as_ref().unwrap().light.clone();
+        assert!(light_a.iter().any(|&v| v > 0.1), "some faces are lit");
+        assert_eq!(
+            r.mesh_maps.as_ref().unwrap().light_params,
+            Some((glam::Vec3::new(0.3, 0.9, 0.2).normalize(), true)),
+        );
+
+        // Drag the sun to the opposite side and re-apply: the GPU sun must re-bake, so
+        // the light channel differs (the interactive-slider win).
+        r.set_sun([-0.3, 0.9, -0.2], true);
+        r.add_map_layer(
+            "Sun2",
+            MapSource::Light,
+            Levels::amount(1.0),
+            [255, 255, 255],
+            crate::layers::BlendMode::Normal,
+            None,
+        );
+        let light_b = &r.mesh_maps.as_ref().unwrap().light;
+        assert_ne!(&light_a, light_b, "moving the sun re-baked the light channel");
+    }
+
+    #[test]
+    fn gpu_paint_stroke_matches_cpu_stroke() {
+        // A solid-colour surface stroke via the GPU dab path (Phase 1) must match the CPU
+        // splat+deposit path within a small tolerance: same face flood, same falloff, same
+        // max-coverage discipline — only f16 coverage precision and the GPU edge fill rule
+        // differ, on a thin rim. Paint the identical stroke both ways; diff the layer.
+        let (w, h) = (256u32, 256u32);
+        let brush = Brush {
+            color: [0.85, 0.2, 0.3],
+            radius: 14.0,
+            opacity: 1.0,
+            hardness: 0.6,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+
+        let paint = |gpu: bool| -> Vec<u8> {
+            let mut r = headless_sized(w, h);
+            r.gpu_paint = gpu;
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.flush_paint(); // mid-stroke per-frame resolve (the realistic app cadence)
+            r.paint_segment((cx, cy), (cx + 28.0, cy + 16.0), &brush);
+            r.flush_paint();
+            r.end_stroke();
+            r.flush_paint();
+            r.layers.active_tex().pixels.clone()
+        };
+        let cpu = paint(false);
+        let gpu = paint(true);
+        let base = headless_sized(w, h).layers.active_tex().pixels.clone();
+
+        // Both paths painted a substantial, comparable region.
+        let painted = |buf: &[u8]| {
+            buf.chunks_exact(4)
+                .zip(base.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        let (cpu_n, gpu_n) = (painted(&cpu), painted(&gpu));
+        assert!(cpu_n > 200, "CPU stroke painted too little: {cpu_n}");
+        assert!(
+            gpu_n as f32 > 0.7 * cpu_n as f32 && (gpu_n as f32) < 1.4 * cpu_n as f32,
+            "GPU painted region differs too much from CPU ({gpu_n} vs {cpu_n})"
+        );
+
+        // Per-channel agreement over the union of painted texels.
+        let mut sum = 0i64;
+        let mut n = 0i64;
+        let mut big = 0i64;
+        for i in 0..cpu.len() {
+            if cpu[i] != base[i] || gpu[i] != base[i] {
+                let d = (cpu[i] as i32 - gpu[i] as i32).abs();
+                sum += d as i64;
+                n += 1;
+                if d > 64 {
+                    big += 1;
+                }
+            }
+        }
+        let mean = sum as f64 / n.max(1) as f64;
+        assert!(mean < 6.0, "GPU vs CPU stroke mean channel diff too high: {mean:.2}");
+        assert!(
+            (big as f64) < 0.04 * n as f64,
+            "too many large GPU/CPU channel diffs: {big} of {n}"
+        );
+    }
+
+    /// The *displayed atlas* after a resolve stroke (what the user sees on the model) must
+    /// match the CPU `composite_display`, and a second overlapping stroke must build over the
+    /// first (overpainting). Guards the resolve path's live display, which the layer-pixel
+    /// parity tests don't cover.
+    #[test]
+    fn gpu_resolve_display_overpaints() {
+        let (w, h) = (256u32, 256u32);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let mut r = headless_sized(w, h);
+        r.gpu_display = true;
+        r.gpu_paint = true;
+
+        let stroke = |r: &mut Renderer, color: [f32; 3], from: (f32, f32), to: (f32, f32)| {
+            let brush = Brush {
+                color,
+                radius: 16.0,
+                opacity: 1.0,
+                hardness: 0.7,
+                ..Brush::default()
+            };
+            r.begin_stroke();
+            r.paint_at(from, &brush);
+            r.flush_paint();
+            r.paint_segment(from, to, &brush);
+            r.flush_paint();
+            r.end_stroke();
+            r.flush_paint();
+        };
+
+        // Stroke 1 (red), then stroke 2 (green) overlapping it.
+        stroke(&mut r, [0.9, 0.1, 0.1], (cx - 30.0, cy), (cx + 10.0, cy));
+        stroke(&mut r, [0.1, 0.9, 0.1], (cx - 10.0, cy), (cx + 30.0, cy));
+
+        // The active layer must show *both* colours (overpainting kept stroke 1 where stroke
+        // 2 didn't cover, and laid stroke 2 on top in the overlap).
+        let px = &r.layers.active_tex().pixels;
+        let reds = px.chunks_exact(4).filter(|p| p[0] > 150 && p[1] < 100).count();
+        let greens = px.chunks_exact(4).filter(|p| p[1] > 150 && p[0] < 100).count();
+        assert!(reds > 50, "stroke 1 (red) vanished — no overpainting base: {reds}");
+        assert!(greens > 50, "stroke 2 (green) didn't lay down: {greens}");
+
+        // The displayed atlas must equal the CPU composite_display (which includes the gutter
+        // bleed) within ±1 / palette flips — i.e. no missing edges at UV seams.
+        let size = r.tex_size as usize;
+        let atlas = r.gpu_layers.read_atlas(&r.device, &r.queue);
+        let cpu = r.composite_display();
+        assert_eq!(atlas.len(), cpu.len());
+        let mut diff = 0u32;
+        for t in 0..size * size {
+            let i = t * 4;
+            let d = (0..3)
+                .map(|c| (atlas[i + c] as i32 - cpu[i + c] as i32).abs())
+                .max()
+                .unwrap();
+            if d > 1 {
+                diff += 1;
+            }
+        }
+        assert!(
+            (diff as f32) < 0.02 * (size * size) as f32,
+            "displayed atlas diverges from CPU composite at {diff} of {} texels",
+            size * size
+        );
+    }
+
+    /// The tiled material brush under GPU display must show a correct atlas — composite +
+    /// gutter bleed — matching the CPU `composite_display`. The material brush takes the
+    /// no-readback resolve path (resolve.wgsl mode 2 samples the material per texel); this
+    /// guards against missing seam edges on the path the material brush actually uses.
+    #[test]
+    fn gpu_material_display_matches_cpu() {
+        let (w, h) = (256u32, 256u32);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let material = crate::material::Material {
+            width: 4,
+            height: 4,
+            pixels: (0..16u32)
+                .flat_map(|i| [(i * 16) as u8, (255 - i * 15) as u8, ((i * 9) % 256) as u8, 255])
+                .collect(),
+        };
+        let mut r = headless_sized(w, h);
+        r.gpu_display = true;
+        r.gpu_paint = true;
+        r.brush_material = Some(material);
+        r.brush_tile = 4.0;
+        let brush = Brush {
+            radius: 16.0,
+            opacity: 1.0,
+            hardness: 0.7,
+            ..Brush::default()
+        };
+        r.begin_stroke();
+        r.paint_at((cx, cy), &brush);
+        r.flush_paint();
+        r.paint_segment((cx, cy), (cx + 30.0, cy + 10.0), &brush);
+        r.flush_paint();
+        r.end_stroke();
+        r.flush_paint();
+
+        let size = r.tex_size as usize;
+        let atlas = r.gpu_layers.read_atlas(&r.device, &r.queue);
+        let cpu = r.composite_display();
+        let mut diff = 0u32;
+        for t in 0..size * size {
+            let i = t * 4;
+            let d = (0..3)
+                .map(|c| (atlas[i + c] as i32 - cpu[i + c] as i32).abs())
+                .max()
+                .unwrap();
+            if d > 1 {
+                diff += 1;
+            }
+        }
+        assert!(
+            (diff as f32) < 0.02 * (size * size) as f32,
+            "material readback display diverges from CPU composite at {diff} of {} texels",
+            size * size
+        );
+    }
+
+    /// The 2D UV editor, brush preview and export all read the CPU display mirror
+    /// (`display_buf` via `atlas_view`), not the GPU atlas. Under GPU display the in-stroke
+    /// paint paths deliberately skip the per-frame CPU composite, so without an explicit
+    /// re-sync the mirror goes stale — the symptom reported as "UVs / painting on them not
+    /// working" in the 2D panel while the 3D model updates correctly. `end_stroke` must leave
+    /// `display_buf` byte-identical to a fresh `composite_display`, and bump `paint_version`
+    /// so the panel re-uploads. Covers both in-stroke paths: the no-readback resolve path
+    /// (solid colour) and the readback path (mask paint).
+    #[test]
+    fn gpu_display_buf_synced_after_stroke() {
+        let (w, h) = (256u32, 256u32);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        // "color" → resolve path; "mask" → readback path (mask reveal/hide isn't resolve-eligible).
+        for target in ["color", "mask"] {
+            let mut r = headless_sized(w, h);
+            r.gpu_display = true;
+            r.gpu_paint = true;
+            // Mask paint needs a layer with some colour to reveal/hide, and a mask target.
+            if target == "mask" {
+                let base = Brush {
+                    color: [0.2, 0.7, 0.9],
+                    radius: 40.0,
+                    opacity: 1.0,
+                    ..Brush::default()
+                };
+                r.begin_stroke();
+                r.paint_segment((cx - 50.0, cy), (cx + 50.0, cy), &base);
+                r.end_stroke();
+                r.flush_paint();
+                r.set_paint_target(PaintTarget::Mask);
+                r.set_mask_reveal(false); // hide
+            }
+            let brush = Brush {
+                color: [0.85, 0.2, 0.3],
+                radius: 16.0,
+                opacity: 1.0,
+                hardness: 0.7,
+                ..Brush::default()
+            };
+            let ver_before = r.paint_version();
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.flush_paint();
+            r.paint_segment((cx, cy), (cx + 30.0, cy + 12.0), &brush);
+            r.flush_paint();
+            r.end_stroke();
+            r.flush_paint();
+
+            assert!(
+                r.paint_version() != ver_before,
+                "[{target}] paint_version never bumped — UV editor won't refresh",
+            );
+            let (_, mirror) = r.atlas_view();
+            let cpu = r.composite_display();
+            assert_eq!(mirror.len(), cpu.len());
+            assert_eq!(
+                mirror, &cpu[..],
+                "[{target}] display_buf (UV-editor mirror) is stale after a GPU-display \
+                 stroke — not byte-identical to composite_display",
+            );
+        }
+    }
+
+    /// Painting in the 2D UV editor draws straight into the panel the user is watching (the CPU
+    /// `display_buf` mirror). Under GPU display the 3D-stroke optimization skips the per-frame CPU
+    /// composite — but a UV stroke MUST keep it live, or the panel won't update until `end_stroke`
+    /// (the stroke looks like it never lands / "only one texel"). Mid-stroke, after a segment +
+    /// `flush_paint`, `paint_version` must bump and `display_buf` must show the paint — and still
+    /// equal a fresh `composite_display`.
+    /// The GPU gutter bleed must use the *current* mesh's UV coverage. The coverage push was
+    /// keyed only on resolution, so a same-resolution mesh swap (load / re-unwrap) left the GPU
+    /// bleeding the new atlas with the PREVIOUS mesh's gutter mask — jagged seams at every real
+    /// island edge on the model, while the CPU path (which rebuilds coverage) stayed clean. After
+    /// a swap the GPU atlas must match `composite_display` (which uses the new coverage).
+    #[test]
+    fn gpu_bleed_uses_current_mesh_coverage_after_swap() {
+        let (w, h) = (256u32, 256u32);
+        let mut r = headless_sized(w, h);
+        r.gpu_display = true;
+        r.gpu_paint = true;
+        // Paint a stroke so islands carry a distinct colour for the bleed to spread.
+        let brush = Brush {
+            color: [0.9, 0.2, 0.2],
+            radius: 20.0,
+            opacity: 1.0,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        r.begin_stroke();
+        r.paint_segment((cx - 40.0, cy), (cx + 40.0, cy), &brush);
+        r.end_stroke();
+        r.flush_paint();
+
+        // Swap to a different UV layout at the SAME resolution (what load_model / re-unwrap do):
+        // shrink every UV toward the atlas centre so the coverage/gutter mask changes a lot.
+        for v in &mut r.mesh.vertices {
+            v.uv = [0.25 + v.uv[0] * 0.5, 0.25 + v.uv[1] * 0.5];
+        }
+        r.topo_version = r.topo_version.wrapping_add(1);
+        *r.coverage.get_mut() = None;
+        r.refresh_display_texture(); // recompose CPU mirror + GPU atlas with the new layout
+
+        let n = (r.tex_size * r.tex_size) as usize;
+        let atlas = r.gpu_layers.read_atlas(&r.device, &r.queue);
+        let cpu = r.composite_display();
+        let mut diff = 0u32;
+        for t in 0..n {
+            let i = t * 4;
+            let d = (0..3)
+                .map(|c| (atlas[i + c] as i32 - cpu[i + c] as i32).abs())
+                .max()
+                .unwrap();
+            if d > 1 {
+                diff += 1;
+            }
+        }
+        assert!(
+            (diff as f32) < 0.02 * n as f32,
+            "GPU atlas bleed used stale coverage after a same-resolution mesh swap: \
+             {diff} of {n} texels differ from CPU composite",
+        );
+    }
+
+    #[test]
+    fn gpu_uv_stroke_updates_panel_live_midstroke() {
+        let (w, h) = (256u32, 256u32);
+        let mut r = headless_sized(w, h);
+        r.gpu_display = true;
+        r.gpu_paint = true;
+        let base = r.display_buf.clone();
+        let ver0 = r.paint_version();
+        let brush = Brush {
+            color: [0.9, 0.15, 0.2],
+            radius: 12.0,
+            opacity: 1.0,
+            ..Brush::default()
+        };
+        r.begin_stroke();
+        // A diagonal UV stroke straight in texel space — no end_stroke yet (still dragging).
+        r.paint_uv_segment(glam::Vec2::new(0.3, 0.3), glam::Vec2::new(0.7, 0.7), &brush);
+        r.flush_paint();
+
+        assert!(
+            r.paint_version() != ver0,
+            "UV stroke didn't bump paint_version mid-stroke — the 2D panel won't refresh until release"
+        );
+        let (_, mirror) = r.atlas_view();
+        assert_ne!(
+            mirror, &base[..],
+            "UV stroke not visible in the panel mirror mid-stroke (stale until end_stroke)"
+        );
+        let cpu = r.composite_display();
+        assert_eq!(
+            mirror, &cpu[..],
+            "mid-stroke UV panel mirror diverges from composite_display"
+        );
+        // The model atlas must show it live too (the split view shows both).
+        let atlas = r.gpu_layers.read_atlas(&r.device, &r.queue);
+        let painted = atlas
+            .chunks_exact(4)
+            .zip(base.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(painted > 50, "UV stroke not visible on the model atlas mid-stroke: {painted}");
+    }
+
+    #[test]
+    fn gpu_resolve_stroke_matches_cpu_stroke() {
+        // The no-readback resolve path (GPU display + GPU paint): the dab coverage resolves
+        // straight into the active GPU layer slice, and `end_stroke` reconciles it back to
+        // the CPU `Layers`. The reconciled pixels must match the pure-CPU stroke within the
+        // same tolerance as the readback GPU path — same coverage, same blend math (±1).
+        let (w, h) = (256u32, 256u32);
+        let brush = Brush {
+            color: [0.85, 0.2, 0.3],
+            radius: 14.0,
+            opacity: 1.0,
+            hardness: 0.6,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+
+        let paint = |resolve: bool| -> Vec<u8> {
+            let mut r = headless_sized(w, h);
+            if resolve {
+                r.gpu_display = true;
+                r.gpu_paint = true;
+            }
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.flush_paint();
+            r.paint_segment((cx, cy), (cx + 28.0, cy + 16.0), &brush);
+            r.flush_paint();
+            r.end_stroke();
+            r.flush_paint();
+            r.layers.active_tex().pixels.clone()
+        };
+        let cpu = paint(false);
+        let gpu = paint(true);
+        let base = headless_sized(w, h).layers.active_tex().pixels.clone();
+
+        let painted = |buf: &[u8]| {
+            buf.chunks_exact(4)
+                .zip(base.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        let (cpu_n, gpu_n) = (painted(&cpu), painted(&gpu));
+        assert!(cpu_n > 200, "CPU stroke painted too little: {cpu_n}");
+        assert!(
+            gpu_n as f32 > 0.7 * cpu_n as f32 && (gpu_n as f32) < 1.4 * cpu_n as f32,
+            "resolve painted region differs too much from CPU ({gpu_n} vs {cpu_n})"
+        );
+
+        let mut sum = 0i64;
+        let mut n = 0i64;
+        let mut big = 0i64;
+        for i in 0..cpu.len() {
+            if cpu[i] != base[i] || gpu[i] != base[i] {
+                let d = (cpu[i] as i32 - gpu[i] as i32).abs();
+                sum += d as i64;
+                n += 1;
+                if d > 64 {
+                    big += 1;
+                }
+            }
+        }
+        let mean = sum as f64 / n.max(1) as f64;
+        assert!(mean < 6.0, "resolve vs CPU stroke mean channel diff too high: {mean:.2}");
+        assert!(
+            (big as f64) < 0.04 * n as f64,
+            "too many large resolve/CPU channel diffs: {big} of {n}"
+        );
+    }
+
+    #[test]
+    fn gpu_erase_stroke_matches_cpu_stroke() {
+        // The GPU eraser path (coverage → `erase_texel` at resolve) must match the CPU
+        // eraser within tolerance: erasing the opaque base lowers alpha by coverage, RGB
+        // unchanged. Same dab coverage, so only f16 precision + the edge rim differ.
+        let (w, h) = (256u32, 256u32);
+        let brush = Brush {
+            radius: 14.0,
+            opacity: 1.0,
+            hardness: 0.6,
+            erase: true,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let erase = |gpu: bool| -> Vec<u8> {
+            let mut r = headless_sized(w, h);
+            r.gpu_paint = gpu;
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.paint_segment((cx, cy), (cx + 28.0, cy + 16.0), &brush);
+            r.end_stroke();
+            r.flush_paint();
+            r.layers.active_tex().pixels.clone()
+        };
+        let cpu = erase(false);
+        let gpu = erase(true);
+        let base = headless_sized(w, h).layers.active_tex().pixels.clone();
+
+        // Erasing the opaque base shows up as alpha changes; both paths must lower alpha
+        // over a comparable region, and agree closely.
+        let erased = |buf: &[u8]| {
+            (0..buf.len() / 4)
+                .filter(|&t| buf[t * 4 + 3] != base[t * 4 + 3])
+                .count()
+        };
+        let (cpu_n, gpu_n) = (erased(&cpu), erased(&gpu));
+        assert!(cpu_n > 200, "CPU eraser changed too little: {cpu_n}");
+        // The GPU dab raster is conservative (covers a thin edge rim the CPU scanline omits),
+        // so the GPU region is a slight superset — allow it to run a little larger, but it must
+        // not be smaller (that would be the unpainted-edge bug).
+        assert!(
+            gpu_n as f32 > 0.85 * cpu_n as f32 && (gpu_n as f32) < 1.5 * cpu_n as f32,
+            "GPU erased region differs too much from CPU ({gpu_n} vs {cpu_n})"
+        );
+        // GPU must not MISS texels the CPU erased (the "teeth"): count CPU-only changes.
+        let cpu_only = (0..cpu.len() / 4)
+            .filter(|&t| cpu[t * 4 + 3] != base[t * 4 + 3] && gpu[t * 4 + 3] == base[t * 4 + 3])
+            .count();
+        assert!(
+            (cpu_only as f32) < 0.05 * cpu_n as f32,
+            "GPU eraser misses texels the CPU erased (teeth): {cpu_only} of {cpu_n}"
+        );
+        // Interior agreement: where both paths erased, the alpha must match closely (the thin
+        // conservative rim, where only one side changed, is excluded).
+        let mut sum = 0i64;
+        let mut n = 0i64;
+        for t in 0..cpu.len() / 4 {
+            let (ca, ga, ba) = (cpu[t * 4 + 3], gpu[t * 4 + 3], base[t * 4 + 3]);
+            if ca != ba && ga != ba {
+                sum += (ca as i32 - ga as i32).abs() as i64;
+                n += 1;
+            }
+        }
+        let mean = sum as f64 / n.max(1) as f64;
+        assert!(mean < 6.0, "GPU vs CPU eraser interior mean alpha diff too high: {mean:.2}");
+    }
+
+    #[test]
+    fn gpu_mask_stroke_matches_cpu_stroke() {
+        // Mask painting on the GPU path resolves the coverage into the layer's reveal mask
+        // (here hide = black into the white mask) instead of colour. Must match the CPU mask
+        // deposit within tolerance; the compositor reads the mask's red channel, so compare
+        // that.
+        let (w, h) = (256u32, 256u32);
+        let brush = Brush {
+            radius: 14.0,
+            opacity: 1.0,
+            hardness: 0.6,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let mask = |gpu: bool| -> Vec<u8> {
+            let mut r = headless_sized(w, h);
+            r.gpu_paint = gpu;
+            r.set_paint_target(PaintTarget::Mask);
+            r.set_mask_reveal(false); // hide: blend black into the white mask
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.paint_segment((cx, cy), (cx + 28.0, cy + 16.0), &brush);
+            r.end_stroke();
+            r.flush_paint();
+            r.layers.active_mask().pixels.clone()
+        };
+        let cpu = mask(false);
+        let gpu = mask(true);
+
+        // The mask starts white (red 255); hiding lowers red. Both paths must carve a
+        // comparable region and agree on the red channel.
+        let carved = |buf: &[u8]| (0..buf.len() / 4).filter(|&t| buf[t * 4] != 255).count();
+        let (cpu_n, gpu_n) = (carved(&cpu), carved(&gpu));
+        assert!(cpu_n > 200, "CPU mask carved too little: {cpu_n}");
+        // Conservative GPU dab raster → a slight superset (thin edge rim); GPU may carve a bit
+        // more, but must not carve less (the unpainted-edge bug).
+        assert!(
+            gpu_n as f32 > 0.85 * cpu_n as f32 && (gpu_n as f32) < 1.5 * cpu_n as f32,
+            "GPU carved region differs too much from CPU ({gpu_n} vs {cpu_n})"
+        );
+        // GPU must not miss texels the CPU carved (the "teeth").
+        let cpu_only = (0..cpu.len() / 4)
+            .filter(|&t| cpu[t * 4] != 255 && gpu[t * 4] == 255)
+            .count();
+        assert!(
+            (cpu_only as f32) < 0.05 * cpu_n as f32,
+            "GPU mask misses texels the CPU carved (teeth): {cpu_only} of {cpu_n}"
+        );
+        // Interior agreement: where both paths carved, the red channel must match closely.
+        let mut sum = 0i64;
+        let mut n = 0i64;
+        for t in 0..cpu.len() / 4 {
+            if cpu[t * 4] != 255 && gpu[t * 4] != 255 {
+                sum += (cpu[t * 4] as i32 - gpu[t * 4] as i32).abs() as i64;
+                n += 1;
+            }
+        }
+        let mean = sum as f64 / n.max(1) as f64;
+        assert!(mean < 6.0, "GPU vs CPU mask interior mean red diff too high: {mean:.2}");
+    }
+
+    #[test]
+    fn gpu_tiled_image_stroke_matches_cpu_stroke() {
+        // The tiled image brush on the GPU path: the GPU computes coverage, the resolve
+        // samples the material per texel (UV-anchored, tiled) exactly as the CPU `deposit`.
+        // Must match the CPU path within tolerance — only coverage (f16 + edge rule) differs;
+        // the sampled colours are identical. (This is the brush the lag report was using.)
+        let (w, h) = (256u32, 256u32);
+        // A 4×4 material with distinct opaque colours so tiling is visible.
+        let material = {
+            let mut pixels = Vec::with_capacity(16 * 4);
+            for i in 0..16u32 {
+                pixels.extend_from_slice(&[
+                    (i * 16) as u8,
+                    (255 - i * 15) as u8,
+                    ((i * 9) % 256) as u8,
+                    255,
+                ]);
+            }
+            crate::material::Material {
+                width: 4,
+                height: 4,
+                pixels,
+            }
+        };
+        let brush = Brush {
+            radius: 14.0,
+            opacity: 1.0,
+            hardness: 0.6,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let paint = |gpu: bool| -> Vec<u8> {
+            let mut r = headless_sized(w, h);
+            r.gpu_paint = gpu;
+            r.brush_material = Some(material.clone()); // Tiled mode by default
+            r.brush_tile = 4.0;
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.paint_segment((cx, cy), (cx + 28.0, cy + 16.0), &brush);
+            r.end_stroke();
+            r.flush_paint();
+            r.layers.active_tex().pixels.clone()
+        };
+        let cpu = paint(false);
+        let gpu = paint(true);
+        let base = headless_sized(w, h).layers.active_tex().pixels.clone();
+
+        let painted = |buf: &[u8]| {
+            buf.chunks_exact(4)
+                .zip(base.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        let (cpu_n, gpu_n) = (painted(&cpu), painted(&gpu));
+        assert!(cpu_n > 200, "CPU tiled stroke painted too little: {cpu_n}");
+        assert!(
+            gpu_n as f32 > 0.7 * cpu_n as f32 && (gpu_n as f32) < 1.4 * cpu_n as f32,
+            "GPU tiled region differs too much from CPU ({gpu_n} vs {cpu_n})"
+        );
+        let mut sum = 0i64;
+        let mut n = 0i64;
+        for i in 0..cpu.len() {
+            if cpu[i] != base[i] || gpu[i] != base[i] {
+                sum += (cpu[i] as i32 - gpu[i] as i32).abs() as i64;
+                n += 1;
+            }
+        }
+        let mean = sum as f64 / n.max(1) as f64;
+        assert!(mean < 8.0, "GPU vs CPU tiled mean channel diff too high: {mean:.2}");
+    }
+
+    #[test]
+    fn gpu_resolve_material_stroke_matches_cpu_stroke() {
+        // The tiled material brush on the no-readback *resolve* path (GPU display + paint):
+        // the resolve shader samples the material per texel and reconciles to the CPU layer.
+        // Must match the pure-CPU stroke within tolerance (coverage f16 + nearest material
+        // wrap are the only sources of difference). This is the brush from the lag report.
+        let (w, h) = (256u32, 256u32);
+        let material = {
+            let mut pixels = Vec::with_capacity(16 * 4);
+            for i in 0..16u32 {
+                pixels.extend_from_slice(&[
+                    (i * 16) as u8,
+                    (255 - i * 15) as u8,
+                    ((i * 9) % 256) as u8,
+                    255,
+                ]);
+            }
+            crate::material::Material {
+                width: 4,
+                height: 4,
+                pixels,
+            }
+        };
+        let brush = Brush {
+            radius: 14.0,
+            opacity: 1.0,
+            hardness: 0.6,
+            ..Brush::default()
+        };
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let paint = |resolve: bool| -> Vec<u8> {
+            let mut r = headless_sized(w, h);
+            if resolve {
+                r.gpu_display = true;
+                r.gpu_paint = true;
+            }
+            r.brush_material = Some(material.clone());
+            r.brush_tile = 4.0;
+            r.begin_stroke();
+            r.paint_at((cx, cy), &brush);
+            r.flush_paint();
+            r.paint_segment((cx, cy), (cx + 28.0, cy + 16.0), &brush);
+            r.flush_paint();
+            r.end_stroke();
+            r.flush_paint();
+            r.layers.active_tex().pixels.clone()
+        };
+        let cpu = paint(false);
+        let gpu = paint(true);
+        let base = headless_sized(w, h).layers.active_tex().pixels.clone();
+
+        let painted = |buf: &[u8]| {
+            buf.chunks_exact(4)
+                .zip(base.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        let (cpu_n, gpu_n) = (painted(&cpu), painted(&gpu));
+        assert!(cpu_n > 200, "CPU material stroke painted too little: {cpu_n}");
+        assert!(
+            gpu_n as f32 > 0.7 * cpu_n as f32 && (gpu_n as f32) < 1.4 * cpu_n as f32,
+            "resolve material region differs too much from CPU ({gpu_n} vs {cpu_n})"
+        );
+        let mut sum = 0i64;
+        let mut n = 0i64;
+        for i in 0..cpu.len() {
+            if cpu[i] != base[i] || gpu[i] != base[i] {
+                sum += (cpu[i] as i32 - gpu[i] as i32).abs() as i64;
+                n += 1;
+            }
+        }
+        let mean = sum as f64 / n.max(1) as f64;
+        assert!(mean < 8.0, "resolve vs CPU material mean channel diff too high: {mean:.2}");
     }
 }

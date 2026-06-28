@@ -39,6 +39,21 @@ pub struct Bvh {
     tris: Vec<Tri>,
 }
 
+/// A BVH node flattened for GPU upload — the same `min/max/left_or_first/count`
+/// as the internal [`Node`], but `#[repr(C)]` + `Pod` so it maps straight onto the
+/// compute shaders' std430 `Node` (8 words = 32 bytes: `min.xyz`, `left_or_first`,
+/// `max.xyz`, `count`). The GPU bake (`gpu_bake.rs`) traverses these to ray-trace
+/// occlusion per texel; keeping the layout knowledge here, beside the build, means
+/// the shader and the builder can't silently drift.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuBvhNode {
+    pub min: [f32; 3],
+    pub left_or_first: u32,
+    pub max: [f32; 3],
+    pub count: u32,
+}
+
 /// The closest triangle a ray struck: the interpolated UV at the hit, the original
 /// mesh-triangle index (for keying per-triangle data like UV islands), and the
 /// world-space hit point + geometric face normal.
@@ -300,6 +315,48 @@ impl Bvh {
             }
         }
         false
+    }
+
+    // --- GPU upload (Phase 2.5: BVH-on-GPU for the mesh-map bake) ---
+
+    /// The nodes flattened for GPU upload (see [`GpuBvhNode`]). One-to-one with the
+    /// internal node array, including index semantics (`left_or_first`/`count`), so the
+    /// compute-shader traversal mirrors [`Self::occludes`] exactly.
+    pub fn gpu_nodes(&self) -> Vec<GpuBvhNode> {
+        self.nodes
+            .iter()
+            .map(|n| GpuBvhNode {
+                min: n.min.to_array(),
+                left_or_first: n.left_or_first,
+                max: n.max.to_array(),
+                count: n.count,
+            })
+            .collect()
+    }
+
+    /// The leaf triangle-index permutation, as the shader indexes it (`tri_idx[first..]`
+    /// inside a leaf). Values are original mesh-triangle indices into [`Self::gpu_tri_positions`].
+    pub fn gpu_tri_indices(&self) -> &[u32] {
+        &self.tri_idx
+    }
+
+    /// Triangle vertex positions packed 9 floats per triangle (`v0.xyz, v1.xyz, v2.xyz`),
+    /// in *mesh* order so a `tri_idx` value indexes straight in (`base = 9 * ti`). The
+    /// shader's Möller–Trumbore reads these for the occlusion test — positions only, since
+    /// the bake's shadow/AO rays don't need UVs.
+    pub fn gpu_tri_positions(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.tris.len() * 9);
+        for t in &self.tris {
+            for p in &t.p {
+                out.extend_from_slice(&[p.x, p.y, p.z]);
+            }
+        }
+        out
+    }
+
+    /// Number of triangles (for the GPU bake's empty-mesh guard / dispatch sizing).
+    pub fn tri_count(&self) -> usize {
+        self.tris.len()
     }
 }
 

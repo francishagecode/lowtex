@@ -120,12 +120,19 @@ impl Texture {
 /// splat — so they all composite identically. `texel` must be in range.
 pub(crate) fn blend_texel(pixels: &mut [u8], base: &[u8], texel: usize, src: [u8; 3], a: f32) {
     let i = texel * 4;
-    for (c, &s) in src.iter().enumerate() {
-        let dst = base[i + c] as f32;
-        pixels[i + c] = (dst * (1.0 - a) + s as f32 * a).round().clamp(0.0, 255.0) as u8;
+    blend4(&mut pixels[i..i + 4], &base[i..i + 4], src, a);
+}
+
+/// The per-texel blend of [`blend_texel`] on standalone 4-byte `dst`/`base` slices, so a
+/// caller that has already split a buffer into rows (the rayon GPU-coverage resolve) shares
+/// the exact same math — no parity drift between the per-dab and per-row paths.
+pub(crate) fn blend4(dst: &mut [u8], base: &[u8], src: [u8; 3], a: f32) {
+    for c in 0..3 {
+        let d = base[c] as f32;
+        dst[c] = (d * (1.0 - a) + src[c] as f32 * a).round().clamp(0.0, 255.0) as u8;
     }
-    let base_a = base[i + 3] as f32;
-    pixels[i + 3] = (base_a * (1.0 - a) + 255.0 * a).round() as u8;
+    let base_a = base[3] as f32;
+    dst[3] = (base_a * (1.0 - a) + 255.0 * a).round() as u8;
 }
 
 /// Erase texel `texel` over the stroke's `base` snapshot at coverage `a` (0..1),
@@ -134,9 +141,14 @@ pub(crate) fn blend_texel(pixels: &mut [u8], base: &[u8], texel: usize, src: [u8
 /// fringe if the layer is later flattened). `texel` must be in range.
 pub(crate) fn erase_texel(pixels: &mut [u8], base: &[u8], texel: usize, a: f32) {
     let i = texel * 4;
-    pixels[i..i + 3].copy_from_slice(&base[i..i + 3]);
-    let base_a = base[i + 3] as f32;
-    pixels[i + 3] = (base_a * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
+    erase4(&mut pixels[i..i + 4], &base[i..i + 4], a);
+}
+
+/// The per-texel erase of [`erase_texel`] on standalone 4-byte slices (see [`blend4`]).
+pub(crate) fn erase4(dst: &mut [u8], base: &[u8], a: f32) {
+    dst[0..3].copy_from_slice(&base[0..3]);
+    let base_a = base[3] as f32;
+    dst[3] = (base_a * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
 }
 
 /// A rectangular region of texels, `[x0, x1) × [y0, y1)` (exclusive upper bound),

@@ -89,6 +89,79 @@ pub fn dilate(pixels: &mut [u8], covered: &[bool], size: u32, pad: u32) {
     }
 }
 
+/// Region-aware seam cleanup: fill the under-coverage "teeth" — unpainted (transparent) texels on
+/// an island's *rim* — from a **same-facet** painted neighbour. This repairs art painted before the
+/// conservative-dab fix without a full repaint. Two safeguards make it safe where a plain dilate is
+/// not: (1) each gap is filled only from a neighbour in the **same UV facet** (`texel_facet`), so it
+/// can never pull an adjacent island's colour across a seam (the bug that made the naive version
+/// spread dark); (2) only texels within `pad` rings of the gutter (the island rim, where the teeth
+/// live) are filled, so intentional interior transparency is left alone. `texel_facet[i] >= 0` is
+/// the facet id of an in-island texel; `-1` is gutter. Opaque texels are never overwritten. In-place
+/// on RGBA8 `pixels`.
+pub fn fill_island_rim_teeth(pixels: &mut [u8], texel_facet: &[i32], size: u32, pad: u32) {
+    if pad == 0 {
+        return;
+    }
+    let w = size as i32;
+    let n = (size * size) as usize;
+    // Rim = in-facet texels within `pad` rings of the gutter (multi-source BFS seeded from gutter).
+    let mut dist = vec![u32::MAX; n];
+    let mut q = std::collections::VecDeque::new();
+    for (i, &f) in texel_facet.iter().enumerate() {
+        if f < 0 {
+            dist[i] = 0;
+            q.push_back(i as i32);
+        }
+    }
+    while let Some(p) = q.pop_front() {
+        let d = dist[p as usize];
+        if d >= pad {
+            continue;
+        }
+        let (x, y) = (p % w, p / w);
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let (nx, ny) = (x + dx, y + dy);
+            if nx < 0 || ny < 0 || nx >= w || ny >= w {
+                continue;
+            }
+            let ni = (ny * w + nx) as usize;
+            if texel_facet[ni] >= 0 && dist[ni] == u32::MAX {
+                dist[ni] = d + 1;
+                q.push_back(ny * w + nx);
+            }
+        }
+    }
+    // Fill rim gaps from same-facet paint, one ring per pass (so fills can chain inward).
+    let mut valid: Vec<bool> = (0..n).map(|i| pixels[i * 4 + 3] > 0).collect();
+    for _ in 0..pad {
+        let frozen = valid.clone();
+        for y in 0..size as i32 {
+            for x in 0..size as i32 {
+                let i = (y * w + x) as usize;
+                // Only unpainted, in-facet, rim texels (dist in 1..=pad).
+                if frozen[i] || dist[i] == 0 || dist[i] > pad {
+                    continue;
+                }
+                let f = texel_facet[i];
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || ny < 0 || nx >= w || ny >= w {
+                        continue;
+                    }
+                    let ni = (ny * w + nx) as usize;
+                    // Neighbour must be painted AND belong to the same facet.
+                    if frozen[ni] && texel_facet[ni] == f {
+                        let (s, d) = (ni * 4, i * 4);
+                        pixels.copy_within(s..s + 4, d);
+                        valid[i] = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Like `dilate`, but only fills (and only iterates) texels inside `region`. The
 /// dirty-rectangle counterpart used by the per-stroke refresh. Validity/colors for
 /// neighbours *outside* `region` are read from `covered`/`pixels` directly (covered
@@ -181,6 +254,35 @@ mod tests {
                 "neighbour ({nx},{ny}) not bled"
             );
         }
+    }
+
+    #[test]
+    fn fill_island_rim_teeth_uses_own_facet_color() {
+        // A rim gap in facet 0 sits between a facet-1 (dark) neighbour scanned FIRST and a facet-0
+        // (red) neighbour scanned later. The fill must take the same-facet (red) colour, never the
+        // adjacent island's dark — the safeguard that the naive dilate lacked.
+        let size = 5u32;
+        let n = (size * size) as usize;
+        let idx = |x: u32, y: u32| (y * size + x) as usize;
+        let mut tf = vec![-1i32; n]; // gutter everywhere by default
+        let gap = idx(2, 2);
+        tf[gap] = 0; // the unpainted rim tooth, in facet 0
+        tf[idx(1, 2)] = 1; // left neighbour: facet 1 (scanned first in [-1,0])
+        tf[idx(3, 2)] = 0; // right neighbour: facet 0 (same as the gap)
+        // (2,1) and (2,3) stay gutter (-1), so the gap is on the rim (dist 1 to gutter).
+
+        let mut px = vec![0u8; n * 4];
+        px[idx(1, 2) * 4..idx(1, 2) * 4 + 4].copy_from_slice(&[10, 10, 10, 255]); // dark, facet 1
+        px[idx(3, 2) * 4..idx(3, 2) * 4 + 4].copy_from_slice(&[200, 30, 40, 255]); // red, facet 0
+        // gap is transparent.
+
+        fill_island_rim_teeth(&mut px, &tf, size, 2);
+
+        assert_eq!(
+            &px[gap * 4..gap * 4 + 4],
+            &[200, 30, 40, 255],
+            "rim tooth must fill from its OWN facet (red), not the adjacent island (dark)"
+        );
     }
 
     #[test]

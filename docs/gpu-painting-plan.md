@@ -1,9 +1,38 @@
 # GPU Painting Plan (Tier 2 → "crazy performance")
 
-Status: **proposed** · supersedes/expands roadmap goal **G12 (GPU compositing)**
+Status: **in progress** · supersedes/expands roadmap goal **G12 (GPU compositing)**
 Scope: move the paint hot path off the CPU so painting stays interactive at
 2K–4K atlases. Companion to the Tier 0/1 CPU work already landed (rayon-parallel
 compositing + version-stamped stroke buffers).
+
+---
+
+## Implementation status (landed)
+
+- **Tier 1 — rayon AO/sun bake** ✅ `bake::bake_ao_into` + `MeshMaps::compute_light`
+  fan the per-texel ray casts across cores; byte-identical to serial (parity tests
+  `ao_bake_parallel_matches_serial`, `compute_light_parallel_matches_serial`).
+- **Phase 2.5 — GPU mesh maps (AO + sun)** ✅ `src/gpu_bake.rs` + `shaders/bake.wgsl`
+  ray-trace the BVH-on-GPU (`bvh::GpuBvhNode`) per texel. Wired into the renderer
+  (`ensure_mesh_maps` → GPU AO, `ensure_light` → GPU sun); the CPU bake stays the parity
+  oracle and a `LOWTEX_CPU_BAKE` fallback. ~6× faster than the rayon CPU path at 1–2K;
+  the sun is now an interactive re-bake. Parity tests `gpu_ao_matches_cpu_reference`,
+  `gpu_sun_matches_cpu_reference` (self-shadowing mesh), `gpu_baked_maps_drive_layers_and_interactive_sun`.
+- **Phase 1 — GPU dab stamping (core)** ✅ option (B): `surface::splat_faces` emits the
+  face set; `src/gpu_dab.rs` + `shaders/dab.wgsl` rasterize it into a per-stroke R16Float
+  coverage texture (`Max`-blended across dabs), resolved into the active layer once per
+  frame. Gated by `LOWTEX_GPU_PAINT` for the surface brush's **solid colour, eraser and
+  mask (reveal/hide)** modes — the resolve blends the colour, subtracts alpha, or blends
+  white/black into the mask from the one coverage map; image (tiled) brushes and decals
+  stay on the CPU path. Reuses the existing deposit / undo / dirty-rect /
+  composite machinery, so symmetry, face-lock, snap and undo all hold on the GPU path (the
+  whole suite passes with `LOWTEX_GPU_PAINT=1`). Parity: `gpu_dab_coverage_matches_cpu_splat`,
+  `gpu_stroke_accumulation_matches_cpu_max`, `gpu_paint_stroke_matches_cpu_stroke`.
+
+**Remaining:** GPU paths for the image (tiled) and decal brush variants (need texture
+sampling in the dab pass); Phase 2 (GPU compositing) to drop the per-frame coverage
+readback + CPU composite; Phase 3 (history/export against GPU state); Phase 4 (virtual
+textures). The CPU paths remain the default and the parity oracle throughout.
 
 ---
 

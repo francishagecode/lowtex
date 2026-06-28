@@ -57,7 +57,8 @@ pub struct MeshMaps {
 }
 
 /// Hemisphere ray count per texel for AO. Modest — bakes stay sub-second.
-const AO_SAMPLES: u32 = 24;
+/// `pub` so the GPU bake (`gpu_bake.rs`) dispatches the identical sample count.
+pub const AO_SAMPLES: u32 = 24;
 
 /// A mesh edge counts as "hard" (and so seeds an edge/crease band) when its two
 /// adjacent faces diverge by more than this in `1 − n₁·n₂`: 0 is coplanar, ~0.13 is
@@ -217,26 +218,30 @@ impl MeshMaps {
     /// sun hasn't moved. Like AO, this raycasts against the BVH, so it's the one map
     /// that needs the mesh's acceleration structure rather than just baked channels.
     pub fn compute_light(&mut self, bvh: &Bvh, dir: Vec3, shadow: bool) {
+        use rayon::prelude::*;
         let dir = dir.normalize_or_zero();
-        let bias = self.diag * 1e-3;
+        let bias = ray_bias(self.diag);
         // A directional light is infinitely far; cast the shadow ray across the
         // whole model so anything between the texel and the sun counts as occluder.
         let reach = self.diag;
-        for i in 0..self.light.len() {
-            if !self.mask[i] {
-                self.light[i] = 0.0;
-                continue;
+        // Per-texel `max(N·L,0)` + one independent BVH shadow ray, fanned across cores.
+        // Byte-identical to the serial loop (disjoint texels, deterministic math), so
+        // dragging the sun slider — which re-bakes the whole light channel every change —
+        // costs ~cores× less. Borrow the read-only channels as locals so the mutable
+        // `self.light` iter and the immutable `mask`/`nrm`/`pos` reads stay disjoint.
+        let (mask, nrm, pos) = (&self.mask, &self.nrm, &self.pos);
+        self.light.par_iter_mut().enumerate().for_each(|(i, out)| {
+            if !mask[i] {
+                *out = 0.0;
+                return;
             }
-            let ndotl = self.nrm[i].dot(dir).max(0.0);
-            self.light[i] = if shadow
-                && ndotl > 0.0
-                && bvh.occludes(self.pos[i] + self.nrm[i] * bias, dir, reach)
-            {
+            let ndotl = nrm[i].dot(dir).max(0.0);
+            *out = if shadow && ndotl > 0.0 && bvh.occludes(pos[i] + nrm[i] * bias, dir, reach) {
                 0.0
             } else {
                 ndotl
             };
-        }
+        });
         self.light_params = Some((dir, shadow));
     }
 }
@@ -265,9 +270,36 @@ impl Gradient {
     }
 }
 
+/// AO hemisphere ray reach for a model of bounding-box diagonal `diag` (a quarter of
+/// the diagonal). Shared by the CPU bake and the GPU bake so both query the same
+/// neighbourhood — keep the magic factor here, in one place.
+pub fn ao_reach(diag: f32) -> f32 {
+    diag * 0.25
+}
+
+/// Ray-start bias along the normal (to dodge self-intersection), from the model's
+/// `diag`. Shared by AO, the sun shadow ray, and their GPU ports.
+pub fn ray_bias(diag: f32) -> f32 {
+    diag * 1e-3
+}
+
+/// Full CPU bake: rasterize the geometry maps, then ray-trace AO on the CPU. The
+/// reference the GPU bake is diffed against; also the path used when no GPU bake is
+/// wired in (and by the parity tests). `bake_geometry` + `bake_ao_into` split lets the
+/// GPU path reuse the (cheap, BVH-free) rasterization and move only the ray-trace.
 pub fn bake(mesh: &Mesh, bvh: &Bvh, size: u32) -> MeshMaps {
+    let mut maps = bake_geometry(mesh, size);
+    bake_ao_into(&mut maps, bvh);
+    maps
+}
+
+/// Rasterize the per-texel geometry maps — `mask`, world `pos`, smooth `nrm`, and the
+/// hard-edge `curvature` band — with `ao`/`light` left zeroed. No BVH and no ray casts,
+/// so it's cheap even at 2K; the expensive occlusion/shadow rays are layered on top by
+/// `bake_ao_into` (CPU) or the GPU bake. Output is byte-identical to the rasterization
+/// half of the old monolithic `bake`.
+pub fn bake_geometry(mesh: &Mesh, size: u32) -> MeshMaps {
     let n = (size * size) as usize;
-    let mut ao = vec![0.0f32; n];
     let mut curvature = vec![0.0f32; n];
     let mut mask = vec![false; n];
     let mut pos_map = vec![Vec3::ZERO; n];
@@ -278,11 +310,9 @@ pub fn bake(mesh: &Mesh, bvh: &Bvh, size: u32) -> MeshMaps {
     // the welded id of each mesh vertex so the rasterizer can look its edges up.
     let (sharp, wid) = sharp_edges(mesh);
 
-    // Scale-dependent AO reach + ray bias from the model's bounding box.
+    // Scale-dependent edge band from the model's bounding box.
     let (mn, mx) = mesh.bounds();
     let diag = (mx - mn).length().max(1e-3);
-    let ao_dist = diag * 0.25;
-    let bias = diag * 1e-3;
     let edge_width = diag * EDGE_WIDTH_FRAC;
 
     // --- Rasterize triangles into UV space ---
@@ -365,41 +395,60 @@ pub fn bake(mesh: &Mesh, bvh: &Bvh, size: u32) -> MeshMaps {
         }
     }
 
-    // --- Ambient occlusion: hemisphere ray casts against the BVH ---
-    for idx in 0..n {
-        if !mask[idx] {
-            continue;
-        }
-        let p = pos_map[idx];
-        let nrm = nrm_map[idx];
-        let (tangent, bitangent) = basis(nrm);
-        let mut occluded = 0u32;
-        for s in 0..AO_SAMPLES {
-            let (r1, r2) = hash2(idx as u32, s);
-            // Cosine-weighted hemisphere sample in the tangent frame.
-            let phi = std::f32::consts::TAU * r1;
-            let cos_t = (1.0 - r2).sqrt();
-            let sin_t = r2.sqrt();
-            let dir = tangent * (phi.cos() * sin_t) + bitangent * (phi.sin() * sin_t) + nrm * cos_t;
-            if bvh.occludes(p + nrm * bias, dir, ao_dist) {
-                occluded += 1;
-            }
-        }
-        ao[idx] = occluded as f32 / AO_SAMPLES as f32;
-    }
-
     MeshMaps {
         size,
-        ao,
+        // AO + light are filled later (CPU `bake_ao_into` / GPU bake; sun lazily).
+        ao: vec![0.0f32; n],
         curvature,
         mask,
         pos: pos_map,
         nrm: nrm_map,
-        // The directional light is baked lazily once a sun direction is chosen.
         light: vec![0.0f32; n],
         light_params: None,
         diag,
     }
+}
+
+/// Fill `maps.ao` by ray-tracing ambient occlusion against the BVH (the CPU path).
+/// Each covered texel's AO is an independent BVH query over the shared, read-only mesh,
+/// so fan the per-texel casts across cores — byte-identical to the serial loop (every
+/// texel runs the same deterministic `ao_for_texel`, no shared mutable state). The
+/// moat's AO bake (24 rays × millions of texels at 2K) is the second-largest CPU pixel
+/// job; the GPU bake replaces this call, but it stays the diff reference.
+pub fn bake_ao_into(maps: &mut MeshMaps, bvh: &Bvh) {
+    use rayon::prelude::*;
+    let ao_dist = ao_reach(maps.diag);
+    let bias = ray_bias(maps.diag);
+    // Read-only channels as locals so the `maps.ao` mutable iter and the immutable
+    // mask/pos/nrm reads are disjoint field borrows.
+    let (mask, pos, nrm) = (&maps.mask, &maps.pos, &maps.nrm);
+    maps.ao.par_iter_mut().enumerate().for_each(|(idx, out)| {
+        if mask[idx] {
+            *out = ao_for_texel(bvh, idx, pos[idx], nrm[idx], ao_dist, bias);
+        }
+    });
+}
+
+/// Cosine-weighted hemisphere ambient occlusion for one covered texel at surface
+/// point `p` with normal `nrm`: the fraction of `AO_SAMPLES` rays the BVH occludes
+/// within `ao_dist`. Factored out of `bake`'s AO loop so the parallel bake and a
+/// serial reference share one body — the parity test pins the rayon port to it.
+/// Deterministic in `idx` (the `hash2` seed), so it is order- and thread-independent.
+fn ao_for_texel(bvh: &Bvh, idx: usize, p: Vec3, nrm: Vec3, ao_dist: f32, bias: f32) -> f32 {
+    let (tangent, bitangent) = basis(nrm);
+    let mut occluded = 0u32;
+    for s in 0..AO_SAMPLES {
+        let (r1, r2) = hash2(idx as u32, s);
+        // Cosine-weighted hemisphere sample in the tangent frame.
+        let phi = std::f32::consts::TAU * r1;
+        let cos_t = (1.0 - r2).sqrt();
+        let sin_t = r2.sqrt();
+        let dir = tangent * (phi.cos() * sin_t) + bitangent * (phi.sin() * sin_t) + nrm * cos_t;
+        if bvh.occludes(p + nrm * bias, dir, ao_dist) {
+            occluded += 1;
+        }
+    }
+    occluded as f32 / AO_SAMPLES as f32
 }
 
 /// Hermite smoothstep: 0 below `lo`, 1 above `hi`, smooth ramp between.
@@ -733,6 +782,59 @@ mod tests {
                 .all(|(a, b)| close(*a, *b)),
             "a convex mesh casts no self-shadow"
         );
+    }
+
+    #[test]
+    fn ao_bake_parallel_matches_serial() {
+        // The rayon AO bake must reproduce the serial loop exactly: each texel is an
+        // independent, deterministic `ao_for_texel` query, so order/thread can't change
+        // it. Recompute every covered texel serially from the maps' own pos/nrm and the
+        // same scale-derived reach/bias, and assert byte equality with the baked `ao`.
+        let mesh = crate::mesh::Mesh::cube();
+        let bvh = Bvh::build(&mesh);
+        let maps = bake(&mesh, &bvh, 64);
+        let ao_dist = maps.diag * 0.25;
+        let bias = maps.diag * 1e-3;
+        let mut covered = 0;
+        for i in 0..maps.ao.len() {
+            let expect = if maps.mask[i] {
+                covered += 1;
+                ao_for_texel(&bvh, i, maps.pos[i], maps.nrm[i], ao_dist, bias)
+            } else {
+                0.0
+            };
+            assert_eq!(maps.ao[i], expect, "AO texel {i}: parallel != serial");
+        }
+        assert!(covered > 0, "the cube must cover texels for the test to bite");
+    }
+
+    #[test]
+    fn compute_light_parallel_matches_serial() {
+        // Same parity guard for the sun bake (the interactive slider path): the rayon
+        // `compute_light` must be byte-identical to a serial recomputation. Shadows on,
+        // an off-axis sun, so `max(N·L,0)` and the BVH shadow-ray branch both run.
+        let mesh = crate::mesh::Mesh::cube();
+        let bvh = Bvh::build(&mesh);
+        let mut maps = bake(&mesh, &bvh, 48);
+        let dir = Vec3::new(0.3, 0.8, 0.5).normalize();
+        maps.compute_light(&bvh, dir, true);
+
+        let d = dir.normalize_or_zero();
+        let bias = maps.diag * 1e-3;
+        let reach = maps.diag;
+        for i in 0..maps.light.len() {
+            let expect = if !maps.mask[i] {
+                0.0
+            } else {
+                let ndotl = maps.nrm[i].dot(d).max(0.0);
+                if ndotl > 0.0 && bvh.occludes(maps.pos[i] + maps.nrm[i] * bias, d, reach) {
+                    0.0
+                } else {
+                    ndotl
+                }
+            };
+            assert_eq!(maps.light[i], expect, "light texel {i}: parallel != serial");
+        }
     }
 
     #[test]
