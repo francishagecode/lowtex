@@ -2518,6 +2518,13 @@ impl Renderer {
         crate::export::export_png(path, &pixels, self.tex_size, self.tex_size, palette)
     }
 
+    /// Write the current mesh — including the UVs produced by the last unwrap — to a
+    /// Wavefront OBJ. Pair it with `export_png`: the texture only maps onto these UVs,
+    /// so an engine needs both files.
+    pub fn export_obj(&self, path: &str) -> Result<(), String> {
+        crate::export::export_obj(path, &self.mesh)
+    }
+
     /// Load a PNG into the paint buffer, resampling to the current resolution.
     pub fn load_texture_png(&mut self, path: &str) -> Result<(), String> {
         let img = image::open(path).map_err(|e| format!("failed to open image: {e}"))?;

@@ -137,6 +137,9 @@ pub struct UiActions {
     pub apply_gradient: Option<(MapSource, Levels, [f32; 3], [f32; 3], Option<NoiseMod>)>,
     /// Export the texture (G23): `true` = true indexed PNG, `false` = RGBA8.
     pub export_png: Option<bool>,
+    /// Export the unwrapped mesh (positions + the new UVs) as a Wavefront OBJ, so the
+    /// painted texture has geometry to map onto outside lowtex.
+    pub export_obj: bool,
     /// Fill the active layer with a chosen material image, tiled this many times.
     pub fill_material: Option<f32>,
     /// Load an image for the brush to paint with (UV-tiled) instead of solid color.
@@ -508,6 +511,16 @@ fn menu_bar(ctx: &Context, state: &mut UiState) {
                 }
                 if ui.button("Export RGBA PNG…").clicked() {
                     state.actions.export_png = Some(false);
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Export mesh (.obj)…")
+                    .on_hover_text(
+                        "The unwrapped geometry + new UVs — pair it with the exported texture",
+                    )
+                    .clicked()
+                {
+                    state.actions.export_obj = true;
                     ui.close_menu();
                 }
                 ui.separator();
